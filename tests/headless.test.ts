@@ -4147,6 +4147,98 @@ test("CLI cleans the Antigravity usage overlay when the parent receives SIGTERM"
   }
 });
 
+test("CLI keeps the Antigravity usage overlay until the agent finishes its SIGTERM handler", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const home = join(dir, "home");
+    const appDir = join(home, ".gemini", "antigravity-cli");
+    const binDir = join(dir, "bin");
+    const overlayPath = join(dir, "overlay-home.txt");
+    const seenPath = join(dir, "overlay-seen-in-handler.txt");
+    mkdirSync(appDir, { recursive: true });
+    mkdirSync(binDir);
+    writeFileSync(join(appDir, "settings.json"), `${JSON.stringify({ statusLine: { type: "", command: "", enabled: true } })}\n`);
+    const binary = join(binDir, "agy");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(overlayPath)}, process.env.HOME);`,
+        // A graceful shutdown that still uses its HOME 300ms after SIGTERM.
+        "process.on('SIGTERM', () => setTimeout(() => {",
+        `  fs.writeFileSync(${JSON.stringify(seenPath)}, fs.existsSync(process.env.HOME) ? 'present' : 'removed');`,
+        "  process.exit(0);",
+        "}, 300));",
+        "setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 100);",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const runner = join(dir, "runner.mjs");
+    writeFileSync(
+      runner,
+      [
+        `import { runCli } from ${JSON.stringify(pathToFileURL(join(repoRoot, "src", "cli.ts")).href)};`,
+        "const code = await runCli(['antigravity', '--prompt', 'hello', '--json', '--usage']);",
+        "process.exitCode = code;",
+        "",
+      ].join("\n"),
+    );
+
+    const child = spawnSync(process.execPath, ["--import", "tsx", runner], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+    });
+    assert.equal(child.signal, "SIGTERM", child.stderr);
+    assert.equal(readFileSync(seenPath, "utf8"), "present");
+    // ...and it is still removed once the agent is gone.
+    assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI cleans up Antigravity descendants even with --keep-background and no --usage", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  const grandchildPidPath = join(dir, "grandchild.pid");
+  let grandchildPid: number | undefined;
+  try {
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir);
+    const binary = join(binDir, "agy");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio: 'ignore' });",
+        `writeFileSync(${JSON.stringify(grandchildPidPath)}, String(child.pid));`,
+        "child.unref();",
+        "process.stdout.write('antigravity final\\n');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+
+    const code = await runCli(["antigravity", "--prompt", "hello", "--keep-background"], {
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", ANTIGRAVITY_CLI_BIN: binary, HOME: join(dir, "home"), PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: () => {},
+      stderr: () => {},
+    });
+
+    assert.equal(code, 0);
+    grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+    assert.equal(processTerminated(grandchildPid), true);
+  } finally {
+    if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("CLI skips the Antigravity usage overlay on Windows", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
   try {

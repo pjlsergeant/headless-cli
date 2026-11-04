@@ -2104,6 +2104,8 @@ async function executeCommand(
       let treeShutdown: {
         completed: boolean;
         killed: boolean;
+        /** A parent signal is pending: run the parent-exit cleanup on completion. */
+        parentCleanup?: boolean;
         reraise?: NodeJS.Signals;
         pendingResult?: ExecuteResult;
         timers: NodeJS.Timeout[];
@@ -2124,6 +2126,16 @@ async function executeCommand(
         }
         treeShutdown.completed = true;
         stopTreeShutdown();
+        if (treeShutdown.parentCleanup) {
+          // Only now that the tree is dead (or the deadline passed): a
+          // gracefully exiting agent may still use what this removes (the
+          // Antigravity overlay HOME). A failure must not block the re-raise.
+          try {
+            options.cleanupBeforeParentSignalExit?.();
+          } catch {
+            // Best effort.
+          }
+        }
         if (treeShutdown.reraise) {
           const signal = treeShutdown.reraise;
           removeParentSignalHandlers();
@@ -2189,9 +2201,9 @@ async function executeCommand(
       // Descendants the direct child leaves behind when it exits on its own
       // are terminated (SIGTERM, grace, SIGKILL) before the run resolves,
       // unless --keep-background asks to leave them running. Antigravity
-      // (cleanup hook) always kills: its descendants use the overlay home
-      // that the cleanup removes.
-      const keepBackground = options.keepBackground === true && options.cleanupBeforeParentSignalExit === undefined;
+      // always kills, with or without usage capture: its descendants may use
+      // the overlay home that the capture cleanup removes.
+      const keepBackground = options.keepBackground === true && agent !== "antigravity";
 
       // After the direct child exits, give its stdio one grace period to
       // drain. Then either terminate the remaining tree (whose death closes
@@ -2295,7 +2307,7 @@ async function executeCommand(
             // re-raise) until the tree is dead or the bounded deadline passes.
             beginTreeShutdown(signal);
             if (!hasExternalListener) treeShutdown!.reraise = signal;
-            options.cleanupBeforeParentSignalExit?.();
+            treeShutdown!.parentCleanup = true;
           };
           handlers.set(signal, handler);
           process.on(signal, handler);
@@ -2426,8 +2438,9 @@ async function executeCommand(
         if (termination) {
           // Timed out: SIGKILL what the direct child left behind at once.
           beginTreeShutdown("SIGKILL");
-        } else if (options.cleanupBeforeParentSignalExit !== undefined && !treeShutdown && tree.alive()) {
-          // Antigravity: its descendants must not outlive the cleanup.
+        } else if (agent === "antigravity" && !treeShutdown && tree.alive()) {
+          // Antigravity always cleans up its descendants, with or without
+          // usage capture and regardless of --keep-background.
           beginTreeShutdown("SIGKILL");
         } else if (!keepBackground && !treeShutdown && tree.alive()) {
           // Normal exit: terminate leftover descendants before resolving.
