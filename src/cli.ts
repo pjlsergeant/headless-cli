@@ -101,7 +101,6 @@ import {
 import {
   acquireDockerSessionLock,
   acquireLaunchLock,
-  isDockerSessionLockSignalListener,
 } from "./launch-lock.js";
 import {
   childProcessTree,
@@ -1426,8 +1425,16 @@ function installWrapUpGuard(
       armed = true;
     },
     release: () => {
-      if (received) reraise(received);
-      else remove();
+      const signal = received;
+      if (!signal) {
+        remove();
+        return;
+      }
+      // Deliver once runCli has returned to its caller. With no other JS
+      // listener left, a synchronous re-raise would end the process inside
+      // runCli's final block.
+      remove();
+      setImmediate(() => reraise(signal));
     },
   };
 }
@@ -3748,7 +3755,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       signal,
       new Set(
         process.listeners(signal).filter(
-          (listener) => !isDockerSessionLockSignalListener(listener) && !isRunStoreLockSignalListener(listener),
+          (listener) => !isRunStoreLockSignalListener(listener),
         ),
       ),
     ] as const),
@@ -4653,7 +4660,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       // appears, then releases before the long wait.
       const claimLock =
         waitPlan?.strategy.kind === "claim"
-          ? acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir))
+          ? await acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir))
           : undefined;
       const waitSnapshot = waitPlan
         ? createTmuxWaitSnapshot(parsed.agent, tmuxWaitWorkDir, env, waitPlan.strategy)

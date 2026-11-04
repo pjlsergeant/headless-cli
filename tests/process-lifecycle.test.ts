@@ -11,6 +11,7 @@ import { runCli } from "../src/cli.ts";
 import { cronRoot, parseCronSchedule, readCronJob, recordCronJob, runDueCronJobsOnce } from "../src/cron.ts";
 import { dockerSessionHomePath } from "../src/docker.ts";
 import { dockerSessionLockPath } from "../src/launch-lock.ts";
+import { inspectOwnerLock } from "../src/owner-lock.ts";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const posixOnly = { skip: process.platform === "win32" };
@@ -569,7 +570,7 @@ test("a signal during wrap-up lets cleanup finish, then exits with it, leaving -
     // deferred signal end the process.
     assert.equal(readFileSync(returnMark, "utf8"), "0");
     const lockPath = dockerSessionLockPath(dockerSessionHomePath("codex", "work", { HOME: homeDir }) as string);
-    assert.equal(existsSync(lockPath), false, "Docker session lock was not released");
+    assert.equal(inspectOwnerLock(lockPath).state, "released", "Docker session lock was not released");
     // The agent had already exited cleanly: its kept process is untouched.
     const grandchildPid = readPid(grandchildPidFile)!;
     assert.equal(processGone(grandchildPid), false, "--keep-background process was killed");
