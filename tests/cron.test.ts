@@ -948,3 +948,34 @@ test("concurrent cron pause from another process vs daemon completion keeps ever
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("inside a headless Docker container, cron add/start, the daemon and --docker are refused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  try {
+    const env = { ...testEnv(dir), HEADLESS_IN_CONTAINER: "1" };
+    mkdirSync(env.HOME as string, { recursive: true });
+    const run = async (argv: string[]) => {
+      let stderr = "";
+      const code = await runCli(argv, { env, stdout: () => {}, stderr: (text) => { stderr += text; } });
+      return { code, stderr };
+    };
+    for (const argv of [
+      ["cron", "start"],
+      ["cron", "add", "codex", "--name", "inside", "--every", "1h", "--prompt", "x"],
+      ["cron-daemon"],
+      ["codex", "--docker", "--prompt", "x"],
+      ["codex", "--docker", "--session", "work", "--prompt", "x"],
+    ]) {
+      const { code, stderr } = await run(argv);
+      assert.equal(code, 2, argv.join(" "));
+      assert.match(stderr, /must run on the host, not inside a headless Docker container/, argv.join(" "));
+    }
+    await assert.rejects(runCronDaemon(env), /must run on the host/);
+    assert.equal(daemonRunning(env), false);
+    assert.equal(readCronJob(env, "inside"), undefined);
+    // Everything else still works inside the container.
+    assert.equal((await run(["cron", "list"])).code, 0);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

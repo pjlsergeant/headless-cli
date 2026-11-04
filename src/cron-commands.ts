@@ -21,6 +21,7 @@ import {
   type CronExecutionRecord,
   type CronJobRecord,
 } from "./cron.js";
+import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { quoteCommand } from "./shell.js";
 import { renderSdkResult, type SdkFormat } from "./sdk.js";
 import type { AgentName, AllowMode, Env, ReasoningEffort } from "./types.js";
@@ -71,6 +72,10 @@ export interface CronCommandHandlers {
 }
 
 export async function handleCronCommand(input: CronCommandInput, handlers: CronCommandHandlers): Promise<number> {
+  // add and start may start the daemon, which takes the host-only daemon lock.
+  if ((input.command === "add" || input.command === "start") && runningInHeadlessContainer(handlers.env)) {
+    throw hostOnlyError(`cron ${input.command}`);
+  }
   if (input.command === "add") return await cronAdd(input, handlers);
   if (input.command === "list") return cronList(input, handlers);
   if (input.command === "view") return cronView(requireJobId(input), input, handlers);

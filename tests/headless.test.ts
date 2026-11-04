@@ -2860,7 +2860,7 @@ test("CLI --docker print-command wraps the selected agent command", async () => 
     assert.equal(code, 0);
     assert.match(output, /^printf %s hello \| docker run --rm --interactive --tmpfs '\/headless-home:rw,mode=1777' --user \d+:\d+ /);
     assert.match(output, new RegExp(`--workdir ${quoteCommand({ command: realpathSync(projectDir), args: [] })}`));
-    assert.match(output, /--env EXTRA_TOKEN=value --env HOME=\/headless-home --network=host custom\/headless:dev sh -lc/);
+    assert.match(output, /--env EXTRA_TOKEN=value --env HOME=\/headless-home --network=host --env HEADLESS_IN_CONTAINER=1 custom\/headless:dev sh -lc/);
     assert.match(output, /headless-agent codex --dangerously-bypass-approvals-and-sandbox --profile research/);
     assert.match(output, /exec -c 'model_reasoning_effort="high"' --json --skip-git-repo-check -/);
   } finally {

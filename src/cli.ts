@@ -113,6 +113,7 @@ import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl } from "./run-commands.js";
 import { handleCronCommand as handleCronCommandImpl, type CronCommand } from "./cron-commands.js";
 import { runCronDaemon } from "./cron.js";
+import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { extractRunNodeMetrics } from "./run-metrics.js";
 import { createRunStatusReporter, parseRunStatusIntervalMs } from "./run-status.js";
 import { isRunStoreLockSignalListener, waitForNodeStoreLockOwner } from "./run-storage.js";
@@ -3793,6 +3794,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     });
   }
   if (argv[0] === "cron-daemon") {
+    if (runningInHeadlessContainer(env)) {
+      stderr(`headless: ${hostOnlyError("the cron daemon").message}\n`);
+      return 2;
+    }
     await runCronDaemon(env);
     return 0;
   }
@@ -4310,6 +4315,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
     if (parsed.docker && parsed.modal) {
       throw new CliError("--docker cannot be used with --modal");
+    }
+    if (parsed.docker && runningInHeadlessContainer(env)) {
+      // Its session lock is host-only (no maximum hold time).
+      throw new CliError(hostOnlyError("--docker").message);
     }
     if (!parsed.agent) {
       parsed.agent = parsed.docker || parsed.modal

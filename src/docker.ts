@@ -17,6 +17,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 
 import { getAgentConfig } from "./agents.js";
 import { readCodexBaseFiles, readCodexProfileFiles } from "./codex-profile.js";
+import { IN_CONTAINER_ENV } from "./container.js";
 import { collectForwardedEnvEntries, type ForwardedEnvEntry } from "./env.js";
 import { quoteArg } from "./shell.js";
 import type { AgentName, BuiltCommand, Env } from "./types.js";
@@ -349,6 +350,9 @@ export function buildDockerAgentCommand(options: DockerAgentCommandOptions): Bui
   args.push(...credentialMountArgs(options.env, dockerEnvEntries, workDir));
   args.push(...dockerEnvArgs(dockerEnvEntries));
   args.push(...options.dockerArgs);
+  // Always last before the image, so no forwarded or user-supplied value
+  // overrides it: inside, headless refuses the cron daemon and nested --docker.
+  args.push("--env", `${IN_CONTAINER_ENV}=1`);
   const maskedEnvNames = Object.entries(options.command.env ?? {})
     .filter(([, value]) => value === undefined).map(([name]) => name);
   args.push(

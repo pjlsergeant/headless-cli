@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
+import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { extractFinalMessage } from "./output.js";
 import {
   readOwnerLockHolder,
@@ -290,6 +291,7 @@ export async function runDueCronJobsOnce(env: Env, now = new Date()): Promise<vo
 }
 
 export async function runCronDaemon(env: Env): Promise<void> {
+  if (runningInHeadlessContainer(env)) throw hostOnlyError("the cron daemon");
   ensurePrivateDir(dirname(cronDaemonLockPath(env)));
   // No maxHoldMs: the daemon holds this for its whole life, and only host
   // processes run it, so a dead holder is always detectable.
