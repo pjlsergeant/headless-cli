@@ -1950,10 +1950,13 @@ async function executeCommand(
         || options.cleanupBeforeParentSignalExit !== undefined;
       waitForAsyncMessageOwnership(env, command);
       let childEnv = commandEnv(env, command);
-      if (asyncMessageWorker) {
+      if (asyncMessageWorker || childEnv.HEADLESS_AGENT_PGID_FILE !== undefined) {
         childEnv = { ...childEnv };
         delete childEnv.HEADLESS_ASYNC_MESSAGE_OWNER_PID;
         delete childEnv.HEADLESS_ASYNC_MESSAGE_WORKER;
+        // Only this headless reports to the supervisor: a nested headless run
+        // by the agent must not overwrite the outer execution's agent group.
+        delete childEnv.HEADLESS_AGENT_PGID_FILE;
       }
       const child = spawn(command.command, command.args, {
         cwd,
@@ -1992,6 +1995,7 @@ async function executeCommand(
       // cannot exit (and orphan the tree) while it is still dying.
       let treeShutdown: {
         completed: boolean;
+        killed: boolean;
         reraise?: NodeJS.Signals;
         pendingResult?: ExecuteResult;
         timers: NodeJS.Timeout[];
@@ -2029,17 +2033,32 @@ async function executeCommand(
           stdoutEndsWithNewline,
         });
       };
+      // SIGKILL now and keep re-sending it on every poll (catching anything
+      // forked or regrouped since), still waiting for the tree to die.
+      const escalateTreeShutdown = () => {
+        if (!treeShutdown || treeShutdown.completed) return;
+        treeShutdown.killed = true;
+        signalChildTree("SIGKILL");
+      };
       const beginTreeShutdown = (signal: NodeJS.Signals) => {
+        if (treeShutdown) {
+          if (signal === "SIGKILL") escalateTreeShutdown();
+          else signalChildTree(signal);
+          return;
+        }
         signalChildTree(signal);
-        if (treeShutdown) return;
-        treeShutdown = { completed: false, timers: [] };
-        treeShutdown.timers.push(setTimeout(() => signalChildTree("SIGKILL"), terminationGraceMs));
+        treeShutdown = { completed: false, killed: signal === "SIGKILL", timers: [] };
+        treeShutdown.timers.push(setTimeout(escalateTreeShutdown, terminationGraceMs));
         treeShutdown.timers.push(setTimeout(() => {
           signalChildTree("SIGKILL");
           completeTreeShutdown(true);
         }, 2 * terminationGraceMs));
         treeShutdown.poll = setInterval(() => {
-          if (!tree.alive()) completeTreeShutdown(false);
+          if (!tree.alive()) {
+            completeTreeShutdown(false);
+          } else if (treeShutdown?.killed) {
+            signalChildTree("SIGKILL");
+          }
         }, 25);
       };
 
@@ -2066,7 +2085,8 @@ async function executeCommand(
         forceDrain = setTimeout(() => {
           forceDrain = undefined;
           if (settled || termination || stdoutDrainPending) return;
-          signalChildTree("SIGKILL");
+          // Kill what is left and hold this result until the tree is dead.
+          beginTreeShutdown("SIGKILL");
           child.stdout?.destroy();
           child.stderr?.destroy();
           finish({
@@ -2091,9 +2111,9 @@ async function executeCommand(
         for (const signal of parentExitSignals()) {
           const handler = () => {
             if (treeShutdown && parentTerminationSignal) {
-              // A second exit signal while the tree is draining: stop waiting.
-              signalChildTree("SIGKILL");
-              completeTreeShutdown(true);
+              // A second exit signal while the tree is draining: SIGKILL at
+              // once, but still wait (bounded) for the tree to die.
+              escalateTreeShutdown();
               return;
             }
             parentTerminationSignal = signal;
@@ -2233,11 +2253,13 @@ async function executeCommand(
         armForceDrain();
       });
       child.on("close", (code, signal) => {
-        if (ownsChildProcessGroup && options.cleanupBeforeParentSignalExit !== undefined) {
-          signalChildTree("SIGKILL");
-        }
-        if (termination) {
-          signalChildTree("SIGKILL");
+        // Antigravity (cleanup hook) and timed-out runs kill what the direct
+        // child left behind; finish() then holds the result until it is dead.
+        if (
+          (ownsChildProcessGroup && options.cleanupBeforeParentSignalExit !== undefined && tree.alive())
+          || termination
+        ) {
+          beginTreeShutdown("SIGKILL");
         }
         if (signal) {
           finish({ code: termination?.code ?? 1, terminationSignal: signal,

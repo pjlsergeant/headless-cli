@@ -203,6 +203,72 @@ test("embedded runCli does not resolve on a host-owned signal until the agent tr
   }
 });
 
+test("a second SIGTERM SIGKILLs at once but headless still waits for the tree to die", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-test-"));
+  const agentPidFile = join(dir, "agent.pid");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const binDir = join(dir, "bin");
+  writeFakeAgent(binDir, "claude");
+  let headless: ReturnType<typeof spawn> | undefined;
+  try {
+    headless = spawn(process.execPath, ["--import", "tsx", join(repoRoot, "src", "cli.ts"), "claude", "--prompt", "hello"], {
+      env: {
+        ...process.env,
+        HEADLESS_KILL_GRACE_MS: "5000",
+        HEADLESS_TEST_AGENT_PID: agentPidFile,
+        HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+        HEADLESS_TEST_IGNORE_TERM: "1",
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+      stdio: "ignore",
+    });
+    await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const exited = new Promise<NodeJS.Signals | null>((resolve) => headless?.once("exit", (_code, signal) => resolve(signal)));
+    const started = Date.now();
+    headless.kill("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    headless.kill("SIGTERM");
+    assert.equal(await exited, "SIGTERM");
+    // Well before the 5s grace: the second signal escalated immediately.
+    assert.ok(Date.now() - started < 4000, `took ${Date.now() - started}ms`);
+    assert.ok(processGone(readPid(agentPidFile)!), "agent outlived headless");
+    assert.ok(processGone(readPid(grandchildPidFile)!), "grandchild outlived headless");
+  } finally {
+    if (headless && headless.exitCode === null && headless.signalCode === null) headless.kill("SIGKILL");
+    killQuietly(readPid(agentPidFile));
+    killQuietly(readPid(grandchildPidFile));
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("headless reports the agent's group to its supervisor and hides the variable from the agent", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-test-"));
+  const pgidFile = join(dir, "agent.pgid");
+  const seenFile = join(dir, "seen.txt");
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir);
+  writeFileSync(join(binDir, "claude"), [
+    `#!${process.execPath}`,
+    "require('node:fs').writeFileSync(process.env.HEADLESS_TEST_SEEN, `${process.pid} ${process.env.HEADLESS_AGENT_PGID_FILE ?? 'unset'}`);",
+    "",
+  ].join("\n"));
+  chmodSync(join(binDir, "claude"), 0o755);
+  try {
+    await runCli(["claude", "--prompt", "hello"], {
+      env: { ...process.env, HEADLESS_AGENT_PGID_FILE: pgidFile, HEADLESS_TEST_SEEN: seenFile, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    const [agentPid, seen] = readFileSync(seenFile, "utf8").split(" ");
+    // A nested headless run by the agent must not overwrite the outer report.
+    assert.equal(seen, "unset");
+    assert.equal(readPid(pgidFile), Number(agentPid));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 interface CronAgentExecution {
   dir: string;
   env: NodeJS.ProcessEnv;

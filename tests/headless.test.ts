@@ -4284,7 +4284,8 @@ test("CLI bounds Antigravity stdout drain after the direct child exits", async (
     assert.equal(code, 0);
     assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
     grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-    await waitFor(() => !processIsAlive(grandchildPid as number));
+    // runCli must not resolve while the drained descendant is still alive.
+    assert.equal(processTerminated(grandchildPid as number), true);
     assert.equal(existsSync(naturalExitPath), false);
   } finally {
     if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
@@ -4335,7 +4336,8 @@ test(
       assert.equal(code, 0);
       assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
       grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while the descendant is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     } finally {
       if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
       rmSync(dir, { force: true, recursive: true });
@@ -4383,7 +4385,8 @@ test(
       assert.equal(code, 124);
       assert.match(stdout.join(""), /antigravity final/);
       grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while the descendant is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     } finally {
       if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
       rmSync(dir, { force: true, recursive: true });
