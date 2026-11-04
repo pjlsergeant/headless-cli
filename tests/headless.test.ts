@@ -26,7 +26,7 @@ import {
   listAgents,
   waitTierForAgent,
 } from "../src/agents.ts";
-import { acpClientCapabilities } from "../src/acp.ts";
+import { acpClientCapabilities, runAcpClient } from "../src/acp.ts";
 import { runCli } from "../src/cli.ts";
 import { parseHeadlessConfig } from "../src/config.ts";
 import { DEFAULT_DOCKER_IMAGE, dockerSessionHomePath } from "../src/docker.ts";
@@ -109,7 +109,7 @@ test("builds Codex profile commands without overriding the profile model", () =>
   );
   assert.deepEqual(
     buildInteractiveAgentCommand("codex", { prompt: "hello", profile: "research" }, {}).args.slice(0, 4),
-    ["--dangerously-bypass-approvals-and-sandbox", "--profile", "research", "hello"],
+    ["--dangerously-bypass-approvals-and-sandbox", "--profile", "research", "--"],
   );
 });
 
@@ -241,6 +241,83 @@ test("ACP client advertises read-only filesystem capability", () => {
   });
 });
 
+test("ACP client confines file reads to the work dir, including through symlinks", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-acp-read-"));
+  try {
+    const work = join(dir, "work");
+    mkdirSync(join(work, "src"), { recursive: true });
+    writeFileSync(join(work, "src", "inside.txt"), "inside content");
+    writeFileSync(join(dir, "outside.txt"), "outside content");
+    symlinkSync(join(dir, "outside.txt"), join(work, "escape.txt"));
+    symlinkSync("src/inside.txt", join(work, "alias.txt"));
+    const fifo = join(work, "pipe");
+    assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+    const sdk = pathToFileURL(join(repoRoot, "node_modules", "@agentclientprotocol", "sdk", "dist", "acp.js")).href;
+    const server = join(dir, "server.mjs");
+    writeFileSync(
+      server,
+      [
+        `import * as acp from ${JSON.stringify(sdk)};`,
+        "import { Readable, Writable } from 'node:stream';",
+        "const paths = JSON.parse(process.env.HEADLESS_TEST_READ_PATHS);",
+        "const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));",
+        "const connection = new acp.AgentSideConnection(() => ({",
+        "  async initialize(params) { return { protocolVersion: params.protocolVersion, agentCapabilities: {} }; },",
+        "  async authenticate() { return {}; },",
+        "  async newSession() { return { sessionId: 's' }; },",
+        "  async prompt(params) {",
+        "    const results = [];",
+        "    for (const path of paths) {",
+        "      try { results.push('OK:' + (await connection.readTextFile({ sessionId: 's', path })).content); }",
+        "      catch (error) { results.push('ERR:' + error.message); }",
+        "    }",
+        "    await connection.sessionUpdate({ sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(results) } } });",
+        "    return { stopReason: 'end_turn' };",
+        "  },",
+        "  async cancel() {},",
+        "}), stream);",
+        "await connection.closed;",
+        "",
+      ].join("\n"),
+    );
+    const paths = [
+      join(work, "src", "inside.txt"),
+      join(work, "alias.txt"),
+      "src/inside.txt",
+      join(dir, "outside.txt"),
+      join(work, "..", "outside.txt"),
+      join(work, "escape.txt"),
+      join(work, "missing.txt"),
+      fifo,
+    ];
+    const stdout: string[] = [];
+    const code = await runAcpClient({
+      agentCommand: { command: process.execPath, args: [server] },
+      prompt: "read",
+      cwd: work,
+      allow: "read-only",
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", HEADLESS_TEST_READ_PATHS: JSON.stringify(paths) },
+      stdout: (text) => stdout.push(text),
+      stderr: () => {},
+    });
+    assert.equal(code, 0, stdout.join(""));
+    const message = stdout
+      .map((line) => JSON.parse(line))
+      .find((record) => record.type === "message");
+    const results = JSON.parse(message.content[0].text) as string[];
+    assert.deepEqual(results.slice(0, 3), ["OK:inside content", "OK:inside content", "OK:inside content"]);
+    for (const result of results.slice(3, 6)) {
+      assert.match(result, /^ERR:.*file reads are limited to the work dir/);
+    }
+    assert.match(results[6], /^ERR:Resource not found/);
+    // A FIFO inside the work dir is refused instead of blocking the read forever.
+    assert.match(results[7], /^ERR:.*only regular files can be read/);
+    assert.ok(!stdout.join("").includes("outside content"));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("builds ACP adapter command from registry npx distribution", () => {
   const registry = {
     agents: [
@@ -309,13 +386,14 @@ test("builds reasoning effort flags for supported agents", () => {
     "--model",
     "claude-opus-4-6",
     "-p",
-    "hello",
     "--output-format",
     "stream-json",
     "--verbose",
     "--effort",
     "xhigh",
     "--dangerously-skip-permissions",
+    "--",
+    "hello",
   ]);
 
   assert.deepEqual(buildAgentCommand("opencode", { prompt: "hello", reasoningEffort: "medium" }, {}).args, [
@@ -411,13 +489,14 @@ test("maps Cursor reasoning effort to model variants and leaves Gemini unchanged
       "--model",
       "gemini-3.1-pro-preview",
       "--skip-trust",
-      "-p",
-      "hello",
+      "--prompt",
+      "",
       "--output-format",
       "stream-json",
       "--approval-mode",
       "yolo",
     ],
+    stdinText: "hello",
   });
 });
 
@@ -474,11 +553,12 @@ test("builds claude, cursor, gemini, opencode, and pi prompt commands", () => {
       "--model",
       "sonnet",
       "-p",
-      "hello",
       "--output-format",
       "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
+      "--",
+      "hello",
     ],
   });
 
@@ -493,13 +573,14 @@ test("builds claude, cursor, gemini, opencode, and pi prompt commands", () => {
       "--model",
       "gemini-model",
       "--skip-trust",
-      "-p",
-      "hello",
+      "--prompt",
+      "",
       "--output-format",
       "stream-json",
       "--approval-mode",
       "yolo",
     ],
+    stdinText: "hello",
   });
 
   assert.deepEqual(buildAgentCommand("opencode", { prompt: "hello", model: "oc-model" }, {}), {
@@ -625,7 +706,7 @@ test("CLI print-command normalizes Claude model shorthand", async () => {
   });
 
   assert.equal(code, 0);
-  assert.match(stdout.join(""), /^claude --model claude-sonnet-4-5 -p hello/);
+  assert.match(stdout.join(""), /^claude --model claude-sonnet-4-5 -p .* -- hello\n$/);
 });
 
 test("prefers an executable user-local Claude binary", () => {
@@ -732,11 +813,12 @@ test("builds native session commands for supported agents", () => {
       "-p",
       "--session-id",
       "11111111-1111-4111-8111-111111111111",
-      "hello",
       "--output-format",
       "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
+      "--",
+      "hello",
     ],
   );
 
@@ -771,8 +853,8 @@ test("builds native session commands for supported agents", () => {
     "--skip-trust",
     "--resume",
     "gem-1",
-    "-p",
-    "hello",
+    "--prompt",
+    "",
     "--output-format",
     "stream-json",
     "--approval-mode",
@@ -822,15 +904,39 @@ test("CLI passes Antigravity model selection through to agy", async () => {
   }
 });
 
+test("prompts starting with a dash are never passed where the agent CLI parses options", () => {
+  const prompt = "- fix the failing test\n- then run lint";
+  for (const [agent, build] of [
+    ["claude", buildAgentCommand],
+    ["claude", buildInteractiveAgentCommand],
+    ["codex", buildInteractiveAgentCommand],
+  ] as const) {
+    const { args } = build(agent, { prompt }, {});
+    assert.deepEqual(args.slice(-2), ["--", prompt], `${agent} ${build.name}`);
+  }
+  const resumed = buildInteractiveAgentCommand("codex", { prompt, sessionId: "thread-1", sessionMode: "resume" }, {});
+  assert.deepEqual(resumed.args.slice(-4), ["resume", "thread-1", "--", prompt]);
+  const resumedClaude = buildAgentCommand("claude", { prompt, sessionId: "thread-1", sessionMode: "resume" }, {});
+  assert.deepEqual(resumedClaude.args.slice(-2), ["--", prompt]);
+  assert.ok(resumedClaude.args.indexOf("--resume") < resumedClaude.args.indexOf("--"));
+
+  // Codex one-shot, Gemini one-shot and ACP read the prompt from stdin.
+  for (const agent of ["codex", "gemini"] as const) {
+    const command = buildAgentCommand(agent, { prompt }, {});
+    assert.equal(command.stdinText, prompt, agent);
+    assert.ok(!command.args.includes(prompt), agent);
+  }
+});
+
 test("builds interactive commands for tmux mode", () => {
   assert.deepEqual(buildInteractiveAgentCommand("codex", { prompt: "hello", model: "gpt-next" }, {}), {
     command: "codex",
-    args: ["--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-next", "hello"],
+    args: ["--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-next", "--", "hello"],
   });
 
   assert.deepEqual(buildInteractiveAgentCommand("claude", { prompt: "hello", model: "sonnet" }, {}), {
     command: "claude",
-    args: ["--model", "sonnet", "--dangerously-skip-permissions", "hello"],
+    args: ["--model", "sonnet", "--dangerously-skip-permissions", "--", "hello"],
   });
 
   assert.deepEqual(buildInteractiveAgentCommand("gemini", { prompt: "hello", model: "gemini-model" }, {}), {
@@ -897,13 +1003,14 @@ test("builds reasoning effort flags for supported interactive commands", () => {
       "gpt-5.5",
       "-c",
       'model_reasoning_effort="high"',
+      "--",
       "hello",
     ],
   });
 
   assert.deepEqual(buildInteractiveAgentCommand("claude", { prompt: "hello", reasoningEffort: "xhigh" }, {}), {
     command: "claude",
-    args: ["--model", "claude-opus-4-6", "--effort", "xhigh", "--dangerously-skip-permissions", "hello"],
+    args: ["--model", "claude-opus-4-6", "--effort", "xhigh", "--dangerously-skip-permissions", "--", "hello"],
   });
 
   assert.deepEqual(buildInteractiveAgentCommand("pi", { prompt: "hello", reasoningEffort: "low" }, {}), {
@@ -1145,7 +1252,7 @@ test("CLI applies model and reasoning defaults from ~/.headless/config.toml", as
     assert.equal(claudeCode, 0);
     assert.equal(
       stdout.join(""),
-      "claude --model claude-opus-4-8 -p hello --output-format stream-json --verbose --dangerously-skip-permissions\n",
+      "claude --model claude-opus-4-8 -p --output-format stream-json --verbose --dangerously-skip-permissions -- hello\n",
     );
   } finally {
     rmSync(dir, { force: true, recursive: true });
@@ -2868,6 +2975,33 @@ test("CLI --docker print-command wraps the selected agent command", async () => 
   }
 });
 
+test("CLI --docker mounts a staged selected AWS profile and removes it afterwards", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const homeDir = join(dir, "home");
+    const projectDir = join(dir, "project");
+    mkdirSync(join(homeDir, ".aws"), { recursive: true });
+    mkdirSync(projectDir);
+    writeFileSync(join(homeDir, ".aws", "credentials"), "[dev]\naws_access_key_id = dev\n[prod]\naws_access_key_id = prod\n");
+    const stdout: string[] = [];
+    const code = await runCli(
+      ["codex", "--prompt", "hello", "--work-dir", projectDir, "--docker", "--print-command"],
+      {
+        env: { ...process.env, CODEX_HOME: undefined, HOME: homeDir, AWS_PROFILE: "dev" },
+        stdout: (text) => stdout.push(text),
+      },
+    );
+    assert.equal(code, 0);
+    const output = stdout.join("");
+    assert.ok(!output.includes(`${join(homeDir, ".aws")}:`), output);
+    const match = /--volume '?([^ ']*headless-docker-credentials-[^ ']*\/aws\/\.aws):\/tmp\/headless-host-home\/\.aws:ro/.exec(output);
+    assert.ok(match, output);
+    assert.equal(existsSync(dirname(dirname(match[1]))), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("CLI --docker --session print-command prepares its bind-mount source", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
   try {
@@ -3086,6 +3220,13 @@ test("CLI rejects invalid Modal option combinations", async () => {
     2,
   );
   assert.match(stderr.join(""), /--docker cannot be used with --modal/);
+
+  stderr.length = 0;
+  assert.equal(
+    await runCli(["codex", "--prompt", "hello", "--modal-keep-sandbox"], { stderr: (text) => stderr.push(text) }),
+    2,
+  );
+  assert.match(stderr.join(""), /--modal-\* options require --modal/);
 
   stderr.length = 0;
   assert.equal(
@@ -4797,7 +4938,7 @@ test("CLI --tmux launches an interactive tmux session and sends the prompt", asy
         sessionName,
         "-c",
         dir,
-        "codex --dangerously-bypass-approvals-and-sandbox --model gpt-next 'hello world'",
+        "codex --dangerously-bypass-approvals-and-sandbox --model gpt-next -- 'hello world'",
       ],
     ]);
     assert.match(sessionName, /^headless-codex-\d+$/);
@@ -6211,6 +6352,7 @@ test("CLI --tmux preserves multiline prompt-file text through the tmux shell com
       "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-next",
+      "--",
       "line one\nline two",
     ]);
   } finally {
@@ -7283,6 +7425,7 @@ test("CLI help lists all Modal options", async () => {
     "--modal-secret",
     "--modal-env",
     "--modal-include-git",
+    "--modal-keep-sandbox",
   ]) {
     assert.match(help, new RegExp(flag));
   }

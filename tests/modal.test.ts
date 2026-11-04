@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,6 +16,8 @@ import {
   DEFAULT_MODAL_MEMORY_MIB,
   DEFAULT_MODAL_TIMEOUT_SECONDS,
   executeModalAgent,
+  MODAL_KEPT_SANDBOX_LIFETIME_SECONDS,
+  MODAL_RECOVERY_TIMEOUT_SECONDS,
   syncWorkspace,
   type ModalClientLike,
   type ModalExecParams,
@@ -193,6 +195,126 @@ test("syncWorkspace does not delete local-only descendants when a remote directo
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("syncWorkspace refuses sandbox symlinks that point outside the work dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-links-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(join(result, "sub", "loop"), { recursive: true });
+    mkdirSync(work);
+    writeFileSync(join(dir, "secret"), "secret");
+    symlinkSync(join(dir, "secret"), join(result, "absolute"));
+    symlinkSync("../../secret", join(result, "sub", "escape"));
+    symlinkSync("../secret", join(result, "parent"));
+    symlinkSync("sub/target.txt", join(result, "inside"));
+    symlinkSync("../sub/target.txt", join(result, "sub", "inside-up"));
+    writeFileSync(join(result, "sub", "target.txt"), "in tree");
+    // Lexically inside, but "self" resolves to sub/loop itself, so ../.. leaves the tree.
+    symlinkSync(".", join(result, "sub", "loop", "self"));
+    symlinkSync("self/../../../secret", join(result, "sub", "loop", "physical"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts.sort(), ["absolute", "parent", "sub/escape", "sub/loop/physical"]);
+    for (const path of ["absolute", "parent", "sub/escape", "sub/loop/physical"]) {
+      assert.equal(existsSync(join(work, path)) || isSymlink(join(work, path)), false, path);
+    }
+    assert.equal(readlinkSync(join(work, "inside")), "sub/target.txt");
+    assert.equal(readFileSync(join(work, "inside"), "utf8"), "in tree");
+    assert.equal(readFileSync(join(work, "sub", "inside-up"), "utf8"), "in tree");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("syncWorkspace refuses sandbox symlink targets containing a backslash", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-backslash-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(result);
+    mkdirSync(work);
+    symlinkSync("a\\b/../../secret", join(result, "sneaky"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts, ["sneaky"]);
+    assert.equal(isSymlink(join(work, "sneaky")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("syncWorkspace judges links against the final tree before deleting anything", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-final-tree-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    for (const root of [baseline, result, work]) mkdirSync(join(root, "a"), { recursive: true });
+    mkdirSync(join(result, "s"));
+    writeFileSync(join(baseline, "a", "x"), "precious");
+    writeFileSync(join(work, "a", "x"), "precious");
+    // Checked alone, a/x stays inside (s/self does not exist yet). Once
+    // s/self -> "." exists it resolves to s, and the two ".." leave the tree.
+    symlinkSync("../s/self/../../secret", join(result, "a", "x"));
+    symlinkSync(".", join(result, "s", "self"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts, ["a/x"]);
+    assert.equal(isSymlink(join(work, "a", "x")), false);
+    assert.equal(readFileSync(join(work, "a", "x"), "utf8"), "precious");
+    assert.equal(readlinkSync(join(work, "s", "self")), ".");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("syncWorkspace treats case and Unicode-normalisation collisions as conflicts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-case-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(join(result, "docs"), { recursive: true });
+    mkdirSync(join(work, "Docs"), { recursive: true });
+    writeFileSync(join(work, "README.md"), "local untracked");
+    writeFileSync(join(result, "readme.md"), "remote");
+    writeFileSync(join(work, "Docs", "guide.md"), "local guide");
+    writeFileSync(join(result, "docs", "guide.md"), "remote guide");
+    const nfc = "caf\u00e9.txt";
+    const nfd = "cafe\u0301.txt";
+    writeFileSync(join(work, nfc), "local cafe");
+    writeFileSync(join(result, nfd), "remote cafe");
+    writeFileSync(join(result, "fresh.txt"), "new");
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work, caseInsensitive: true });
+
+    assert.deepEqual(sync.changed, ["fresh.txt"]);
+    assert.deepEqual(sync.conflicts.sort(), [nfd, "docs", "readme.md"].sort());
+    assert.equal(readFileSync(join(work, "README.md"), "utf8"), "local untracked");
+    assert.equal(readFileSync(join(work, "Docs", "guide.md"), "utf8"), "local guide");
+    assert.equal(readFileSync(join(work, nfc), "utf8"), "local cafe");
+    assert.equal(existsSync(join(work, "readme.md")) && readFileSync(join(work, "readme.md"), "utf8") === "remote", false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
 test("executeModalAgent runs through a Modal client and syncs results back", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-exec-"));
@@ -588,6 +710,50 @@ test("executeModalAgent rejects non-git workdirs instead of recursively uploadin
   }
 });
 
+test("executeModalAgent uploads a worktree with an unstaged tracked-file deletion", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-unstaged-delete-"));
+  try {
+    const work = join(dir, "work");
+    const remote = join(dir, "remote");
+    mkdirSync(work);
+    mkdirSync(remote);
+    initGitWorkdir(work);
+    writeFileSync(join(work, "input.txt"), "local");
+    writeFileSync(join(work, "gone.txt"), "tracked");
+    symlinkSync("missing-target", join(work, "dangling"));
+    assert.equal(spawnSync("git", ["add", "."], { cwd: work }).status, 0);
+    rmSync(join(work, "gone.txt"));
+    const sandbox = new FakeSandbox(remote);
+
+    const result = await executeModalAgent({
+      agent: "codex",
+      appName: "headless-test",
+      command: { command: "codex", args: ["exec", "--json", "-"], stdinText: "prompt" },
+      cpu: DEFAULT_MODAL_CPU,
+      env: { HOME: join(dir, "home"), OPENAI_API_KEY: "sk-test" },
+      image: DEFAULT_MODAL_IMAGE,
+      includeGit: false,
+      memoryMiB: DEFAULT_MODAL_MEMORY_MIB,
+      modalEnv: [],
+      modalSecrets: [],
+      stderr: () => {},
+      stdout: () => {},
+      stdoutHandling: "capture",
+      timeoutSeconds: DEFAULT_MODAL_TIMEOUT_SECONDS,
+      workDir: work,
+      clientFactory: async () => new FakeModalClient(sandbox),
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(existsSync(join(remote, "workspace", "gone.txt")), false);
+    assert.equal(readlinkSync(join(remote, "workspace", "dangling")), "missing-target");
+    assert.equal(existsSync(join(work, "gone.txt")), false);
+    assert.equal(readFileSync(join(work, "input.txt"), "utf8"), "remote");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("executeModalAgent includeGit uploads git metadata without ignored files", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-include-git-"));
   try {
@@ -672,6 +838,306 @@ test("executeModalAgent rejects unsafe result archive entries before local extra
   }
 });
 
+function modalRecoveryOptions(dir: string, work: string, sandbox: FakeSandbox, stderr: string[]) {
+  return {
+    agent: "codex" as const,
+    appName: "headless-test",
+    command: { command: "codex", args: ["exec", "--json", "-"], stdinText: "prompt" },
+    cpu: DEFAULT_MODAL_CPU,
+    env: { HOME: join(dir, "home"), OPENAI_API_KEY: "sk-test" },
+    image: DEFAULT_MODAL_IMAGE,
+    includeGit: false,
+    memoryMiB: DEFAULT_MODAL_MEMORY_MIB,
+    modalEnv: [],
+    modalSecrets: [],
+    stderr: (text: string) => stderr.push(text),
+    stdout: () => {},
+    stdoutHandling: "capture" as const,
+    timeoutSeconds: 600,
+    workDir: work,
+    clientFactory: async () => new FakeModalClient(sandbox),
+  };
+}
+
+function setupRecoveryWorkdir(prefix: string): { dir: string; work: string; remote: string } {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const work = join(dir, "work");
+  const remote = join(dir, "remote");
+  mkdirSync(work);
+  mkdirSync(remote);
+  initGitWorkdir(work);
+  writeFileSync(join(work, "input.txt"), "local");
+  return { dir, work, remote };
+}
+
+test("Modal result download gets its own recovery window after the agent deadline", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-window-");
+  try {
+    const sandbox = new FakeSandbox(remote);
+    await executeModalAgent(modalRecoveryOptions(dir, work, sandbox, []));
+    assert.equal(sandbox.createParams?.timeoutMs, (600 + MODAL_RECOVERY_TIMEOUT_SECONDS) * 1000);
+    const capture = sandbox.execParams.find(({ command }) => isTarCommand(command[0]) && command[1] === "-czf");
+    assert.equal(capture?.params?.timeoutMs, MODAL_RECOVERY_TIMEOUT_SECONDS * 1000);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal saves the downloaded archive privately when extraction fails, then terminates", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-extract-");
+  try {
+    const archive = makeTarGz([{ content: "outside", name: "../../outside.txt" }]);
+    const sandbox = new FakeSandbox(remote, { resultArchive: archive });
+    sandbox.sandboxId = "sb-abcdef123456";
+    const stderr: string[] = [];
+
+    await assert.rejects(
+      () => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)),
+      /modal result recovery failed: unsafe Modal workspace archive entry/,
+    );
+
+    const recoveryDir = join(dir, "home", ".headless", "modal-recovery");
+    const files = readdirSync(recoveryDir);
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^\d{8}T\d{6}Z-ef123456\.tar\.gz$/);
+    const saved = join(recoveryDir, files[0]);
+    assert.deepEqual(readFileSync(saved), Buffer.from(archive));
+    assert.equal(lstatSync(recoveryDir).mode & 0o777, 0o700);
+    assert.equal(lstatSync(saved).mode & 0o777, 0o600);
+    const output = stderr.join("");
+    assert.ok(output.includes(saved), output);
+    assert.match(output, /tar -xzf /);
+    assert.equal(sandbox.terminated, true);
+    assert.equal(existsSync(join(dir, "outside.txt")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal keeps the sandbox and prints its id when the result download fails", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-download-");
+  try {
+    const sandbox = new FakeSandbox(remote, { captureError: "tar: connection lost" });
+    sandbox.sandboxId = "sb-download1";
+    const stderr: string[] = [];
+
+    await assert.rejects(
+      () => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)),
+      /modal result recovery failed: tar: connection lost/,
+    );
+
+    // Nothing was saved locally, so the sandbox is the only copy of the work.
+    assert.equal(sandbox.terminated, false);
+    const output = stderr.join("");
+    assert.match(output, /modal result recovery failed: tar: connection lost/);
+    assert.match(output, /not saved locally, so Modal sandbox sb-download1 was left running/);
+    assert.match(output, /lifetime from creation ends/);
+    assert.equal(existsSync(join(dir, "home", ".headless", "modal-recovery")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal recovers the workspace when execution fails, then rethrows the execution error", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-exec-error-");
+  try {
+    const sandbox = new FakeSandbox(remote);
+    await assert.rejects(
+      () =>
+        executeModalAgent({
+          ...modalRecoveryOptions(dir, work, sandbox, []),
+          invoke: async (execute) => {
+            await execute({ command: "codex", args: ["exec", "-"], stdinText: "prompt" }, {}, 60, () => {});
+            throw new Error("stdout stream broke");
+          },
+        }),
+      /stdout stream broke/,
+    );
+    assert.equal(readFileSync(join(work, "created.txt"), "utf8"), "created");
+    assert.equal(sandbox.terminated, true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("--modal-keep-sandbox applies when execution fails and the download fails too", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-exec-keep-");
+  try {
+    const sandbox = new FakeSandbox(remote, { captureError: "tar: gone" });
+    sandbox.sandboxId = "sb-execkeep";
+    const stderr: string[] = [];
+    await assert.rejects(
+      () =>
+        executeModalAgent({
+          ...modalRecoveryOptions(dir, work, sandbox, stderr),
+          keepSandboxOnFailure: true,
+          invoke: async () => {
+            throw new Error("wait rejected");
+          },
+        }),
+      /wait rejected/,
+    );
+    assert.equal(sandbox.terminated, false);
+    assert.match(stderr.join(""), /sb-execkeep/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal saves the archive when sync conflicts leave remote changes unapplied", async () => {
+  for (const keep of [false, true]) {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-conflict-");
+    try {
+      // The fake agent writes input.txt remotely; change it locally meanwhile.
+      const sandbox = new FakeSandbox(remote, { beforeCapture: () => writeFileSync(join(work, "input.txt"), "edited locally") });
+      sandbox.sandboxId = "sb-conflict1";
+      const stderr: string[] = [];
+      const result = await executeModalAgent({ ...modalRecoveryOptions(dir, work, sandbox, stderr), keepSandboxOnFailure: keep });
+      assert.equal(result.code, 0);
+      assert.deepEqual(result.conflicts, ["input.txt"]);
+      assert.equal(readFileSync(join(work, "input.txt"), "utf8"), "edited locally");
+      const recoveryDir = join(dir, "home", ".headless", "modal-recovery");
+      assert.equal(readdirSync(recoveryDir).length, 1);
+      assert.match(stderr.join(""), /saved the remote Modal workspace/);
+      assert.equal(sandbox.terminated, !keep);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
+test("Modal keeps the sandbox when the recovery archive cannot be saved", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-save-fail-");
+  try {
+    mkdirSync(join(dir, "home"), { recursive: true });
+    writeFileSync(join(dir, "home", ".headless"), "not a directory");
+    const sandbox = new FakeSandbox(remote, { resultArchive: makeTarGz([{ content: "x", name: "../escape.txt" }]) });
+    sandbox.sandboxId = "sb-nosave";
+    const stderr: string[] = [];
+    await assert.rejects(() => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)), /recovery failed/);
+    assert.equal(sandbox.terminated, false);
+    assert.match(stderr.join(""), /could not save the Modal workspace archive/);
+    assert.match(stderr.join(""), /sb-nosave was left running/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal bounds the downloaded and the extracted archive size", async () => {
+  {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-cap-download-");
+    try {
+      const sandbox = new FakeSandbox(remote);
+      const options = modalRecoveryOptions(dir, work, sandbox, []);
+      await assert.rejects(
+        () => executeModalAgent({ ...options, env: { ...options.env, HEADLESS_MODAL_MAX_ARCHIVE_BYTES: "64" } }),
+        /exceeds 64 bytes \(HEADLESS_MODAL_MAX_ARCHIVE_BYTES\)/,
+      );
+      assert.equal(sandbox.terminated, false);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+  {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-cap-extract-");
+    try {
+      const sandbox = new FakeSandbox(remote, { resultArchive: makeTarGz([{ content: "z".repeat(100_000), name: "big.txt" }]) });
+      const options = modalRecoveryOptions(dir, work, sandbox, []);
+      await assert.rejects(
+        () => executeModalAgent({ ...options, env: { ...options.env, HEADLESS_MODAL_MAX_EXTRACTED_BYTES: "50000" } }),
+        /expands beyond 50000 bytes/,
+      );
+      assert.equal(existsSync(join(work, "big.txt")), false);
+      // The (small) download itself was saved, so the sandbox can go.
+      assert.equal(readdirSync(join(dir, "home", ".headless", "modal-recovery")).length, 1);
+      assert.equal(sandbox.terminated, true);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
+test("Modal refuses sparse result entries in pax and GNU formats", async () => {
+  for (const format of ["pax", "gnu"]) {
+    const { dir, work, remote } = setupRecoveryWorkdir(`headless-modal-recovery-sparse-${format}-`);
+    try {
+      const source = join(dir, "sparse-source");
+      mkdirSync(source);
+      // 1 GiB logical size, almost no payload.
+      assert.equal(spawnSync("truncate", ["-s", "1G", join(source, "huge.bin")]).status, 0);
+      const archive = spawnSync("tar", ["--sparse", `--format=${format}`, "-czf", "-", "-C", source, "."], { encoding: "buffer" });
+      assert.equal(archive.status, 0, archive.stderr?.toString());
+      assert.ok(archive.stdout.byteLength < 100_000);
+      const sandbox = new FakeSandbox(remote, { resultArchive: archive.stdout });
+      const stderr: string[] = [];
+      await assert.rejects(
+        () => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)),
+        /sparse files are not supported|unsupported type S/,
+      );
+      assert.equal(existsSync(join(work, "huge.bin")), false);
+      assert.match(stderr.join(""), /saved the remote Modal workspace/);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
+test("Modal refuses result archives whose entries would overwrite each other", async () => {
+  for (const [names, pattern] of [
+    [["notes/A", "notes/a"], /notes\/a collides with notes\/A/],
+    [["dup.txt", "./dup.txt"], /duplicate entry dup\.txt/],
+  ] as const) {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-collide-");
+    try {
+      const archive = makeTarGz(names.map((name, index) => ({ content: `version ${index}`, name })));
+      const sandbox = new FakeSandbox(remote, { resultArchive: archive });
+      const stderr: string[] = [];
+      await assert.rejects(() => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)), pattern);
+      // Treated as unapplied work: archive saved durably before terminating.
+      assert.equal(readdirSync(join(dir, "home", ".headless", "modal-recovery")).length, 1);
+      assert.equal(sandbox.terminated, true);
+      assert.equal(existsSync(join(work, "notes")) || existsSync(join(work, "dup.txt")), false);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
+test("--modal-keep-sandbox leaves the sandbox running and prints its id when recovery fails", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-keep-");
+  try {
+    const sandbox = new FakeSandbox(remote, { captureError: "tar: connection lost" });
+    sandbox.sandboxId = "sb-keepme42";
+    const stderr: string[] = [];
+
+    await assert.rejects(
+      () => executeModalAgent({ ...modalRecoveryOptions(dir, work, sandbox, stderr), keepSandboxOnFailure: true }),
+      /modal result recovery failed/,
+    );
+
+    assert.equal(sandbox.terminated, false);
+    const output = stderr.join("");
+    assert.match(output, /sb-keepme42/);
+    assert.match(output, /keeps billing until you terminate it/);
+    assert.match(output, /terminate/);
+    assert.equal(sandbox.createParams?.timeoutMs, MODAL_KEPT_SANDBOX_LIFETIME_SECONDS * 1000);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("--modal-keep-sandbox still terminates the sandbox after a successful sync", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-keep-ok-");
+  try {
+    const sandbox = new FakeSandbox(remote);
+    const result = await executeModalAgent({ ...modalRecoveryOptions(dir, work, sandbox, []), keepSandboxOnFailure: true });
+    assert.equal(result.code, 0);
+    assert.equal(sandbox.terminated, true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 class FakeModalClient implements ModalClientLike {
   appName = "";
   closed = false;
@@ -723,18 +1189,23 @@ class FakeSandbox implements ModalSandboxLike {
   agentStdin = "";
   commands: string[][] = [];
   createParams?: ModalSandboxCreateParams;
+  execParams: { command: string[]; params?: ModalExecParams }[] = [];
+  sandboxId?: string;
   terminated = false;
 
   constructor(
     private root: string,
     public options: {
       agentStdoutChunks?: string[];
+      beforeCapture?: () => void;
+      captureError?: string;
       resultArchive?: Uint8Array;
     } = {},
   ) {}
 
   async exec(command: string[], params?: ModalExecParams): Promise<ModalProcessLike<string | Uint8Array>> {
     this.commands.push(command);
+    this.execParams.push({ command, params });
     const process = new FakeProcess(command, params, this.root, this);
     return process;
   }
@@ -795,6 +1266,8 @@ class FakeProcess implements ModalProcessLike<string | Uint8Array> {
       return;
     }
     if (isTarCommand(this.command[0]) && this.command[1] === "-czf") {
+      this.sandbox.options.beforeCapture?.();
+      if (this.sandbox.options.captureError) throw new Error(this.sandbox.options.captureError);
       if (this.sandbox.options.resultArchive) {
         this.stdoutValue = this.sandbox.options.resultArchive;
         return;

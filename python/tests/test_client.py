@@ -111,6 +111,7 @@ def test_run_supports_prompt_file_acp_modal_and_print_command(
         modal_secrets=["one", "two"],
         modal_env=["A=1"],
         modal_include_git=True,
+        modal_keep_sandbox=True,
         print_command=True,
     )
 
@@ -147,6 +148,7 @@ def test_run_supports_prompt_file_acp_modal_and_print_command(
         "--modal-env",
         "A=1",
         "--modal-include-git",
+        "--modal-keep-sandbox",
         "--print-command",
     ]
 

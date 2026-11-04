@@ -1,28 +1,37 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
+  createReadStream,
+  fsyncSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readlinkSync,
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { gunzipSync } from "node:zlib";
+import { createGunzip, gunzipSync } from "node:zlib";
 
 import { getAgentConfig } from "./agents.js";
 import { codexProfileSeedFiles, readCodexBaseFiles } from "./codex-profile.js";
+import { seedAwsProfileFiles } from "./aws-profile.js";
 import { collectForwardedEnvEntries } from "./env.js";
+import { quoteArg } from "./shell.js";
 import type { AgentName, BuiltCommand, Env } from "./types.js";
 
 export const DEFAULT_MODAL_IMAGE =
@@ -31,6 +40,32 @@ export const DEFAULT_MODAL_APP = "headless-cli";
 export const DEFAULT_MODAL_CPU = 2;
 export const DEFAULT_MODAL_MEMORY_MIB = 4096;
 export const DEFAULT_MODAL_TIMEOUT_SECONDS = 3600;
+// Result download gets its own window after the agent deadline.
+export const MODAL_RECOVERY_TIMEOUT_SECONDS = 120;
+// Lifetime of a sandbox created with --modal-keep-sandbox, so it outlives a
+// failed recovery long enough to be inspected (Modal's sandbox maximum).
+export const MODAL_KEPT_SANDBOX_LIFETIME_SECONDS = 24 * 60 * 60;
+// Bounds on the untrusted result archive: downloaded (compressed) size and
+// the size it expands to. Overridable, in bytes, through these variables.
+export const MODAL_MAX_ARCHIVE_BYTES_ENV = "HEADLESS_MODAL_MAX_ARCHIVE_BYTES";
+export const MODAL_MAX_EXTRACTED_BYTES_ENV = "HEADLESS_MODAL_MAX_EXTRACTED_BYTES";
+const defaultMaxArchiveBytes = 4 * 1024 ** 3;
+const defaultMaxExtractedBytes = 16 * 1024 ** 3;
+
+export function modalArchiveLimits(env: Env): { archiveBytes: number; extractedBytes: number } {
+  const read = (name: string, fallback: number) => {
+    const value = env[name]?.trim();
+    if (!value) return fallback;
+    if (!/^\d+$/.test(value) || Number(value) <= 0 || !Number.isSafeInteger(Number(value))) {
+      throw new Error(`${name} must be a positive number of bytes`);
+    }
+    return Number(value);
+  };
+  return {
+    archiveBytes: read(MODAL_MAX_ARCHIVE_BYTES_ENV, defaultMaxArchiveBytes),
+    extractedBytes: read(MODAL_MAX_EXTRACTED_BYTES_ENV, defaultMaxExtractedBytes),
+  };
+}
 
 const remoteWorkDir = "/workspace";
 const remoteHome = "/home/node";
@@ -84,6 +119,9 @@ export interface ExecuteModalOptions {
   workDir: string;
   clientFactory?: () => Promise<ModalClientLike>;
   invoke?: (execute: ModalAttemptExecutor) => Promise<ModalAttemptResult>;
+  /** Leave the sandbox running when the result cannot be recovered. */
+  keepSandboxOnFailure?: boolean;
+  recoveryTimeoutSeconds?: number;
 }
 
 export interface ExecuteModalResult {
@@ -241,12 +279,19 @@ export function collectModalEnv(
 export async function executeModalAgent(options: ExecuteModalOptions): Promise<ExecuteModalResult> {
   const workDir = realpathSync(options.workDir);
   const timeoutMs = options.timeoutSeconds * 1000;
+  const recoveryTimeoutMs = (options.recoveryTimeoutSeconds ?? MODAL_RECOVERY_TIMEOUT_SECONDS) * 1000;
+  const sandboxLifetimeMs = Math.max(
+    timeoutMs + recoveryTimeoutMs,
+    options.keepSandboxOnFailure ? MODAL_KEPT_SANDBOX_LIFETIME_SECONDS * 1000 : 0,
+  );
+  const limits = modalArchiveLimits(options.env);
   const env = collectModalEnv(options.env, options.command.env, options.modalEnv, { workDir });
   let client: ModalClientLike | undefined;
   let sandbox: ModalSandboxLike | undefined;
   const stdoutDrainController = new AbortController();
   const baselineDir = mkdtempSync(join(tmpdir(), "headless-modal-baseline-"));
   const resultDir = mkdtempSync(join(tmpdir(), "headless-modal-result-"));
+  let keepSandbox = false;
 
   try {
     const seedArchive = await createAgentSeedArchive(options.agent, options.env, options.profile);
@@ -268,10 +313,10 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
       command: ["sleep", "infinity"],
       cpu: options.cpu,
       env,
-      idleTimeoutMs: timeoutMs,
+      idleTimeoutMs: sandboxLifetimeMs,
       memoryMiB: options.memoryMiB,
       secrets,
-      timeoutMs,
+      timeoutMs: sandboxLifetimeMs,
       workdir: "/",
     });
 
@@ -338,26 +383,196 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
       const [stdout, , code] = await Promise.all([stdoutPromise, stderrPromise, runProcess.wait()]);
       return { stdout, code };
     };
-    const { stdout, code } = options.invoke
-      ? await options.invoke(execute)
-      : await execute(options.command, options.env, options.timeoutSeconds, () => {});
-
-    const resultArchive = await captureRemoteArchive(sandbox, timeoutMs);
-    extractArchiveLocally(resultArchive, resultDir);
-    const sync = syncWorkspace({ baselineDir, resultDir, workDir });
-    for (const conflict of sync.conflicts) {
-      options.stderr(`headless: modal sync skipped local conflict: ${conflict}\n`);
+    // Recover the remote workspace even when execution failed (stream error,
+    // wait() rejection): the agent may already have changed files.
+    let execution: ModalAttemptResult | undefined;
+    let executionError: unknown;
+    try {
+      execution = options.invoke
+        ? await options.invoke(execute)
+        : await execute(options.command, options.env, options.timeoutSeconds, () => {});
+    } catch (error) {
+      executionError = error;
     }
 
-    return { code, stdout, conflicts: sync.conflicts };
+    const recovery = await recoverRemoteWorkspace({
+      baselineDir,
+      limits,
+      options,
+      recoveryTimeoutMs,
+      resultDir,
+      sandbox,
+      sandboxLifetimeMs,
+      workDir,
+    });
+    keepSandbox = !recovery.terminate;
+    if (executionError !== undefined) {
+      throw executionError;
+    }
+    if (recovery.failure) {
+      throw new Error(`modal result recovery failed: ${recovery.failure}`);
+    }
+    return { code: execution!.code, stdout: execution!.stdout, conflicts: recovery.conflicts };
   } finally {
     stdoutDrainController.abort();
-    if (sandbox) {
+    if (sandbox && !keepSandbox) {
       await sandbox.terminate();
     }
     client?.close?.();
     rmSync(baselineDir, { force: true, recursive: true });
     rmSync(resultDir, { force: true, recursive: true });
+  }
+}
+
+interface RemoteRecovery {
+  conflicts: string[];
+  /** Why the result could not be applied, if it could not. */
+  failure?: string;
+  /** False while the remote work exists only in the sandbox (or --modal-keep-sandbox applies). */
+  terminate: boolean;
+}
+
+/**
+ * Downloads the remote workspace to a private bounded file, validates and
+ * extracts it, and applies it. The sandbox may be terminated only when the
+ * result was fully applied or the archive is durably saved locally; with
+ * --modal-keep-sandbox it is kept whenever anything was left unapplied.
+ */
+async function recoverRemoteWorkspace(context: {
+  baselineDir: string;
+  limits: { archiveBytes: number; extractedBytes: number };
+  options: ExecuteModalOptions;
+  recoveryTimeoutMs: number;
+  resultDir: string;
+  sandbox: ModalSandboxLike;
+  sandboxLifetimeMs: number;
+  workDir: string;
+}): Promise<RemoteRecovery> {
+  const { options, sandbox } = context;
+  const scratch = mkdtempSync(join(tmpdir(), "headless-modal-archive-"));
+  const archivePath = join(scratch, "result.tar.gz");
+  try {
+    let failure: string | undefined;
+    let downloaded = false;
+    let conflicts: string[] = [];
+    try {
+      await captureRemoteArchiveToFile(sandbox, context.recoveryTimeoutMs, archivePath, context.limits.archiveBytes);
+      downloaded = true;
+      await validateArchiveFile(archivePath, context.limits.extractedBytes);
+      extractArchiveFile(archivePath, context.resultDir);
+      conflicts = syncWorkspace({ baselineDir: context.baselineDir, resultDir: context.resultDir, workDir: context.workDir }).conflicts;
+    } catch (error) {
+      failure = error instanceof Error ? error.message.trim() : String(error);
+    }
+
+    if (failure) {
+      options.stderr(`headless: modal result recovery failed: ${failure}\n`);
+    }
+    for (const conflict of conflicts) {
+      options.stderr(`headless: modal sync skipped local conflict: ${conflict}\n`);
+    }
+    const unapplied = Boolean(failure) || conflicts.length > 0;
+    let saved = !unapplied;
+    if (unapplied && downloaded) {
+      saved = reportSavedRecoveryArchive(options, sandbox, archivePath, context.workDir);
+    }
+    const keep = !saved || (unapplied && Boolean(options.keepSandboxOnFailure));
+    if (keep) {
+      reportKeptSandbox(options, sandbox, context.sandboxLifetimeMs, !saved);
+    }
+    return { conflicts, failure, terminate: !keep };
+  } finally {
+    rmSync(scratch, { force: true, recursive: true });
+  }
+}
+
+/** Saves the downloaded archive durably and says how to use it; false when it could not be saved. */
+function reportSavedRecoveryArchive(
+  options: ExecuteModalOptions,
+  sandbox: ModalSandboxLike,
+  archivePath: string,
+  workDir: string,
+): boolean {
+  let path: string;
+  try {
+    path = saveRecoveryArchive(options.env, sandbox.sandboxId, archivePath);
+  } catch (error) {
+    options.stderr(
+      `headless: could not save the Modal workspace archive: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return false;
+  }
+  const extractDir = path.replace(/\.tar\.gz$/, "");
+  options.stderr(
+    [
+      `headless: saved the remote Modal workspace (not fully applied to your work dir) to ${path}`,
+      "headless: extract it into a new directory, compare, and copy back what you need:",
+      `headless:   mkdir ${quoteArg(extractDir)} && tar -xzf ${quoteArg(path)} -C ${quoteArg(extractDir)}`,
+      `headless:   diff -r ${quoteArg(workDir)} ${quoteArg(extractDir)}`,
+      "",
+    ].join("\n"),
+  );
+  return true;
+}
+
+function reportKeptSandbox(options: ExecuteModalOptions, sandbox: ModalSandboxLike, lifetimeMs: number, unsaved: boolean): void {
+  const id = sandbox.sandboxId ?? "(unknown id)";
+  const hours = Math.round(lifetimeMs / 3_600_000);
+  options.stderr(
+    [
+      unsaved
+        ? `headless: WARNING: the remote work was not saved locally, so Modal sandbox ${id} was left running.`
+        : `headless: WARNING: Modal sandbox ${id} was left running (--modal-keep-sandbox).`,
+      `headless: it keeps billing until you terminate it, or until its ${hours}h lifetime from creation ends.`,
+      `headless: terminate it from the Modal dashboard, or with the Modal JS SDK:`,
+      `headless:   await (await new ModalClient().sandboxes.fromId(${JSON.stringify(id)})).terminate()`,
+      "",
+    ].join("\n"),
+  );
+}
+
+function saveRecoveryArchive(env: Env, sandboxId: string | undefined, archivePath: string): string {
+  const dir = join(env.HOME || homedir(), ".headless", "modal-recovery");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`not a directory: ${dir}`);
+  }
+  chmodSync(dir, 0o700);
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const shortId = (sandboxId?.replace(/[^A-Za-z0-9]/g, "").slice(-8)) || randomBytes(4).toString("hex");
+  const path = join(dir, `${timestamp}-${shortId}.tar.gz`);
+  const source = openSync(archivePath, "r");
+  const target = openSync(path, "wx", 0o600);
+  try {
+    const buffer = Buffer.alloc(1024 * 1024);
+    let position = 0;
+    for (;;) {
+      const read = readSync(source, buffer, 0, buffer.length, position);
+      if (read === 0) break;
+      writeSync(target, buffer, 0, read);
+      position += read;
+    }
+    fsyncSync(target);
+  } catch (error) {
+    closeSync(target);
+    rmSync(path, { force: true });
+    throw error;
+  } finally {
+    closeSync(source);
+  }
+  closeSync(target);
+  fsyncDirectory(dir);
+  return path;
+}
+
+function fsyncDirectory(dir: string): void {
+  if (process.platform === "win32") return; // Directories cannot be opened for fsync there.
+  const fd = openSync(dir, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -452,85 +667,6 @@ async function createCredentialSeedArchive(
   }
 }
 
-function seedAwsProfileFiles(awsDir: string, seedDir: string, profile: string): string[] {
-  const paths: string[] = [];
-  const credentialsPath = join(awsDir, "credentials");
-  const configPath = join(awsDir, "config");
-  const targetDir = join(seedDir, ".aws");
-
-  if (existsSync(credentialsPath) && lstatSync(credentialsPath).isFile()) {
-    const content = filterIniSections(readFileSync(credentialsPath, "utf8"), new Set([profile]));
-    if (content) {
-      mkdirSync(targetDir, { recursive: true });
-      const target = join(targetDir, "credentials");
-      writeFileSync(target, content, { mode: lstatSync(credentialsPath).mode & 0o777 });
-      paths.push(".aws/credentials");
-    }
-  }
-
-  if (existsSync(configPath) && lstatSync(configPath).isFile()) {
-    const config = readFileSync(configPath, "utf8");
-    const profileSection = profile === "default" ? "default" : `profile ${profile}`;
-    const sections = new Set([profileSection]);
-    const ssoSession = getIniSectionValue(config, profileSection, "sso_session");
-    if (ssoSession) {
-      sections.add(`sso-session ${ssoSession}`);
-    }
-    const content = filterIniSections(config, sections);
-    if (content) {
-      mkdirSync(targetDir, { recursive: true });
-      const target = join(targetDir, "config");
-      writeFileSync(target, content, { mode: lstatSync(configPath).mode & 0o777 });
-      paths.push(".aws/config");
-    }
-  }
-
-  return paths;
-}
-
-function filterIniSections(content: string, sectionNames: Set<string>): string | undefined {
-  const selected: string[] = [];
-  let keep = false;
-  for (const line of content.split(/\r?\n/)) {
-    const section = parseIniSectionName(line);
-    if (section !== undefined) {
-      keep = sectionNames.has(section);
-    }
-    if (keep) {
-      selected.push(line);
-    }
-  }
-  return selected.length > 0 ? `${selected.join("\n").replace(/\n+$/, "")}\n` : undefined;
-}
-
-function getIniSectionValue(content: string, sectionName: string, key: string): string | undefined {
-  let inSection = false;
-  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*(.*?)\\s*$`);
-  for (const line of content.split(/\r?\n/)) {
-    const section = parseIniSectionName(line);
-    if (section !== undefined) {
-      inSection = section === sectionName;
-      continue;
-    }
-    if (!inSection) {
-      continue;
-    }
-    const match = keyPattern.exec(line);
-    if (match) {
-      return match[1];
-    }
-  }
-  return undefined;
-}
-
-function parseIniSectionName(line: string): string | undefined {
-  return /^\s*\[([^\]]+)\]\s*$/.exec(line)?.[1];
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function forwardedEnvValue(env: Env, commandEnv: Env | undefined, explicitEnv: string[], name: string): string | undefined {
   return collectForwardedEnvEntries(env, commandEnv, explicitEnv).find((entry) => entry.name === name)?.actualValue;
 }
@@ -588,7 +724,19 @@ async function listGitFiles(workDir: string): Promise<string[] | undefined> {
     .split("\0")
     .filter(Boolean)
     .filter((path) => path !== ".")
+    // --cached still lists tracked files deleted from the worktree but not
+    // staged; tar would fail on them. Existing symlinks are kept (lstat).
+    .filter((path) => pathExists(join(workDir, path)))
     .sort();
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function listFilesRecursive(root: string, options: { ignoredDirs?: Set<string> } = {}): string[] {
@@ -671,7 +819,12 @@ async function runRemoteTar(
   return typeof stdout === "string" ? stdout : "";
 }
 
-async function captureRemoteArchive(sandbox: ModalSandboxLike, timeoutMs: number): Promise<Uint8Array> {
+async function captureRemoteArchiveToFile(
+  sandbox: ModalSandboxLike,
+  timeoutMs: number,
+  path: string,
+  maxBytes: number,
+): Promise<void> {
   const process = await sandbox.exec([remoteTarCommand, "-czf", "-", "-C", remoteWorkDir, "."], {
     mode: "binary",
     stderr: "pipe",
@@ -679,15 +832,74 @@ async function captureRemoteArchive(sandbox: ModalSandboxLike, timeoutMs: number
     timeoutMs,
     workdir: remoteWorkDir,
   });
-  const [stdout, stderr, code] = await Promise.all([
-    readBytes(process.stdout as ModalReadStreamLike<Uint8Array>),
-    readTextStream(process.stderr),
-    process.wait(),
-  ]);
-  if (code !== 0) {
-    throw new Error(stderr || "could not download Modal workspace archive");
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    const [, stderr, code] = await Promise.all([
+      writeBoundedStream(process.stdout as ModalReadStreamLike<Uint8Array>, fd, maxBytes),
+      readTextStream(process.stderr),
+      process.wait(),
+    ]);
+    if (code !== 0) {
+      throw new Error(stderr || "could not download Modal workspace archive");
+    }
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
-  return stdout;
+}
+
+/** Writes a sandbox stream to a file, failing once it exceeds maxBytes. */
+async function writeBoundedStream(stream: ModalReadStreamLike<Uint8Array>, fd: number, maxBytes: number): Promise<void> {
+  let total = 0;
+  const write = (chunk: Uint8Array) => {
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      throw new Error(`Modal workspace archive exceeds ${maxBytes} bytes (${MODAL_MAX_ARCHIVE_BYTES_ENV})`);
+    }
+    writeSync(fd, chunk);
+  };
+  if (!stream.getReader) {
+    write((await stream.readBytes?.()) ?? new Uint8Array());
+    return;
+  }
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      write(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Validates a gzipped tar file while streaming it, bounding the decompressed size. */
+async function validateArchiveFile(path: string, maxExtractedBytes: number): Promise<void> {
+  // The result comes from the sandbox: also refuse entries that would land on
+  // the same file, which tar would silently overwrite.
+  const validator = new TarEntryValidator(maxExtractedBytes, { rejectCollisions: true });
+  const gunzip = createReadStream(path).pipe(createGunzip());
+  try {
+    for await (const chunk of gunzip) {
+      validator.push(chunk as Buffer);
+      if (validator.complete) break;
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("unsafe Modal workspace archive entry")) throw error;
+    throw new Error("could not inspect Modal workspace archive");
+  } finally {
+    gunzip.destroy();
+  }
+  validator.finish();
+}
+
+function extractArchiveFile(path: string, dir: string): void {
+  const result = spawnSync(localTarCommand, ["-xzf", path, "-C", dir], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.error?.message || "could not extract Modal workspace archive");
+  }
 }
 
 function validateArchiveEntries(archive: Uint8Array): void {
@@ -697,58 +909,149 @@ function validateArchiveEntries(archive: Uint8Array): void {
   } catch {
     throw new Error("could not inspect Modal workspace archive");
   }
+  const validator = new TarEntryValidator(Number.POSITIVE_INFINITY);
+  validator.push(data);
+  validator.finish();
+}
 
-  let offset = 0;
-  let nextLongName: string | undefined;
-  let nextPaxPath: string | undefined;
-  while (offset + 512 <= data.length) {
-    const header = data.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) {
-      return;
+const maxTarMetadataBytes = 1024 * 1024;
+
+/**
+ * Incremental tar header check: every entry path is relative without "..",
+ * only regular files, directories and symlinks, honouring GNU long names and
+ * pax path/size overrides so entry boundaries match what tar will see.
+ */
+class TarEntryValidator {
+  complete = false;
+  private pending: Buffer = Buffer.alloc(0);
+  private skip = 0;
+  private meta?: { type: string; size: number; padded: number };
+  private nextLongName?: string;
+  private nextPaxPath?: string;
+  private nextPaxSize?: number;
+  private total = 0;
+  private readonly seen = new Map<string, string>();
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly options: { rejectCollisions?: boolean } = {},
+  ) {}
+
+  push(chunk: Buffer): void {
+    this.total += chunk.byteLength;
+    if (this.total > this.maxBytes) {
+      throw new Error(
+        `unsafe Modal workspace archive entry: archive expands beyond ${this.maxBytes} bytes (${MODAL_MAX_EXTRACTED_BYTES_ENV})`,
+      );
     }
+    if (this.complete) return;
+    let buf = this.pending.length > 0 ? Buffer.concat([this.pending, chunk]) : chunk;
+    let offset = 0;
+    while (!this.complete) {
+      if (this.skip > 0) {
+        const n = Math.min(this.skip, buf.length - offset);
+        this.skip -= n;
+        offset += n;
+        if (this.skip > 0) break;
+        continue;
+      }
+      if (this.meta) {
+        if (buf.length - offset < this.meta.padded) break;
+        this.readMeta(buf.subarray(offset, offset + this.meta.size), this.meta.type);
+        offset += this.meta.padded;
+        this.meta = undefined;
+        continue;
+      }
+      if (buf.length - offset < 512) break;
+      this.readHeader(buf.subarray(offset, offset + 512));
+      offset += 512;
+    }
+    this.pending = Buffer.from(buf.subarray(offset));
+    buf = Buffer.alloc(0);
+  }
 
-    const type = readTarString(header, 156, 1) || "0";
-    const size = readTarSize(header);
-    const contentStart = offset + 512;
-    const contentEnd = contentStart + size;
-    if (contentEnd > data.length) {
+  finish(): void {
+    if (this.complete) return;
+    if (this.skip > 0 || this.meta || this.pending.length > 0) {
       throw new Error("unsafe Modal workspace archive entry: truncated archive");
     }
+    throw new Error("unsafe Modal workspace archive entry: missing end marker");
+  }
 
-    if (type === "L") {
-      nextLongName = readNullTerminated(data.subarray(contentStart, contentEnd));
-      offset = nextTarOffset(contentEnd);
-      continue;
+  private readHeader(header: Buffer): void {
+    if (header.every((byte) => byte === 0)) {
+      this.complete = true;
+      return;
     }
-    if (type === "x") {
-      nextPaxPath = parsePaxRecords(data.subarray(contentStart, contentEnd)).path;
-      offset = nextTarOffset(contentEnd);
-      continue;
-    }
-    if (type === "g") {
-      const records = parsePaxRecords(data.subarray(contentStart, contentEnd));
-      if (records.path !== undefined) {
-        throw new Error("unsafe Modal workspace archive entry: global pax path is not supported");
+    const type = readTarString(header, 156, 1) || "0";
+    const size = this.nextPaxSize ?? readTarSize(header);
+    const padded = Math.ceil(size / 512) * 512;
+    if (type === "L" || type === "x" || type === "g") {
+      if (size > maxTarMetadataBytes) {
+        throw new Error("unsafe Modal workspace archive entry: oversized metadata header");
       }
-      offset = nextTarOffset(contentEnd);
-      continue;
+      this.meta = { type, size, padded };
+      return;
     }
-
     const prefix = readTarString(header, 345, 155);
-    const name = nextPaxPath ?? nextLongName ?? [prefix, readTarString(header, 0, 100)].filter(Boolean).join("/");
-    nextLongName = undefined;
-    nextPaxPath = undefined;
+    const name = this.nextPaxPath ?? this.nextLongName ?? [prefix, readTarString(header, 0, 100)].filter(Boolean).join("/");
+    this.nextLongName = undefined;
+    this.nextPaxPath = undefined;
+    this.nextPaxSize = undefined;
     if (!isSafeArchivePath(name)) {
       throw new Error(`unsafe Modal workspace archive entry: ${name}`);
     }
     if (!["0", "\0", "2", "5"].includes(type)) {
       throw new Error(`unsafe Modal workspace archive entry: unsupported type ${type || "unknown"} for ${name}`);
     }
-
-    offset = nextTarOffset(contentEnd);
+    if (this.options.rejectCollisions) this.recordPath(name);
+    this.skip = padded;
   }
 
-  throw new Error("unsafe Modal workspace archive entry: missing end marker");
+  /**
+   * Duplicate entries, and entries equal after NFC and case folding (always
+   * folded: a case-insensitive work dir would merge them), overwrite each
+   * other on extraction, losing one silently.
+   */
+  private recordPath(name: string): void {
+    const normalized = name.split("\\").join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+    if (!normalized || normalized === ".") return;
+    const key = normalized.normalize("NFC").toLowerCase();
+    const previous = this.seen.get(key);
+    if (previous !== undefined) {
+      throw new Error(
+        previous === normalized
+          ? `unsafe Modal workspace archive entry: duplicate entry ${normalized}`
+          : `unsafe Modal workspace archive entry: ${normalized} collides with ${previous} on case-insensitive filesystems`,
+      );
+    }
+    this.seen.set(key, normalized);
+  }
+
+  private readMeta(data: Buffer, type: string): void {
+    if (type === "L") {
+      this.nextLongName = readNullTerminated(data);
+      return;
+    }
+    const records = parsePaxRecords(data);
+    // GNU sparse files expand to a declared size the payload does not bound.
+    if (Object.keys(records).some((key) => key.startsWith("GNU.sparse."))) {
+      throw new Error("unsafe Modal workspace archive entry: sparse files are not supported");
+    }
+    if (type === "g") {
+      if (records.path !== undefined || records.size !== undefined) {
+        throw new Error("unsafe Modal workspace archive entry: global pax path or size is not supported");
+      }
+      return;
+    }
+    this.nextPaxPath = records.path;
+    if (records.size !== undefined) {
+      if (!/^\d+$/.test(records.size)) {
+        throw new Error("unsafe Modal workspace archive entry: invalid pax size");
+      }
+      this.nextPaxSize = Number(records.size);
+    }
+  }
 }
 
 function readTarString(header: Buffer, start: number, length: number): string {
@@ -791,10 +1094,6 @@ function parsePaxRecords(data: Buffer): Record<string, string> {
     offset += length;
   }
   return records;
-}
-
-function nextTarOffset(contentEnd: number): number {
-  return Math.ceil(contentEnd / 512) * 512;
 }
 
 function isSafeArchivePath(path: string): boolean {
@@ -942,15 +1241,32 @@ async function readBytes(stream: ModalReadStreamLike<Uint8Array>): Promise<Uint8
   return output;
 }
 
-export function syncWorkspace(options: { baselineDir: string; resultDir: string; workDir: string }): WorkspaceSyncResult {
+interface SyncOp {
+  relPath: string;
+  before?: FileState;
+  after?: FileState;
+  local?: FileState;
+}
+
+export function syncWorkspace(options: {
+  baselineDir: string;
+  resultDir: string;
+  workDir: string;
+  /** Test seam; detected from the work dir's filesystem when omitted. */
+  caseInsensitive?: boolean;
+}): WorkspaceSyncResult {
   const baseline = snapshotTree(options.baselineDir);
   const result = snapshotTree(options.resultDir);
   const localTree = snapshotTree(options.workDir);
+  const fold = pathFolder(options.workDir, options.caseInsensitive);
+  const collides = collisionChecker(fold, [baseline.keys(), result.keys(), localTree.keys()]);
   const allPaths = new Set([...baseline.keys(), ...result.keys()]);
   const changed: string[] = [];
   const conflicts: string[] = [];
   const replacedAncestors = new Set<string>();
+  const ops: SyncOp[] = [];
 
+  // Plan every change before touching the work dir.
   for (const relPath of [...allPaths].sort()) {
     if (hasReplacedAncestor(relPath, replacedAncestors)) {
       continue;
@@ -969,6 +1285,13 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       conflicts.push(relPath);
       continue;
     }
+    // On a case- or normalisation-insensitive filesystem a differently
+    // spelled path is the same file: never touch it.
+    if (collides(relPath)) {
+      conflicts.push(relPath);
+      replacedAncestors.add(relPath);
+      continue;
+    }
     const local = localTree.get(relPath);
     if (!before && local) {
       conflicts.push(relPath);
@@ -983,14 +1306,50 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       replacedAncestors.add(relPath);
       continue;
     }
+    if (after?.type === "symlink" && !isSafeLinkText(after.target ?? "")) {
+      conflicts.push(relPath);
+      continue;
+    }
+    ops.push({ relPath, before, after, local });
+    if (before?.type === "directory" && after?.type !== "directory") {
+      replacedAncestors.add(relPath);
+    }
+  }
+
+  // Judge every sandbox symlink against the tree as it would be once all
+  // planned changes are applied. Dropping a rejected link changes that tree,
+  // so repeat until nothing more is rejected. Nothing is mutated before this.
+  const rejected = new Set<string>();
+  if (ops.some((op) => op.after?.type === "symlink")) {
+    for (;;) {
+      const tree = virtualTree(localTree, ops.filter((op) => !rejected.has(op.relPath)), fold);
+      let rejectedMore = false;
+      for (const op of ops) {
+        if (op.after?.type !== "symlink" || rejected.has(op.relPath)) continue;
+        if (!virtualLinkStaysInside(tree, op.relPath, op.after.target ?? "", fold)) {
+          rejected.add(op.relPath);
+          rejectedMore = true;
+        }
+      }
+      if (!rejectedMore) break;
+    }
+  }
+
+  const createdLinks: SyncOp[] = [];
+  for (const op of ops) {
+    const { relPath, after, local } = op;
+    if (rejected.has(relPath)) {
+      conflicts.push(relPath);
+      continue;
+    }
+    const localPath = resolve(options.workDir, relPath);
+    if (!parentRealPathIsWithin(options.workDir, localPath)) {
+      conflicts.push(relPath);
+      continue;
+    }
     if (!after) {
-      if (existsSync(localPath)) {
-        rmSync(localPath, { force: true, recursive: true });
-      }
+      removePathIfPresent(localPath);
       changed.push(relPath);
-      if (before?.type === "directory") {
-        replacedAncestors.add(relPath);
-      }
       continue;
     }
     mkdirSync(dirname(localPath), { recursive: true });
@@ -1003,18 +1362,204 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
     } else if (after.type === "symlink") {
       removePathIfPresent(localPath);
       symlinkSync(after.target ?? "", localPath);
+      createdLinks.push(op);
     } else {
       removePathIfPresent(localPath);
       copyFileSync(join(options.resultDir, relPath), localPath);
       chmodSync(localPath, after.mode);
     }
     changed.push(relPath);
-    if (before?.type === "directory" && after.type !== "directory") {
-      replacedAncestors.add(relPath);
+  }
+
+  // Check the created links again on the real filesystem. One that escapes
+  // after all is removed and its path restored from the baseline.
+  for (const op of createdLinks) {
+    const localPath = resolve(options.workDir, op.relPath);
+    if (!symlinkTargetIsWithin(options.workDir, localPath, readlinkText(localPath))) {
+      removePathIfPresent(localPath);
+      restoreBaselinePath(options.baselineDir, op.relPath, op.before, localPath);
+      changed.splice(changed.indexOf(op.relPath), 1);
+      conflicts.push(op.relPath);
     }
   }
 
   return { changed, conflicts };
+}
+
+function restoreBaselinePath(baselineDir: string, relPath: string, before: FileState | undefined, localPath: string): void {
+  if (!before) return;
+  const source = join(baselineDir, relPath);
+  if (before.type === "directory") {
+    cpSync(source, localPath, { recursive: true, verbatimSymlinks: true });
+  } else if (before.type === "symlink") {
+    symlinkSync(before.target ?? "", localPath);
+  } else {
+    copyFileSync(source, localPath);
+    chmodSync(localPath, before.mode);
+  }
+}
+
+// Sandbox link text is accepted only as a plain relative POSIX path: no
+// absolute paths, drive letters, backslashes (a name character on POSIX but
+// a separator on Windows, so checks and the created link could disagree) or NUL.
+function isSafeLinkText(target: string): boolean {
+  return Boolean(target) && !target.includes("\\") && !target.includes("\0") && !target.startsWith("/") &&
+    !isAbsolute(target) && !/^[A-Za-z]:/.test(target);
+}
+
+/**
+ * Folds paths the way the work dir's filesystem compares them: always NFC
+ * (macOS is normalisation-insensitive), and lower-cased unless the
+ * filesystem is known to be case-sensitive.
+ */
+function pathFolder(workDir: string, caseInsensitive?: boolean): (path: string) => string {
+  const insensitive = caseInsensitive ?? probeCaseInsensitive(workDir);
+  return (path) => {
+    const normalized = path.normalize("NFC");
+    return insensitive ? normalized.toLowerCase() : normalized;
+  };
+}
+
+function probeCaseInsensitive(workDir: string): boolean {
+  const name = basename(workDir);
+  const swapped = [...name].map((char) => (char === char.toLowerCase() ? char.toUpperCase() : char.toLowerCase())).join("");
+  if (swapped === name) {
+    return true; // Cannot tell from this name; assume the cautious answer.
+  }
+  try {
+    const original = statSync(workDir);
+    const other = statSync(join(dirname(workDir), swapped));
+    return original.ino === other.ino && original.dev === other.dev;
+  } catch {
+    return false;
+  }
+}
+
+/** True when a path or one of its ancestors also exists under another spelling that folds to the same name. */
+function collisionChecker(fold: (path: string) => string, sources: Iterable<string>[]): (relPath: string) => boolean {
+  const spellings = new Map<string, Set<string>>();
+  const add = (path: string) => {
+    const key = fold(path);
+    const set = spellings.get(key) ?? new Set<string>();
+    set.add(path);
+    spellings.set(key, set);
+  };
+  for (const source of sources) {
+    for (const path of source) add(path);
+  }
+  return (relPath) => {
+    const segments = relPath.split("/");
+    for (let index = 1; index <= segments.length; index += 1) {
+      if ((spellings.get(fold(segments.slice(0, index).join("/")))?.size ?? 0) > 1) return true;
+    }
+    return false;
+  };
+}
+
+type VirtualEntry = Pick<FileState, "type" | "target">;
+
+function virtualTree(localTree: Map<string, FileState>, ops: SyncOp[], fold: (path: string) => string): Map<string, VirtualEntry> {
+  const tree = new Map<string, VirtualEntry>();
+  for (const [path, state] of localTree) tree.set(fold(path), state);
+  const removeSubtree = (key: string) => {
+    tree.delete(key);
+    for (const other of [...tree.keys()]) {
+      if (other.startsWith(`${key}/`)) tree.delete(other);
+    }
+  };
+  for (const op of ops) {
+    const key = fold(op.relPath);
+    if (!op.after || op.after.type !== "directory") removeSubtree(key);
+    if (op.after) tree.set(key, op.after);
+  }
+  return tree;
+}
+
+/** Resolves a link through the simulated final tree; false when it leaves the work dir. */
+function virtualLinkStaysInside(
+  tree: Map<string, VirtualEntry>,
+  relPath: string,
+  target: string,
+  fold: (path: string) => string,
+): boolean {
+  return resolveVirtual(tree, relPath.split("/").slice(0, -1), target, fold, 0) !== undefined;
+}
+
+function resolveVirtual(
+  tree: Map<string, VirtualEntry>,
+  start: string[],
+  target: string,
+  fold: (path: string) => string,
+  depth: number,
+): string[] | undefined {
+  // Absolute targets (including local links the user made) count as leaving.
+  if (depth > 40 || !target || target.startsWith("/") || isAbsolute(target) || target.includes("\0")) {
+    return undefined;
+  }
+  let segments = [...start];
+  for (const part of target.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (segments.length === 0) return undefined;
+      segments.pop();
+      continue;
+    }
+    segments.push(part);
+    const entry = tree.get(fold(segments.join("/")));
+    if (entry?.type === "symlink") {
+      segments.pop();
+      const resolved = resolveVirtual(tree, segments, entry.target ?? "", fold, depth + 1);
+      if (!resolved) return undefined;
+      segments = resolved;
+    }
+  }
+  return segments;
+}
+
+// A symlink from the sandbox is applied only when its target stays inside the
+// work dir: never absolute, inside lexically, and inside once the existing
+// part of the path is resolved through the local filesystem.
+function symlinkTargetIsWithin(workDir: string, linkPath: string, target: string): boolean {
+  if (!isSafeLinkText(target)) {
+    return false;
+  }
+  const normalized = target;
+  const parent = dirname(linkPath);
+  if (!isWithin(workDir, resolve(parent, normalized))) {
+    return false;
+  }
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(workDir);
+  } catch {
+    return false;
+  }
+  let current: string;
+  try {
+    current = realpathSync(parent);
+  } catch {
+    // The parent does not exist yet; its existing ancestors were checked.
+    return true;
+  }
+  for (const segment of normalized.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      current = dirname(current);
+      continue;
+    }
+    current = join(current, segment);
+    try {
+      current = realpathSync(current);
+    } catch {
+      // A dangling link may point anywhere; a missing path resolves lexically.
+      try {
+        if (lstatSync(current).isSymbolicLink()) return false;
+      } catch {
+        // Missing component.
+      }
+    }
+  }
+  return isWithin(rootReal, current);
 }
 
 function snapshotTree(root: string): Map<string, FileState> {
@@ -1057,7 +1602,24 @@ function snapshotPath(root: string, relPath: string): FileState | undefined {
   if (!stat.isFile()) {
     return undefined;
   }
-  return { hash: createHash("sha256").update(readFileSync(path)).digest("hex"), mode, type: "file" };
+  return { hash: hashFile(path), mode, type: "file" };
+}
+
+/** Hashes a file in bounded chunks instead of reading it into memory whole. */
+function hashFile(path: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(1024 * 1024);
+    for (;;) {
+      const read = readSync(fd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
 }
 
 function sameState(left: FileState | undefined, right: FileState | undefined): boolean {

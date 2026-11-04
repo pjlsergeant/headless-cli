@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
@@ -186,6 +187,50 @@ function contentText(value: unknown): string {
   return asString(record.text);
 }
 
+function isWithinDir(root: string, path: string): boolean {
+  const relPath = relative(root, path);
+  return relPath === "" || (relPath.split(sep)[0] !== ".." && !isAbsolute(relPath));
+}
+
+const maxAcpReadBytes = 16 * 1024 * 1024;
+
+/**
+ * Reads a regular file without blocking: O_NONBLOCK so a FIFO cannot hang the
+ * open, O_NOFOLLOW so a final component swapped for a link is not followed,
+ * then fstat to refuse anything that is not a regular file, and a bounded read.
+ */
+function readConfinedTextFile(target: string, requested: string): string {
+  const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0);
+  let fd: number;
+  try {
+    fd = openSync(target, flags);
+  } catch {
+    throw acp.RequestError.invalidParams({ path: requested }, "file could not be opened");
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw acp.RequestError.invalidParams({ path: requested }, "only regular files can be read");
+    }
+    if (stat.size > maxAcpReadBytes) {
+      throw acp.RequestError.invalidParams({ path: requested }, `file is larger than ${maxAcpReadBytes} bytes`);
+    }
+    const buffer = Buffer.allocUnsafe(maxAcpReadBytes + 1);
+    let length = 0;
+    for (;;) {
+      const read = readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+      if (length > maxAcpReadBytes) {
+        throw acp.RequestError.invalidParams({ path: requested }, `file is larger than ${maxAcpReadBytes} bytes`);
+      }
+    }
+    return buffer.subarray(0, length).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export const acpClientCapabilities = {
   fs: { readTextFile: true, writeTextFile: false },
 };
@@ -196,6 +241,7 @@ class HeadlessAcpClient {
   constructor(
     private readonly stdout: (text: string) => void,
     private readonly allow: AllowMode | undefined,
+    private readonly workDir: string,
   ) {}
 
   finalAssistantText(): string {
@@ -228,7 +274,26 @@ class HeadlessAcpClient {
   }
 
   async readTextFile(params: acp.ReadTextFileRequest): Promise<acp.ReadTextFileResponse> {
-    return { content: readFileSync(params.path, "utf8") };
+    // Reads are confined to the invocation work dir, through symlinks too.
+    const refused = () =>
+      acp.RequestError.invalidParams({ path: params.path }, "file reads are limited to the work dir");
+    let root: string;
+    try {
+      root = realpathSync(this.workDir);
+    } catch {
+      throw refused();
+    }
+    const requested = resolve(root, params.path);
+    let target: string;
+    try {
+      target = realpathSync(requested);
+    } catch {
+      throw isWithinDir(root, requested) ? acp.RequestError.resourceNotFound(params.path) : refused();
+    }
+    if (!isWithinDir(root, target)) {
+      throw refused();
+    }
+    return { content: readConfinedTextFile(target, params.path) };
   }
 
   async writeTextFile(): Promise<acp.WriteTextFileResponse> {
@@ -359,7 +424,7 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    const client = new HeadlessAcpClient(options.stdout, options.allow);
+    const client = new HeadlessAcpClient(options.stdout, options.allow, options.cwd ?? process.cwd());
     const connection = new acp.ClientSideConnection(() => client, stream);
 
     try {

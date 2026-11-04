@@ -31,3 +31,14 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - User-supplied `--docker-arg` volume mounts are not checked for overlap with Headless state.
 - Flaky under full-suite load: "cron daemon keeps its signal handlers until active executions are killed" (tests/cron.test.ts) failed once in a full run, passes alone; timing-sensitive.
 - Attacker-filled old mailbox launch directories can linger: the bounded best-effort sweep on the next launch does not recurse into subdirectories a container nested inside its mailbox.
+- Prompts starting with "-" are still passed as a bare positional (or `-p` value) to Cursor (`agent`, one-shot and interactive), OpenCode (`run` and interactive run), Pi (one-shot and interactive), Gemini interactive, and Antigravity (`agy -p`); none of these CLIs is installed here to verify whether they accept `--` or a dash-leading value, and none has a stdin prompt path in Headless. Claude, Codex and Gemini one-shot are fixed.
+- Gemini one-shot now sends inline prompts on stdin with `--prompt ''` (the path prompt files already used); not verified against an installed gemini.
+- Modal sandbox lifetime is counted from sandbox creation (agent timeout + 120s recovery window), so a slow upload eats into the recovery window.
+- `--modal-keep-sandbox` creates the sandbox with a 24h lifetime for every run, so if Headless itself is SIGKILLed the sandbox bills up to 24h instead of the agent timeout.
+- The kept-sandbox message points at the Modal dashboard or the JS SDK to terminate; Headless has no command to terminate (or fetch from) a kept sandbox.
+- ACP SDK logs "Error handling request" to stderr for each refused ACP file read (SDK console logging of handler errors).
+- ACP `fs/read_text_file` ignores the request's `line`/`limit` and returns the whole file.
+- `--docker --print-command` prints an AWS mount source in a staged temp dir that is removed when Headless exits, so the printed command is not runnable as is when `AWS_PROFILE` is forwarded.
+- The staged Docker AWS credentials temp dir is left behind if Headless is killed without running its cleanup (e.g. SIGKILL).
+- AWS profile staging copies the SSO token cache file but not the SSO client registration cache, so an expired SSO token cannot be refreshed inside the container (run `aws sso login` on the host). `credential_process` profiles run their host command inside the container, where it usually does not exist.
+- ACP `readTextFile` confinement is check-then-read (realpath, then read), so a path swapped in between can escape (TOCTOU). The ACP agent is a local process that can read files itself, so this is a policy guard, not a security boundary; a proper fix needs openat-style fd-relative resolution, which Node lacks.

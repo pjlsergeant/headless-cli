@@ -392,6 +392,25 @@ test("cron start fails when the daemon process cannot be spawned", async () => {
   }
 });
 
+test("cron add passes --modal-keep-sandbox through to the scheduled invocation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-modal-keep-"));
+  try {
+    const env = testEnv(dir);
+    markDaemonRunning(env);
+    let stderr = "";
+    const code = await runCli(
+      ["cron", "add", "codex", "--name", "modal-keep", "--every", "1h", "--prompt", "x", "--modal", "--modal-keep-sandbox"],
+      { env, stdinIsTTY: true, stdout: () => undefined, stderr: (text) => { stderr += text; } },
+    );
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(readCronJob(env, "modal-keep")?.command.args, [
+      "codex", "--prompt", "x", "--modal", "--modal-keep-sandbox",
+    ]);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("cron add rolls back new jobs when the daemon cannot start", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
   try {

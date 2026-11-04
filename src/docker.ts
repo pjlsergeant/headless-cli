@@ -9,6 +9,7 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -16,6 +17,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { getAgentConfig } from "./agents.js";
+import { seedAwsProfileFiles } from "./aws-profile.js";
 import { readCodexBaseFiles, readCodexProfileFiles } from "./codex-profile.js";
 import { IN_CONTAINER_ENV } from "./container.js";
 import { collectForwardedEnvEntries, type ForwardedEnvEntry } from "./env.js";
@@ -54,6 +56,12 @@ export interface DockerAgentCommandOptions {
   persistentHome?: string;
   persistentVolume?: string;
   profile?: string;
+  /**
+   * Private host directory, removed by the caller after the run, where
+   * credentials filtered for this run are staged. Without it, AWS profile
+   * files are not mounted.
+   */
+  credentialStageDir?: string;
   /** A run node's mailbox; the run directory itself is never mounted. */
   runMailbox?: MailboxPaths;
   sessionBootstrap?: DockerSessionBootstrap;
@@ -379,7 +387,7 @@ export function buildDockerAgentCommand(options: DockerAgentCommandOptions): Bui
   const dockerEnvEntries = collectDockerEnvEntries(options.env, options.command.env, options.dockerEnv);
   args.push("--workdir", workDir, "--volume", `${workDir}:${workDir}`);
   args.push(...agentConfigMountArgs(options.agent, options.env, options.profile));
-  args.push(...credentialMountArgs(options.env, dockerEnvEntries, workDir));
+  args.push(...credentialMountArgs(options.env, dockerEnvEntries, workDir, options.credentialStageDir));
   args.push(...dockerEnvArgs(dockerEnvEntries));
   args.push(...options.dockerArgs);
   // Always last before the image, so no forwarded or user-supplied value
@@ -432,6 +440,11 @@ function bootstrapScript(
       'if [ "$(stat -c %u "$HOME/.codex")" != "$(id -u)" ]; then echo "durable Codex configuration directory is not owned by the container user" >&2; exit 1; fi',
       'refresh_codex_file() { source="$1"; destination="$2"; refresh_tmp="$(mktemp "$HOME/.codex/.headless-refresh.XXXXXX")"; trap \'rm -f "$refresh_tmp"\' EXIT HUP INT TERM; cp "$source" "$refresh_tmp"; chmod 600 "$refresh_tmp"; mv -fT "$refresh_tmp" "$destination"; trap - EXIT HUP INT TERM; }',
     );
+  }
+  if (persistentHome) {
+    // AWS files are staged per run with only the selected profile; never keep
+    // an earlier run's copy (possibly every profile) in a durable home.
+    commands.push('rm -rf "$HOME/.aws"');
   }
   commands.push(
     `if [ -d "${hostHomeMountRoot}" ]; then cp ${copyFlags} "${hostHomeMountRoot}/." "$HOME"/; fi`,
@@ -539,7 +552,12 @@ function collectDockerEnvEntries(env: Env, commandEnv: Env | undefined, explicit
   return [...entries.values()];
 }
 
-function credentialMountArgs(env: Env, entries: DockerEnvEntry[], workDir: string): string[] {
+function credentialMountArgs(
+  env: Env,
+  entries: DockerEnvEntry[],
+  workDir: string,
+  stageDir: string | undefined,
+): string[] {
   const args: string[] = [];
   const googleCredentials = entries.find((entry) => entry.name === "GOOGLE_APPLICATION_CREDENTIALS")?.actualValue;
   if (googleCredentials) {
@@ -551,8 +569,14 @@ function credentialMountArgs(env: Env, entries: DockerEnvEntry[], workDir: strin
 
   const awsProfile = entries.find((entry) => entry.name === "AWS_PROFILE")?.actualValue;
   const awsDir = env.HOME ? join(env.HOME, ".aws") : undefined;
-  if (awsProfile && awsDir && existsSync(awsDir) && statSync(awsDir).isDirectory()) {
-    args.push("--volume", `${awsDir}:${join(hostHomeMountRoot, ".aws")}:ro`);
+  if (awsProfile && awsDir && stageDir && existsSync(awsDir) && statSync(awsDir).isDirectory()) {
+    // Mount only the selected profile (and its sso-session), never all of ~/.aws.
+    const awsStage = join(stageDir, "aws");
+    rmSync(awsStage, { force: true, recursive: true });
+    mkdirSync(awsStage, { mode: 0o700 });
+    if (seedAwsProfileFiles(awsDir, awsStage, awsProfile).length > 0) {
+      args.push("--volume", `${join(awsStage, ".aws")}:${join(hostHomeMountRoot, ".aws")}:ro`);
+    }
   }
 
   return args;
