@@ -33,3 +33,11 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - Attacker-filled old mailbox launch directories can linger: the bounded best-effort sweep on the next launch does not recurse into subdirectories a container nested inside its mailbox.
 - Prompts starting with "-" are still passed as a bare positional (or `-p` value) to Cursor (`agent`, one-shot and interactive), OpenCode (`run` and interactive run), Pi (one-shot and interactive), Gemini interactive, and Antigravity (`agy -p`); none of these CLIs is installed here to verify whether they accept `--` or a dash-leading value, and none has a stdin prompt path in Headless. Claude, Codex and Gemini one-shot are fixed.
 - Gemini one-shot now sends inline prompts on stdin with `--prompt ''` (the path prompt files already used); not verified against an installed gemini.
+- Modal sandbox lifetime is counted from sandbox creation (agent timeout + 120s recovery window), so a slow upload eats into the recovery window.
+- `--modal-keep-sandbox` creates the sandbox with a 24h lifetime for every run, so if Headless itself is SIGKILLed the sandbox bills up to 24h instead of the agent timeout.
+- The kept-sandbox message points at the Modal dashboard or the JS SDK to terminate; Headless has no command to terminate (or fetch from) a kept sandbox.
+- ACP SDK logs "Error handling request" to stderr for each refused ACP file read (SDK console logging of handler errors).
+- ACP `fs/read_text_file` ignores the request's `line`/`limit` and returns the whole file.
+- AWS profile filtering (Docker and Modal) skips `~/.aws/credentials`/`config` when they are symlinks, drops `source_profile` chains and the SSO token cache (`~/.aws/sso/cache`), so SSO or chained profiles need credentials supplied another way in the container.
+- `--docker --print-command` prints an AWS mount source in a staged temp dir that is removed when Headless exits, so the printed command is not runnable as is when `AWS_PROFILE` is forwarded.
+- The staged Docker AWS credentials temp dir is left behind if Headless is killed without running its cleanup (e.g. SIGKILL).
