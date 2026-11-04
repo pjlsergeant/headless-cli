@@ -9,8 +9,10 @@ import {
   DEFAULT_KILL_GRACE_MS,
   forceKillWindowsProcessTree,
   killGraceMs,
+  childProcessTree,
   processGroupAlive,
-  terminateProcessGroup,
+  ProcessTree,
+  terminateProcessTree,
   windowsTaskkillPath,
   type TaskkillLauncher,
 } from "../src/process-tree.ts";
@@ -101,7 +103,7 @@ test("process group termination escalates to SIGKILL for a group that ignores SI
     await once(child.stdout, "data");
     assert.equal(processGroupAlive(child.pid!), true);
     const started = Date.now();
-    assert.equal(await terminateProcessGroup(child, { graceMs: 200 }), "SIGKILL");
+    assert.deepEqual(await terminateProcessTree(childProcessTree(child), { graceMs: 200 }), { signal: "SIGKILL", survived: false });
     assert.ok(Date.now() - started >= 180);
     assert.equal(processGroupAlive(child.pid!), false);
   } finally {
@@ -115,5 +117,36 @@ test("process group termination stops at SIGTERM when the group exits", { skip: 
     stdio: ["ignore", "pipe", "ignore"],
   });
   await once(child.stdout, "data");
-  assert.equal(await terminateProcessGroup(child, { graceMs: 2000 }), "SIGTERM");
+  assert.deepEqual(await terminateProcessTree(childProcessTree(child), { graceMs: 2000 }), { signal: "SIGTERM", survived: false });
+});
+
+test("process tree tracks a descendant that left the group with setsid", { skip: process.platform === "win32" }, async () => {
+  // The leader spawns a detached (setsid) grandchild that ignores SIGTERM.
+  const grandchild = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+  const child = spawn(process.execPath, ["-e", `
+    const { spawn } = require('node:child_process');
+    const g = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { detached: true, stdio: 'ignore' });
+    console.log(g.pid);
+    setInterval(() => {}, 1000);
+  `], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  let grandchildPid: number | undefined;
+  try {
+    grandchildPid = Number(String(await once(child.stdout, "data")));
+    assert.ok(grandchildPid > 0);
+    // Let the grandchild install its SIGTERM handler.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const tree = childProcessTree(child);
+    assert.equal(tree.alive(), true);
+    assert.deepEqual(await terminateProcessTree(tree, { graceMs: 300 }), { signal: "SIGKILL", survived: false });
+    assert.equal(new ProcessTree({ roots: [grandchildPid] }).alive(), false);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (grandchildPid) {
+      try {
+        process.kill(grandchildPid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  }
 });

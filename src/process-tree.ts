@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { win32 } from "node:path";
 
@@ -20,6 +20,273 @@ export function killGraceMs(env: Record<string, string | undefined> = process.en
   return Number(raw.trim());
 }
 
+interface ProcessEntry {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  /** Terminated but not yet reaped (zombie/dead): no longer counts as alive. */
+  exited: boolean;
+}
+
+type ProcessTable = Map<number, ProcessEntry>;
+
+/**
+ * Snapshot of every visible process. Linux reads /proc; other POSIX systems
+ * (macOS) ask `ps`. Undefined on Windows or when neither is available.
+ */
+function readProcessTable(): ProcessTable | undefined {
+  if (process.platform === "win32") return undefined;
+  if (process.platform === "linux") {
+    let entries: string[];
+    try {
+      entries = readdirSync("/proc");
+    } catch {
+      return undefined;
+    }
+    const table: ProcessTable = new Map();
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        const state = fields[0] ?? "";
+        table.set(Number(entry), {
+          pid: Number(entry),
+          ppid: Number(fields[1]),
+          pgid: Number(fields[2]),
+          exited: state === "Z" || state === "X",
+        });
+      } catch {
+        // Exited while we were scanning.
+      }
+    }
+    return table;
+  }
+  const result = spawnSync("ps", ["-A", "-o", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: 2000 });
+  if (result.status !== 0 || typeof result.stdout !== "string") return undefined;
+  const table: ProcessTable = new Map();
+  for (const line of result.stdout.split("\n")) {
+    const [pid, ppid, pgid, stat] = line.trim().split(/\s+/);
+    if (!pid || !ppid || !pgid) continue;
+    table.set(Number(pid), {
+      pid: Number(pid),
+      ppid: Number(ppid),
+      pgid: Number(pgid),
+      exited: (stat ?? "").startsWith("Z"),
+    });
+  }
+  return table;
+}
+
+function probe(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function sendSignal(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface ProcessTreeOptions {
+  /** Process groups whose members belong to the tree. */
+  groups?: number[];
+  /**
+   * PIDs whose descendants (by parent PID) belong to the tree. Descendants
+   * are re-snapshotted at every signal and liveness check and remembered, so
+   * one that calls setsid()/setpgid() to leave its group is still signalled.
+   */
+  roots?: number[];
+  /**
+   * PIDs never signalled or counted, typically the calling process when it
+   * shares a group with the tree. A group containing an excluded PID is
+   * signalled member by member instead of with kill(-pgid).
+   */
+  exclude?: number[];
+  /** Direct child, signalled when nothing else matched (and on Windows). */
+  child?: KillableProcess;
+}
+
+/**
+ * A process tree to terminate: whole process groups plus every tracked
+ * descendant of the roots.
+ *
+ * Limits: a descendant that double-forks and is reparented away (to init or a
+ * subreaper) *before* any snapshot saw it, and that also left the group, is
+ * invisible and can escape. Agents run in tmux mode are owned by the tmux
+ * server by design and are not part of any headless process tree.
+ */
+export class ProcessTree {
+  private readonly groups: Set<number>;
+  private readonly roots: Set<number>;
+  private readonly exclude: Set<number>;
+  private readonly tracked = new Set<number>();
+
+  constructor(private readonly options: ProcessTreeOptions) {
+    this.groups = new Set((options.groups ?? []).filter((pid) => pid > 0));
+    this.roots = new Set((options.roots ?? []).filter((pid) => pid > 0));
+    this.exclude = new Set(options.exclude ?? []);
+  }
+
+  addGroup(pgid: number): void {
+    if (pgid > 0) this.groups.add(pgid);
+  }
+
+  addRoot(pid: number): void {
+    if (pid > 0) this.roots.add(pid);
+  }
+
+  private refresh(table: ProcessTable): void {
+    // Forget tracked PIDs that are gone so a recycled PID is not adopted.
+    for (const pid of this.tracked) {
+      const entry = table.get(pid);
+      if (!entry || entry.exited) this.tracked.delete(pid);
+    }
+    const children = new Map<number, number[]>();
+    for (const entry of table.values()) {
+      if (entry.exited) continue;
+      const siblings = children.get(entry.ppid);
+      if (siblings) siblings.push(entry.pid);
+      else children.set(entry.ppid, [entry.pid]);
+      if (this.groups.has(entry.pgid) && !this.exclude.has(entry.pid)) this.tracked.add(entry.pid);
+    }
+    const pending = [...this.roots, ...this.tracked];
+    while (pending.length) {
+      const pid = pending.pop()!;
+      const entry = table.get(pid);
+      if (entry && !entry.exited && !this.exclude.has(pid)) this.tracked.add(pid);
+      for (const child of children.get(pid) ?? []) {
+        if (!this.tracked.has(child) && !this.exclude.has(child)) {
+          this.tracked.add(child);
+          pending.push(child);
+        }
+      }
+    }
+  }
+
+  signal(signal: NodeJS.Signals): void {
+    if (process.platform === "win32") {
+      this.signalChild(signal);
+      return;
+    }
+    const table = readProcessTable();
+    if (table) this.refresh(table);
+    let delivered = false;
+    const signalledGroups = new Set<number>();
+    for (const pgid of this.groups) {
+      const sharesGroupWithExcluded = [...this.exclude].some((pid) => {
+        const entry = table?.get(pid);
+        return entry ? entry.pgid === pgid : pid === pgid;
+      });
+      if (!sharesGroupWithExcluded && sendSignal(-pgid, signal)) {
+        delivered = true;
+        signalledGroups.add(pgid);
+      }
+    }
+    // Individually: setsid escapees, and members of groups we cannot signal
+    // whole. Skip members the group signal already reached, so a process
+    // with a handler does not see the same signal twice.
+    for (const pid of this.tracked) {
+      const pgid = table?.get(pid)?.pgid;
+      if (pgid !== undefined && signalledGroups.has(pgid)) continue;
+      if (sendSignal(pid, signal)) delivered = true;
+    }
+    if (!delivered) this.signalChild(signal);
+  }
+
+  alive(): boolean {
+    if (process.platform === "win32") return this.childAlive() ?? false;
+    const table = readProcessTable();
+    if (!table) {
+      if ([...this.groups].some((pgid) => probe(-pgid))) return true;
+      if ([...this.roots].some((pid) => !this.exclude.has(pid) && probe(pid))) return true;
+      return this.childAlive() ?? false;
+    }
+    this.refresh(table);
+    if (this.tracked.size > 0) return true;
+    // Group members hidden from the table (e.g. /proc hidepid) still count.
+    for (const pgid of this.groups) {
+      if (probe(-pgid) && ![...table.values()].some((entry) => entry.pgid === pgid)) return true;
+    }
+    return false;
+  }
+
+  private signalChild(signal: NodeJS.Signals): void {
+    try {
+      this.options.child?.kill(signal);
+    } catch {
+      // Already exited.
+    }
+  }
+
+  private childAlive(): boolean | undefined {
+    const pid = this.options.child?.pid;
+    return pid === undefined ? undefined : probe(pid);
+  }
+}
+
+/** Tree for a child spawned detached (leader of its own process group). */
+export function childProcessTree(child: KillableProcess, exclude: number[] = [process.pid]): ProcessTree {
+  const pid = child.pid;
+  return new ProcessTree({ groups: pid ? [pid] : [], roots: pid ? [pid] : [], exclude, child });
+}
+
+/** True while the group led by `pid`, or `pid`'s descendants, have a live process. */
+export function processGroupAlive(pid: number): boolean {
+  return new ProcessTree({ groups: [pid], roots: [pid], exclude: [process.pid] }).alive();
+}
+
+export interface TerminateProcessTreeOptions {
+  signal?: NodeJS.Signals;
+  graceMs: number;
+  pollMs?: number;
+}
+
+export interface TerminateProcessTreeResult {
+  /** Last signal sent. */
+  signal: NodeJS.Signals;
+  /** True when something was still alive after SIGKILL and the final wait. */
+  survived: boolean;
+}
+
+/**
+ * POSIX: sends `signal` (default SIGTERM) to the tree, waits up to `graceMs`
+ * for it to exit, then SIGKILLs it and waits up to `graceMs` again. Never
+ * rejects.
+ */
+export async function terminateProcessTree(
+  tree: ProcessTree,
+  options: TerminateProcessTreeOptions,
+): Promise<TerminateProcessTreeResult> {
+  const signal = options.signal ?? "SIGTERM";
+  const pollMs = options.pollMs ?? 25;
+  if (!tree.alive()) return { signal, survived: false };
+  tree.signal(signal);
+  if (await waitUntilDead(tree, options.graceMs, pollMs)) return { signal, survived: false };
+  tree.signal("SIGKILL");
+  const dead = await waitUntilDead(tree, options.graceMs, pollMs);
+  return { signal: "SIGKILL", survived: !dead };
+}
+
+async function waitUntilDead(tree: ProcessTree, timeoutMs: number, pollMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!tree.alive()) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return !tree.alive();
+}
+
+// Legacy group-only helpers, removed once their last caller moves to ProcessTree.
 /**
  * Grace a supervisor (cron) gives a headless process it SIGTERMed before
  * SIGKILLing headless's group: headless itself needs one grace period to
@@ -53,65 +320,6 @@ export function signalProcessGroup(child: KillableProcess, signal: NodeJS.Signal
   }
 }
 
-function probe(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to someone else.
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-/**
- * True while the process group led by `pid` (or, failing that, `pid` itself)
- * has a member that has not terminated.
- *
- * On Linux, zombies are ignored: a killed descendant that was orphaned is
- * reparented to PID 1 and, when PID 1 never reaps (containers without an init,
- * e.g. Node as PID 1), lingers as a zombie that kill(-pgid, 0) still reports,
- * which would otherwise turn every shutdown into a full grace-period wait.
- */
-export function processGroupAlive(pid: number): boolean {
-  if (process.platform !== "win32" && probe(-pid)) {
-    return process.platform !== "linux" || linuxGroupHasLiveMember(pid);
-  }
-  return probe(pid) && (process.platform !== "linux" || !linuxProcessIsZombie(pid));
-}
-
-function linuxStat(pid: string | number): { state: string; pgrp: number } | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    return { state: fields[0] ?? "", pgrp: Number(fields[2]) };
-  } catch {
-    return undefined;
-  }
-}
-
-function linuxProcessIsZombie(pid: number): boolean {
-  return linuxStat(pid)?.state === "Z";
-}
-
-function linuxGroupHasLiveMember(pgid: number): boolean {
-  let entries: string[];
-  try {
-    entries = readdirSync("/proc");
-  } catch {
-    return true; // Cannot tell: the kill(-pgid, 0) probe said alive.
-  }
-  let sawMember = false;
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const stat = linuxStat(entry);
-    if (!stat || stat.pgrp !== pgid) continue;
-    sawMember = true;
-    if (stat.state !== "Z" && stat.state !== "X") return true;
-  }
-  // Members hidden from us (e.g. hidepid) still count as alive.
-  return !sawMember;
-}
-
 export interface TerminateProcessGroupOptions {
   signal?: NodeJS.Signals;
   graceMs: number;
@@ -135,13 +343,13 @@ export async function terminateProcessGroup(
   const alive = options.isAlive ?? (() => pid !== undefined && processGroupAlive(pid));
   if (!alive()) return signal;
   signalProcessGroup(child, signal);
-  if (await waitUntilDead(alive, options.graceMs, pollMs)) return signal;
+  if (await waitUntilDeadLegacy(alive, options.graceMs, pollMs)) return signal;
   signalProcessGroup(child, "SIGKILL");
-  await waitUntilDead(alive, options.graceMs, pollMs);
+  await waitUntilDeadLegacy(alive, options.graceMs, pollMs);
   return "SIGKILL";
 }
 
-async function waitUntilDead(alive: () => boolean, timeoutMs: number, pollMs: number): Promise<boolean> {
+async function waitUntilDeadLegacy(alive: () => boolean, timeoutMs: number, pollMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!alive()) return true;
