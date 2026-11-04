@@ -14,6 +14,7 @@ import {
   removeRunStoreLockSignalListeners,
   replaceRunStateFile,
 } from "../src/run-storage.ts";
+import { ProcessTree } from "../src/process-tree.ts";
 
 function withTemporaryDirectory(callback: (directory: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "headless-run-storage-"));
@@ -538,11 +539,8 @@ test("run state replacement waits for a native Windows sharing lock", { skip: pr
 async function waitForProcessGroupExit(processGroupId: number): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    try {
-      process.kill(-processGroupId, 0);
-    } catch {
-      return;
-    }
+    // Zombie-aware: where PID 1 never reaps, killed members linger as zombies.
+    if (!new ProcessTree({ groups: [processGroupId] }).alive()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`process group did not exit: ${processGroupId}`);

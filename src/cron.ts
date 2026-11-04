@@ -15,7 +15,8 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
-import { killGraceMs, processRunning, ProcessTree, terminateProcessTree } from "./process-tree.js";
+import { processAlive as processRunning } from "./process-identity.js";
+import { killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedule.js";
 import type { AgentName, Env } from "./types.js";
 

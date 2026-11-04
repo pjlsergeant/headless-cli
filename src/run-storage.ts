@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -12,9 +11,18 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { win32 } from "node:path";
 
 import type { lockSync as LockSync } from "proper-lockfile";
+
+import {
+  executeWindowsPowerShell,
+  processAlive,
+  processIdentityChanged,
+  processStartIdentity,
+  validProcessId,
+  windowsPowerShellPath,
+} from "./process-identity.js";
+import { ProcessTree } from "./process-tree.js";
 
 const privateDirMode = 0o700;
 const legacyInitializationGraceMs = 1_000;
@@ -24,9 +32,7 @@ const nodeLockStaleMs = 20_000;
 const nodeLockUpdateMs = 5_000;
 const runLockTimeoutMs = 30_000;
 const runLockRetryMs = 10;
-const maximumProcessId = 0xffff_ffff;
 const windowsProcessTreeTimeoutMs = 3_000;
-const windowsProcessIdentityTimeoutMs = 5_000;
 const windowsOwnerIdentityTimeoutMs = 10_000;
 const windowsRenameAttempts = 40;
 const windowsRenameRetryMs = 25;
@@ -59,15 +65,6 @@ export interface RunStateReplacementOptions {
 export interface WindowsProcessTreeProbeOptions {
   execute?: (command: string, args: string[]) => string;
   systemRoot?: string;
-}
-
-export interface MacosProcessStartIdentityOptions {
-  env?: NodeJS.ProcessEnv;
-  execute?: (
-    command: string,
-    args: string[],
-    options: { env: NodeJS.ProcessEnv },
-  ) => string;
 }
 
 export function acquireRunStoreLock(lockPath: string, runId: string): () => void {
@@ -242,17 +239,13 @@ function storedOwnerIsTrusted(owner: StoredNodeStoreLockOwner): boolean {
   return validProcessId(owner.processTreeRootPid) && Number.isFinite(owner.createdAtMs);
 }
 
-function validProcessId(pid: number): boolean {
-  return Number.isSafeInteger(pid) && pid > 0 && pid <= maximumProcessId;
-}
-
 function writeLockOwner(lockPath: string, owner: NodeStoreLockOwner): void {
-  writeStoredLockOwner(lockPath, createStoredLockOwner(owner, windowsProcessIdentityTimeoutMs));
+  writeStoredLockOwner(lockPath, createStoredLockOwner(owner));
 }
 
 function createStoredLockOwner(
   owner: NodeStoreLockOwner,
-  windowsIdentityTimeoutMs: number,
+  windowsIdentityTimeoutMs?: number,
 ): StoredNodeStoreLockOwner {
   return {
     ...owner,
@@ -337,35 +330,15 @@ function readLegacyLockPid(lockPath: string): number | undefined {
   return Number.isSafeInteger(pid) ? pid : undefined;
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
+// Zombie-aware and identity-checked through process-identity: a dead owner
+// left as a zombie (non-reaping PID 1) or a reused root PID does not block.
 function processTreeAlive(owner: StoredNodeStoreLockOwner): boolean {
   const rootPid = owner.processTreeRootPid;
   const rootAlive = processAlive(rootPid);
-  let identityMismatch = false;
-  if (rootAlive) {
-    const currentIdentity = processStartIdentity(rootPid);
-    identityMismatch = Boolean(
-      owner.processStartIdentity
-      && currentIdentity
-      && owner.processStartIdentity !== currentIdentity,
-    );
-  }
+  const identityMismatch = rootAlive && processIdentityChanged(rootPid, owner.processStartIdentity);
   return processTreeAliveFromProbes(process.platform, rootAlive, identityMismatch, () => {
     if (process.platform === "win32") return windowsProcessTreeAlive(rootPid);
-    try {
-      process.kill(-rootPid, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "EPERM";
-    }
+    return new ProcessTree({ groups: [rootPid] }).alive();
   });
 }
 
@@ -400,97 +373,6 @@ export function windowsProcessTreeAlive(
   }
 }
 
-export function windowsProcessStartIdentity(
-  pid: number,
-  options: WindowsProcessTreeProbeOptions = {},
-): string | undefined {
-  return probeWindowsProcessStartIdentity(pid, options, windowsProcessIdentityTimeoutMs);
-}
-
-function probeWindowsProcessStartIdentity(
-  pid: number,
-  options: WindowsProcessTreeProbeOptions,
-  timeoutMs: number,
-): string | undefined {
-  if (!validProcessId(pid)) return undefined;
-  const execute = options.execute
-    ?? ((command, args) => executeWindowsPowerShell(command, args, timeoutMs));
-  try {
-    const output = execute(windowsPowerShellPath(options.systemRoot), [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      windowsProcessStartIdentityProbe(pid),
-    ]).trim();
-    const match = /^HEADLESS_PROCESS_START:(\d+)$/.exec(output);
-    return match ? `win32:${match[1]}` : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function executeWindowsPowerShell(command: string, args: string[], timeout: number): string {
-  return execFileSync(command, args, {
-    encoding: "utf8",
-    timeout,
-    windowsHide: true,
-  });
-}
-
-function processStartIdentity(pid: number, windowsTimeoutMs = windowsProcessIdentityTimeoutMs): string | undefined {
-  if (process.platform === "linux") {
-    try {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      return fields[19];
-    } catch {
-      return undefined;
-    }
-  }
-  if (process.platform === "darwin") {
-    return macosProcessStartIdentity(pid);
-  }
-  if (process.platform === "win32") {
-    return probeWindowsProcessStartIdentity(pid, {}, windowsTimeoutMs);
-  }
-  return undefined;
-}
-
-export function macosProcessStartIdentity(
-  pid: number,
-  options: MacosProcessStartIdentityOptions = {},
-): string | undefined {
-  const execute = options.execute ?? executeMacosProcessStartIdentityProbe;
-  const env = { ...(options.env ?? process.env), LC_ALL: "C", TZ: "UTC" };
-  try {
-    const startedAt = execute(
-      "/bin/ps",
-      ["-o", "lstart=", "-p", String(pid)],
-      { env },
-    ).trim();
-    return startedAt ? `darwin:${startedAt}` : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function executeMacosProcessStartIdentityProbe(
-  command: string,
-  args: string[],
-  options: { env: NodeJS.ProcessEnv },
-): string {
-  return execFileSync(command, args, {
-    ...options,
-    encoding: "utf8",
-    timeout: 3_000,
-  });
-}
-
-function windowsPowerShellPath(systemRoot = process.env.SystemRoot): string {
-  const root = systemRoot && win32.isAbsolute(systemRoot) ? systemRoot : "C:\\Windows";
-  return win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-
 function windowsDescendantProbe(rootPid: number): string {
   return [
     "$ErrorActionPreference = 'Stop'",
@@ -504,15 +386,6 @@ function windowsDescendantProbe(rootPid: number): string {
     "  $parents = @($children | ForEach-Object { $_.ProcessId })",
     "} while ($parents.Count -gt 0)",
     "if ($found) { 'HEADLESS_PROCESS_TREE_ALIVE' } else { 'HEADLESS_PROCESS_TREE_DEAD' }",
-  ].join("; ");
-}
-
-function windowsProcessStartIdentityProbe(rootPid: number): string {
-  return [
-    "$ErrorActionPreference = 'Stop'",
-    `$rootPid = [uint32]${rootPid}`,
-    "$process = Get-CimInstance Win32_Process -Filter \"ProcessId = $rootPid\"",
-    "if ($null -ne $process) { 'HEADLESS_PROCESS_START:' + $process.CreationDate.ToUniversalTime().Ticks }",
   ].join("; ");
 }
 
