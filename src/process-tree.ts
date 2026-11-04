@@ -46,19 +46,8 @@ function readProcessTable(): ProcessTable | undefined {
     const table: ProcessTable = new Map();
     for (const entry of entries) {
       if (!/^\d+$/.test(entry)) continue;
-      try {
-        const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
-        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-        const state = fields[0] ?? "";
-        table.set(Number(entry), {
-          pid: Number(entry),
-          ppid: Number(fields[1]),
-          pgid: Number(fields[2]),
-          exited: state === "Z" || state === "X",
-        });
-      } catch {
-        // Exited while we were scanning.
-      }
+      const found = linuxProcessEntry(Number(entry));
+      if (found) table.set(found.pid, found);
     }
     return table;
   }
@@ -76,6 +65,17 @@ function readProcessTable(): ProcessTable | undefined {
     });
   }
   return table;
+}
+
+function linuxProcessEntry(pid: number): ProcessEntry | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const state = fields[0] ?? "";
+    return { pid, ppid: Number(fields[1]), pgid: Number(fields[2]), exited: state === "Z" || state === "X" };
+  } catch {
+    return undefined; // Gone (or exited while we were scanning).
+  }
 }
 
 function probe(pid: number): boolean {
@@ -195,9 +195,11 @@ export class ProcessTree {
     // Individually: setsid escapees, and members of groups we cannot signal
     // whole. Skip members the group signal already reached, so a process
     // with a handler does not see the same signal twice.
+    // SIGKILL goes to every tracked PID regardless: a process that changed
+    // group between the snapshot and the group kill must not be missed.
     for (const pid of this.tracked) {
       const pgid = table?.get(pid)?.pgid;
-      if (pgid !== undefined && signalledGroups.has(pgid)) continue;
+      if (signal !== "SIGKILL" && pgid !== undefined && signalledGroups.has(pgid)) continue;
       if (sendSignal(pid, signal)) delivered = true;
     }
     if (!delivered) this.signalChild(signal);
@@ -232,6 +234,16 @@ export class ProcessTree {
     const pid = this.options.child?.pid;
     return pid === undefined ? undefined : probe(pid);
   }
+}
+
+/**
+ * True while `pid` exists and has not terminated. Unlike kill(pid, 0) this
+ * treats a zombie as dead (Linux), which matters where PID 1 never reaps.
+ */
+export function processRunning(pid: number): boolean {
+  if (!probe(pid)) return false;
+  if (process.platform !== "linux") return true;
+  return linuxProcessEntry(pid)?.exited !== true;
 }
 
 /** Tree for a child spawned detached (leader of its own process group). */
@@ -273,14 +285,22 @@ export async function terminateProcessTree(
   tree.signal(signal);
   if (await waitUntilDead(tree, options.graceMs, pollMs)) return { signal, survived: false };
   tree.signal("SIGKILL");
-  const dead = await waitUntilDead(tree, options.graceMs, pollMs);
+  // Re-send SIGKILL on every poll: it also catches descendants forked or
+  // regrouped after the previous snapshot.
+  const dead = await waitUntilDead(tree, options.graceMs, pollMs, () => tree.signal("SIGKILL"));
   return { signal: "SIGKILL", survived: !dead };
 }
 
-async function waitUntilDead(tree: ProcessTree, timeoutMs: number, pollMs: number): Promise<boolean> {
+async function waitUntilDead(
+  tree: ProcessTree,
+  timeoutMs: number,
+  pollMs: number,
+  onPoll?: () => void,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!tree.alive()) return true;
+    onPoll?.();
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   return !tree.alive();
