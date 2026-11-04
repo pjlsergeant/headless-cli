@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Fixed Modal runs losing the remote work when the result could not be recovered: the result download now gets its own 120s window after the agent deadline, and if the downloaded workspace cannot be extracted or applied, Headless saves it to `~/.headless/modal-recovery/<timestamp>-<id>.tar.gz` (private), prints how to extract it, terminates the sandbox and exits nonzero. Added `--modal-keep-sandbox` (also for `cron add` and the Python SDK's `modal_keep_sandbox=True`) to leave the sandbox running, with its id printed, when recovery fails; a kept sandbox keeps billing until terminated (created with a 24h lifetime).
 - Fixed Modal uploads failing before the agent started when a tracked file had been deleted from the worktree without staging the deletion.
 - Fixed Modal sync-back recreating sandbox symlinks with any target: links whose target is absolute or resolves outside the work dir are now reported as conflicts and not created.
 - Fixed Docker runs to refuse a work dir that overlaps Headless state in either direction (`~/.headless`, the run store, cron root, session store, or Docker session root), comparing configured and canonical paths, since the work dir is mounted read-write into the container. Docker run nodes pin the canonical run directory at launch for their mailbox and the nodes it starts.

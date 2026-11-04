@@ -162,6 +162,7 @@ class AsyncCron:
         modal_image: str | None = None,
         modal_image_secret: str | None = None,
         modal_include_git: bool = False,
+        modal_keep_sandbox: bool = False,
         modal_memory: int | None = None,
         modal_secrets: Sequence[str] | None = None,
         modal_timeout: int | None = None,
@@ -198,6 +199,8 @@ class AsyncCron:
         append_value(args, "--modal-image-secret", modal_image_secret)
         if modal_include_git:
             args.append("--modal-include-git")
+        if modal_keep_sandbox:
+            args.append("--modal-keep-sandbox")
         append_value(args, "--modal-memory", modal_memory)
         append_many(args, "--modal-secret", modal_secrets)
         append_value(args, "--modal-timeout", modal_timeout)

@@ -49,6 +49,7 @@ def build_run_args(
     modal_secrets: Sequence[str] | None = None,
     modal_env: Sequence[str] | None = None,
     modal_include_git: bool = False,
+    modal_keep_sandbox: bool = False,
     timeout_seconds: int | None = None,
     keep_background: bool = False,
     session: str | None = None,
@@ -101,6 +102,8 @@ def build_run_args(
     append_many(args, "--modal-env", modal_env)
     if modal_include_git:
         args.append("--modal-include-git")
+    if modal_keep_sandbox:
+        args.append("--modal-keep-sandbox")
     append_value(args, "--timeout", timeout_seconds)
     if keep_background:
         args.append("--keep-background")

@@ -53,6 +53,7 @@ export interface CronCommandInput {
   modalImage?: string;
   modalImageSecret?: string;
   modalIncludeGit: boolean;
+  modalKeepSandbox: boolean;
   modalMemoryMiB?: number;
   modalSecrets: string[];
   modalTimeoutSeconds?: number;
@@ -388,6 +389,7 @@ function buildScheduledArgs(input: CronCommandInput): string[] {
   if (input.modalImage !== undefined) args.push("--modal-image", input.modalImage);
   if (input.modalImageSecret !== undefined) args.push("--modal-image-secret", input.modalImageSecret);
   if (input.modalIncludeGit) args.push("--modal-include-git");
+  if (input.modalKeepSandbox) args.push("--modal-keep-sandbox");
   if (input.modalMemoryMiB !== undefined) args.push("--modal-memory", String(input.modalMemoryMiB));
   for (const value of input.modalSecrets) args.push("--modal-secret", value);
   if (input.modalTimeoutSeconds !== undefined) args.push("--modal-timeout", String(input.modalTimeoutSeconds));

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -15,7 +15,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
@@ -23,6 +23,7 @@ import { gunzipSync } from "node:zlib";
 import { getAgentConfig } from "./agents.js";
 import { codexProfileSeedFiles, readCodexBaseFiles } from "./codex-profile.js";
 import { collectForwardedEnvEntries } from "./env.js";
+import { quoteArg } from "./shell.js";
 import type { AgentName, BuiltCommand, Env } from "./types.js";
 
 export const DEFAULT_MODAL_IMAGE =
@@ -31,6 +32,11 @@ export const DEFAULT_MODAL_APP = "headless-cli";
 export const DEFAULT_MODAL_CPU = 2;
 export const DEFAULT_MODAL_MEMORY_MIB = 4096;
 export const DEFAULT_MODAL_TIMEOUT_SECONDS = 3600;
+// Result download gets its own window after the agent deadline.
+export const MODAL_RECOVERY_TIMEOUT_SECONDS = 120;
+// Lifetime of a sandbox created with --modal-keep-sandbox, so it outlives a
+// failed recovery long enough to be inspected (Modal's sandbox maximum).
+export const MODAL_KEPT_SANDBOX_LIFETIME_SECONDS = 24 * 60 * 60;
 
 const remoteWorkDir = "/workspace";
 const remoteHome = "/home/node";
@@ -84,6 +90,9 @@ export interface ExecuteModalOptions {
   workDir: string;
   clientFactory?: () => Promise<ModalClientLike>;
   invoke?: (execute: ModalAttemptExecutor) => Promise<ModalAttemptResult>;
+  /** Leave the sandbox running when the result cannot be recovered. */
+  keepSandboxOnFailure?: boolean;
+  recoveryTimeoutSeconds?: number;
 }
 
 export interface ExecuteModalResult {
@@ -241,12 +250,18 @@ export function collectModalEnv(
 export async function executeModalAgent(options: ExecuteModalOptions): Promise<ExecuteModalResult> {
   const workDir = realpathSync(options.workDir);
   const timeoutMs = options.timeoutSeconds * 1000;
+  const recoveryTimeoutMs = (options.recoveryTimeoutSeconds ?? MODAL_RECOVERY_TIMEOUT_SECONDS) * 1000;
+  const sandboxLifetimeMs = Math.max(
+    timeoutMs + recoveryTimeoutMs,
+    options.keepSandboxOnFailure ? MODAL_KEPT_SANDBOX_LIFETIME_SECONDS * 1000 : 0,
+  );
   const env = collectModalEnv(options.env, options.command.env, options.modalEnv, { workDir });
   let client: ModalClientLike | undefined;
   let sandbox: ModalSandboxLike | undefined;
   const stdoutDrainController = new AbortController();
   const baselineDir = mkdtempSync(join(tmpdir(), "headless-modal-baseline-"));
   const resultDir = mkdtempSync(join(tmpdir(), "headless-modal-result-"));
+  let keepSandbox = false;
 
   try {
     const seedArchive = await createAgentSeedArchive(options.agent, options.env, options.profile);
@@ -268,10 +283,10 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
       command: ["sleep", "infinity"],
       cpu: options.cpu,
       env,
-      idleTimeoutMs: timeoutMs,
+      idleTimeoutMs: sandboxLifetimeMs,
       memoryMiB: options.memoryMiB,
       secrets,
-      timeoutMs,
+      timeoutMs: sandboxLifetimeMs,
       workdir: "/",
     });
 
@@ -342,9 +357,32 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
       ? await options.invoke(execute)
       : await execute(options.command, options.env, options.timeoutSeconds, () => {});
 
-    const resultArchive = await captureRemoteArchive(sandbox, timeoutMs);
-    extractArchiveLocally(resultArchive, resultDir);
-    const sync = syncWorkspace({ baselineDir, resultDir, workDir });
+    const activeSandbox = sandbox;
+    const recoveryFailed = (error: unknown, archive?: Uint8Array): Error => {
+      const reason = error instanceof Error ? error.message.trim() : String(error);
+      options.stderr(`headless: modal result recovery failed: ${reason}\n`);
+      if (archive) {
+        reportSavedRecoveryArchive(options, activeSandbox, archive, workDir);
+      }
+      if (options.keepSandboxOnFailure) {
+        keepSandbox = true;
+        reportKeptSandbox(options, activeSandbox, sandboxLifetimeMs);
+      }
+      return new Error(`modal result recovery failed: ${reason}`);
+    };
+    let resultArchive: Uint8Array;
+    try {
+      resultArchive = await captureRemoteArchive(sandbox, recoveryTimeoutMs);
+    } catch (error) {
+      throw recoveryFailed(error);
+    }
+    let sync: WorkspaceSyncResult;
+    try {
+      extractArchiveLocally(resultArchive, resultDir);
+      sync = syncWorkspace({ baselineDir, resultDir, workDir });
+    } catch (error) {
+      throw recoveryFailed(error, resultArchive);
+    }
     for (const conflict of sync.conflicts) {
       options.stderr(`headless: modal sync skipped local conflict: ${conflict}\n`);
     }
@@ -352,13 +390,69 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
     return { code, stdout, conflicts: sync.conflicts };
   } finally {
     stdoutDrainController.abort();
-    if (sandbox) {
+    if (sandbox && !keepSandbox) {
       await sandbox.terminate();
     }
     client?.close?.();
     rmSync(baselineDir, { force: true, recursive: true });
     rmSync(resultDir, { force: true, recursive: true });
   }
+}
+
+function reportSavedRecoveryArchive(
+  options: ExecuteModalOptions,
+  sandbox: ModalSandboxLike,
+  archive: Uint8Array,
+  workDir: string,
+): void {
+  let path: string;
+  try {
+    path = saveRecoveryArchive(options.env, sandbox.sandboxId, archive);
+  } catch (error) {
+    options.stderr(
+      `headless: could not save the Modal workspace archive: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return;
+  }
+  const extractDir = path.replace(/\.tar\.gz$/, "");
+  options.stderr(
+    [
+      `headless: saved the remote Modal workspace (not applied to your work dir) to ${path}`,
+      "headless: extract it into a new directory, compare, and copy back what you need:",
+      `headless:   mkdir ${quoteArg(extractDir)} && tar -xzf ${quoteArg(path)} -C ${quoteArg(extractDir)}`,
+      `headless:   diff -r ${quoteArg(workDir)} ${quoteArg(extractDir)}`,
+      "",
+    ].join("\n"),
+  );
+}
+
+function reportKeptSandbox(options: ExecuteModalOptions, sandbox: ModalSandboxLike, lifetimeMs: number): void {
+  const id = sandbox.sandboxId ?? "(unknown id)";
+  const hours = Math.round(lifetimeMs / 3_600_000);
+  options.stderr(
+    [
+      `headless: WARNING: Modal sandbox ${id} was left running (--modal-keep-sandbox).`,
+      `headless: it keeps billing until you terminate it, or until its ${hours}h lifetime from creation ends.`,
+      `headless: terminate it from the Modal dashboard, or with the Modal JS SDK:`,
+      `headless:   await (await new ModalClient().sandboxes.fromId(${JSON.stringify(id)})).terminate()`,
+      "",
+    ].join("\n"),
+  );
+}
+
+function saveRecoveryArchive(env: Env, sandboxId: string | undefined, archive: Uint8Array): string {
+  const dir = join(env.HOME || homedir(), ".headless", "modal-recovery");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`not a directory: ${dir}`);
+  }
+  chmodSync(dir, 0o700);
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const shortId = (sandboxId?.replace(/[^A-Za-z0-9]/g, "").slice(-8)) || randomBytes(4).toString("hex");
+  const path = join(dir, `${timestamp}-${shortId}.tar.gz`);
+  writeFileSync(path, archive, { flag: "wx", mode: 0o600 });
+  return path;
 }
 
 async function createModalClient(): Promise<ModalClientLike> {

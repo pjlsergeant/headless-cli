@@ -3089,6 +3089,13 @@ test("CLI rejects invalid Modal option combinations", async () => {
 
   stderr.length = 0;
   assert.equal(
+    await runCli(["codex", "--prompt", "hello", "--modal-keep-sandbox"], { stderr: (text) => stderr.push(text) }),
+    2,
+  );
+  assert.match(stderr.join(""), /--modal-\* options require --modal/);
+
+  stderr.length = 0;
+  assert.equal(
     await runCli(["codex", "--prompt", "hello", "--modal-env", "BAD-NAME"], { stderr: (text) => stderr.push(text) }),
     2,
   );
@@ -7283,6 +7290,7 @@ test("CLI help lists all Modal options", async () => {
     "--modal-secret",
     "--modal-env",
     "--modal-include-git",
+    "--modal-keep-sandbox",
   ]) {
     assert.match(help, new RegExp(flag));
   }

@@ -218,6 +218,7 @@ interface ParsedArgs {
   modalImage?: string;
   modalImageSecret?: string;
   modalIncludeGit: boolean;
+  modalKeepSandbox: boolean;
   modalMemoryMiB?: number;
   modalSecrets: string[];
   modalTimeoutSeconds?: number;
@@ -342,6 +343,7 @@ function usage(): string {
     "  --modal-secret <nm>  Inject a named Modal Secret. Repeatable.",
     "  --modal-env <env>    Pass env into Modal as NAME or NAME=value. Repeatable.",
     "  --modal-include-git Include .git metadata in Modal uploads.",
+    "  --modal-keep-sandbox Leave the sandbox running (and billing) if its result cannot be recovered.",
     "  --timeout <s>        One-shot command timeout in seconds.",
     "  --keep-background    Leave processes the agent started running after it exits.",
     "  --json               Stream raw agent JSON trace output.",
@@ -401,6 +403,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     modal: false,
     modalEnv: [],
     modalIncludeGit: false,
+    modalKeepSandbox: false,
     modalSecrets: [],
     keepBackground: false,
     json: false,
@@ -574,6 +577,9 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--modal-include-git":
         parsed.modalIncludeGit = true;
+        break;
+      case "--modal-keep-sandbox":
+        parsed.modalKeepSandbox = true;
         break;
       case "--modal-memory":
         parsed.modalMemoryMiB = parsePositiveInteger(takeValue(args, arg), arg);
@@ -941,6 +947,7 @@ function hasModalOptions(parsed: ParsedArgs): boolean {
     parsed.modalImage !== undefined ||
     parsed.modalImageSecret !== undefined ||
     parsed.modalIncludeGit ||
+    parsed.modalKeepSandbox ||
     parsed.modalMemoryMiB !== undefined ||
     parsed.modalSecrets.length > 0 ||
     parsed.modalTimeoutSeconds !== undefined
@@ -3932,6 +3939,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             modalImage: parsed.modalImage,
             modalImageSecret: parsed.modalImageSecret,
             modalIncludeGit: parsed.modalIncludeGit,
+            modalKeepSandbox: parsed.modalKeepSandbox,
             modalMemoryMiB: parsed.modalMemoryMiB,
             modalSecrets: parsed.modalSecrets,
             modalTimeoutSeconds: parsed.modalTimeoutSeconds,
@@ -5088,7 +5096,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             agent: parsed.agent, appName: parsed.modalApp ?? DEFAULT_MODAL_APP,
             command, cpu: parsed.modalCpu ?? DEFAULT_MODAL_CPU, env: billingEnv,
             image: parsed.modalImage ?? DEFAULT_MODAL_IMAGE, imageSecret: parsed.modalImageSecret,
-            includeGit: parsed.modalIncludeGit, memoryMiB: parsed.modalMemoryMiB ?? DEFAULT_MODAL_MEMORY_MIB,
+            includeGit: parsed.modalIncludeGit, keepSandboxOnFailure: parsed.modalKeepSandbox, memoryMiB: parsed.modalMemoryMiB ?? DEFAULT_MODAL_MEMORY_MIB,
             modalEnv: parsed.modalEnv, modalSecrets: parsed.modalSecrets, profile: effectiveProfile,
             maxCapturedStdoutBytes: parsed.sdkFormat ? sdkCaptureLimitBytes : undefined,
             waitForStdoutDrain: parsed.sdkFormat === "ndjson" ? waitForSdkStdoutDrain : undefined,
