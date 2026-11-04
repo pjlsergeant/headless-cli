@@ -148,7 +148,8 @@ test("async run message keeps ownership until a signaled agent that ignores SIGT
     assert.throws(() => acquireNodeLock(env, "auth", "worker-1"), /node is locked: worker-1/);
 
     await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
-    assert.equal(processAlive(agentPid!), false);
+    // Zombie-aware: the CLI may exit before reaping the agent it killed.
+    assert.equal(processGone(agentPid!), true);
     agentPid = undefined;
     await waitFor(() => {
       try {
