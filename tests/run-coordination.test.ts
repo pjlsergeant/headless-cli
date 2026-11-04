@@ -1581,7 +1581,7 @@ test("run message --async print-command renders an executable async invocation w
   }
 });
 
-test("Docker run coordination mounts the host run directory", async () => {
+test("Docker run coordination mounts only the node mailbox, never the run directory", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-run-test-"));
   try {
     const env = { ...process.env, HOME: join(dir, "home") };
@@ -1605,8 +1605,11 @@ test("Docker run coordination mounts the host run directory", async () => {
       ),
       0,
     );
-    assert.match(stdout.join(""), /--volume .*\/\.headless\/runs\/auth:\/headless-runs\/auth/);
-    assert.match(stdout.join(""), /--env HEADLESS_RUN_DIR=\/headless-runs\/auth/);
+    const output = stdout.join("");
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/requests:\/headless-mailbox\/requests /);
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/replies:\/headless-mailbox\/replies:ro /);
+    assert.match(output, /--env HEADLESS_RUN_MAILBOX=\/headless-mailbox /);
+    assert.doesNotMatch(output, /HEADLESS_RUN_DIR|\/\.headless\/runs\/auth:/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

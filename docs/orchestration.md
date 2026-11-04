@@ -92,11 +92,26 @@ Tune polling with `HEADLESS_RUN_STATUS_INTERVAL_MS`. Modal orchestrator runs rel
 
 ## Docker Run Coordination
 
-Docker run coordination mounts the host run directory into containers with `HEADLESS_RUN_DIR`, so containerized nodes can read and update the same local run state.
+A Docker run node never sees the host run directory. Each one gets a private mailbox instead:
+
+| Host path | Container path | Access |
+| --- | --- | --- |
+| `~/.headless/runs/<run>/mailboxes/<node>/requests` | `/headless-mailbox/requests` | read-write |
+| `~/.headless/runs/<run>/mailboxes/<node>/replies` | `/headless-mailbox/replies` | read-only |
+
+`HEADLESS_RUN_MAILBOX=/headless-mailbox` tells the `headless` inside the container to use it. There, the run commands work against the node's own run only:
+
+- `run view`, `run list`, and `run wait` read `replies/run.json`, a snapshot of the run state the host refreshes while the node runs.
+- `run message <run> <node> --prompt "..." [--async]` submits a request. If the target is an idle `oneshot` Docker node, the host starts it in its own container, with the same `--docker-image`, `--docker-arg`, and `--docker-env` flags the requesting node was launched with, and the work dir, permissions, and model from the host's run state. Without `--async` the command waits for the target to finish and prints its final message. A message to a host, Modal, tmux, session, or busy node is recorded in run state (so `run view` shows it) but not started; the command says so and exits 1.
+- `run mark <run> <own-node> --status ...` can change only the container's own node.
+- Launching a new run node from inside the container (`headless <agent> --run ...`) is refused.
+
+The host process that launched the container reads each request file, validates it strictly (a regular file of at most 256 KiB, a known operation with exactly its fields, a valid known target node id, a prompt of at most 100,000 characters, at most 16 requests per poll and 500 per container), and applies it under the run lock. Rejected requests are logged to the node's `latest.stderr.log` and answered with an error reply. Nothing a container writes is used as a host path, command, work dir, permission mode, or environment variable.
+
 Containerized run nodes currently support `oneshot` coordination only; explicit `--docker --coordination session` and `--docker --session` run-node combinations are rejected because follow-up `run message` invocations do not persist Docker launch options.
 
 Each node records the sandbox it was launched in (`none`, `docker`, or `modal`). Headless never runs a Docker or Modal node on the host: a host-side `run message` to one is refused, and relaunching it directly must use the same sandbox flag.
 
 ```bash
-headless codex --role worker --run auth --node worker-1 --docker --prompt "Implement the next task"
+headless codex --role orchestrator --run auth --node orchestrator --team worker=2 --docker --prompt "Build auth"
 ```

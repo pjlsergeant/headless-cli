@@ -230,13 +230,25 @@ function readRunState(env: Env, runId: string): RunState {
   if (!existsSync(path)) {
     return { kind: "missing" };
   }
+  let text: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Omit<RunRecord, "version">> & { version?: number };
+    text = readFileSync(path, "utf8");
+  } catch {
+    return { kind: "invalid" };
+  }
+  const run = parseRunRecord(text, runId);
+  return run ? { kind: "ok", run } : { kind: "invalid" };
+}
+
+/** Parses run state text for runId; undefined when it is not valid run state. */
+export function parseRunRecord(text: string, runId: string): RunRecord | undefined {
+  try {
+    const parsed = JSON.parse(text) as Partial<Omit<RunRecord, "version">> & { version?: number };
     if (
-      parsed.version !== 2 || parsed.runId !== runId
+      !isPlainObject(parsed) || parsed.version !== 2 || parsed.runId !== runId
       || !isPlainObject(parsed.nodes) || !Array.isArray(parsed.events)
     ) {
-      return { kind: "invalid" };
+      return undefined;
     }
     // Node ids name directories under the run dir: drop any entry whose key
     // is not a valid id or does not match the node it holds.
@@ -248,18 +260,15 @@ function readRunState(env: Env, runId: string): RunState {
       nodes[nodeId] = candidate;
     }
     return {
-      kind: "ok",
-      run: {
-        version: 2,
-        runId,
-        createdAt: parsed.createdAt ?? new Date().toISOString(),
-        updatedAt: parsed.updatedAt ?? new Date().toISOString(),
-        nodes,
-        events: parsed.events,
-      },
+      version: 2,
+      runId,
+      createdAt: parsed.createdAt ?? new Date().toISOString(),
+      updatedAt: parsed.updatedAt ?? new Date().toISOString(),
+      nodes,
+      events: parsed.events,
     };
   } catch {
-    return { kind: "invalid" };
+    return undefined;
   }
 }
 
@@ -546,6 +555,21 @@ function ensureNodeDir(env: Env, runId: string, nodeId: string): void {
   ensurePrivateDir(runDir);
   ensureRealPrivateDir(join(runDir, "nodes"));
   ensureRealPrivateDir(nodeDirectory(env, runId, nodeId));
+}
+
+/**
+ * Creates <runDir>/<segments...> one private directory at a time, refusing
+ * any level that is a symbolic link or not a directory. Returns the path.
+ */
+export function ensureRunSubdirectory(env: Env, runId: string, ...segments: string[]): string {
+  let path = runDirectory(env, runId);
+  ensurePrivateDir(path);
+  for (const segment of segments) {
+    validateRunId(segment, "run store path segment");
+    path = join(path, segment);
+    ensureRealPrivateDir(path);
+  }
+  return path;
 }
 
 function ensureRealPrivateDir(path: string): void {
