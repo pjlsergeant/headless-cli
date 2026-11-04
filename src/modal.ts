@@ -877,7 +877,9 @@ async function writeBoundedStream(stream: ModalReadStreamLike<Uint8Array>, fd: n
 
 /** Validates a gzipped tar file while streaming it, bounding the decompressed size. */
 async function validateArchiveFile(path: string, maxExtractedBytes: number): Promise<void> {
-  const validator = new TarEntryValidator(maxExtractedBytes);
+  // The result comes from the sandbox: also refuse entries that would land on
+  // the same file, which tar would silently overwrite.
+  const validator = new TarEntryValidator(maxExtractedBytes, { rejectCollisions: true });
   const gunzip = createReadStream(path).pipe(createGunzip());
   try {
     for await (const chunk of gunzip) {
@@ -928,8 +930,12 @@ class TarEntryValidator {
   private nextPaxPath?: string;
   private nextPaxSize?: number;
   private total = 0;
+  private readonly seen = new Map<string, string>();
 
-  constructor(private readonly maxBytes: number) {}
+  constructor(
+    private readonly maxBytes: number,
+    private readonly options: { rejectCollisions?: boolean } = {},
+  ) {}
 
   push(chunk: Buffer): void {
     this.total += chunk.byteLength;
@@ -998,7 +1004,28 @@ class TarEntryValidator {
     if (!["0", "\0", "2", "5"].includes(type)) {
       throw new Error(`unsafe Modal workspace archive entry: unsupported type ${type || "unknown"} for ${name}`);
     }
+    if (this.options.rejectCollisions) this.recordPath(name);
     this.skip = padded;
+  }
+
+  /**
+   * Duplicate entries, and entries equal after NFC and case folding (always
+   * folded: a case-insensitive work dir would merge them), overwrite each
+   * other on extraction, losing one silently.
+   */
+  private recordPath(name: string): void {
+    const normalized = name.split("\\").join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+    if (!normalized || normalized === ".") return;
+    const key = normalized.normalize("NFC").toLowerCase();
+    const previous = this.seen.get(key);
+    if (previous !== undefined) {
+      throw new Error(
+        previous === normalized
+          ? `unsafe Modal workspace archive entry: duplicate entry ${normalized}`
+          : `unsafe Modal workspace archive entry: ${normalized} collides with ${previous} on case-insensitive filesystems`,
+      );
+    }
+    this.seen.set(key, normalized);
   }
 
   private readMeta(data: Buffer, type: string): void {

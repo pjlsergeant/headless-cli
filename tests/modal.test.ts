@@ -1082,6 +1082,27 @@ test("Modal refuses sparse result entries in pax and GNU formats", async () => {
   }
 });
 
+test("Modal refuses result archives whose entries would overwrite each other", async () => {
+  for (const [names, pattern] of [
+    [["notes/A", "notes/a"], /notes\/a collides with notes\/A/],
+    [["dup.txt", "./dup.txt"], /duplicate entry dup\.txt/],
+  ] as const) {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-collide-");
+    try {
+      const archive = makeTarGz(names.map((name, index) => ({ content: `version ${index}`, name })));
+      const sandbox = new FakeSandbox(remote, { resultArchive: archive });
+      const stderr: string[] = [];
+      await assert.rejects(() => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)), pattern);
+      // Treated as unapplied work: archive saved durably before terminating.
+      assert.equal(readdirSync(join(dir, "home", ".headless", "modal-recovery")).length, 1);
+      assert.equal(sandbox.terminated, true);
+      assert.equal(existsSync(join(work, "notes")) || existsSync(join(work, "dup.txt")), false);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
 test("--modal-keep-sandbox leaves the sandbox running and prints its id when recovery fails", async () => {
   const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-keep-");
   try {
