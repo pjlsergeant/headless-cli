@@ -28,5 +28,5 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - Explicit `--docker-env NAME=value` entries are handed to nodes started from a mailbox on the detached child's argv (visible in `ps`), as they already were for the original invocation.
 - A container can leave dot-prefixed files in its mailbox `requests/` (treated as in-progress writes and never removed until the node's next launch), using disk in the run dir.
 - Two concurrent launches of the same Docker run node share one mailbox; the second launch clears requests and replies the first had pending.
-- A Docker work dir that contains `~/.headless` (e.g. `--work-dir ~`) exposes the run store, cron jobs, and session stores to the container read-write; nothing refuses or warns about that overlap.
+- User-supplied `--docker-arg` volume mounts are not checked for overlap with Headless state.
 - Flaky under full-suite load: "cron daemon keeps its signal handlers until active executions are killed" (tests/cron.test.ts) failed once in a full run, passes alone; timing-sensitive.

@@ -191,3 +191,38 @@ test("a sandboxed node is never relaunched on the host", async () => {
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("a Docker run refuses a work dir that contains Headless state", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-run-trust-"));
+  try {
+    const home = join(dir, "home");
+    const cron = join(dir, "elsewhere", "cron");
+    mkdirSync(join(home, ".headless"), { recursive: true });
+    mkdirSync(join(dir, "elsewhere"));
+    const cases: Array<[string, Record<string, string>]> = [
+      [home, {}],
+      [join(home, ".headless"), {}],
+      [dir, {}],
+      [join(dir, "elsewhere"), { HEADLESS_CRON_DIR: cron }],
+    ];
+    for (const [workDir, extra] of cases) {
+      const stderr: string[] = [];
+      const code = await runCli(
+        ["codex", "--role", "worker", "--run", "auth", "--node", "w1", "--docker", "--work-dir", workDir, "--prompt", "hi", "--print-command"],
+        { env: { ...process.env, HOME: home, ...extra }, stdout: () => undefined, stderr: (text) => stderr.push(text) },
+      );
+      assert.equal(code, 2, workDir);
+      assert.match(stderr.join(""), /contains Headless state/, workDir);
+    }
+    // A sibling project dir is fine.
+    const project = join(dir, "project");
+    mkdirSync(project);
+    const code = await runCli(
+      ["codex", "--docker", "--work-dir", project, "--prompt", "hi", "--print-command"],
+      { env: { ...process.env, HOME: home }, stdout: () => undefined, stderr: () => undefined },
+    );
+    assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

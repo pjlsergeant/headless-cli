@@ -2919,7 +2919,7 @@ test("CLI rejects Docker session roots that overlap the workdir", async () => {
         ),
         2,
       );
-      assert.match(stderr.join(""), /Docker session root must not overlap the work dir/);
+      assert.match(stderr.join(""), /Docker session root must not overlap the work dir|Docker work dir .* contains Headless state/);
       assert.equal(existsSync(join(sessionRoot, "codex")), false);
     }
   } finally {

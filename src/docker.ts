@@ -123,6 +123,30 @@ export function validateDockerSessionRootWorkDir(sessionHome: string, workDir: s
   }
 }
 
+/**
+ * The work dir is mounted read-write, so it must not contain Headless's own
+ * trusted state (run store, cron, session stores): a container could then
+ * rewrite what the host later acts on.
+ */
+export function validateDockerWorkDirExcludesState(workDir: string, stateRoots: string[]): void {
+  const canonicalWorkDir = realpathSync(workDir);
+  for (const root of stateRoots) {
+    const canonicalRoot = canonicalProspectivePath(root);
+    if (isSameOrContained(canonicalWorkDir, canonicalRoot)) {
+      throw new Error(
+        `Docker work dir ${canonicalWorkDir} contains Headless state (${canonicalRoot}); `
+        + "choose a work dir that does not include it",
+      );
+    }
+  }
+}
+
+export function dockerSessionRootPath(env: Env): string | undefined {
+  const configuredRoot = env[DOCKER_SESSION_ROOT_ENV]?.trim();
+  if (configuredRoot) return configuredRoot;
+  return env.HOME ? join(env.HOME, ".headless", "docker-sessions") : undefined;
+}
+
 export function validateDockerWorkDir(workDir: string): void {
   const requestedWorkDir = resolve(workDir);
   if (pathsOverlap(containerHome, requestedWorkDir)) {

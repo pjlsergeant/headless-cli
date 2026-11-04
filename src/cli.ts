@@ -16,7 +16,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { runAcpClient, runAcpStdioAgent } from "./acp.js";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { constants as osConstants, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { PiCompletionObserver } from "./pi-completion.js";
@@ -66,6 +66,8 @@ import {
   readDockerCursorSessionId,
   validateDockerSessionRootWorkDir,
   validateDockerWorkDir,
+  validateDockerWorkDirExcludesState,
+  dockerSessionRootPath,
 } from "./docker.js";
 import {
   buildModalRunSummary,
@@ -113,7 +115,7 @@ import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl, startSandboxedNodeMessage } from "./run-commands.js";
 import { containerMailboxRoot, mailboxPaths, prepareMailbox, RunMailboxService, type MailboxPaths } from "./run-mailbox.js";
 import { handleCronCommand as handleCronCommandImpl, type CronCommand } from "./cron-commands.js";
-import { runCronDaemon } from "./cron.js";
+import { cronRoot, runCronDaemon } from "./cron.js";
 import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { extractRunNodeMetrics } from "./run-metrics.js";
 import { createRunStatusReporter, parseRunStatusIntervalMs } from "./run-status.js";
@@ -125,6 +127,7 @@ import {
   nodeLockPath,
   readRun,
   registerNode,
+  runStoreRoot,
   updateNodeStatus,
   type SandboxKind,
   validateRunId,
@@ -3579,6 +3582,18 @@ function validateCronAddCliOptions(parsed: ParsedArgs): void {
   }
 }
 
+/** Everything Headless trusts on the host; a Docker work dir must contain none of it. */
+function headlessStateRoots(env: Env): string[] {
+  const roots: Array<string | undefined> = [
+    env.HOME ? join(env.HOME, ".headless") : undefined,
+    env.HOME || env.HEADLESS_RUN_DIR ? runStoreRoot(env) : undefined,
+    env.HOME || env.HEADLESS_CRON_DIR ? cronRoot(env) : undefined,
+    sessionStorePath(env) ? dirname(sessionStorePath(env) as string) : undefined,
+    dockerSessionRootPath(env),
+  ];
+  return roots.filter((root): root is string => Boolean(root)).map((root) => resolve(root));
+}
+
 function createRunMailboxService(
   env: Env,
   parsed: ParsedArgs,
@@ -4480,6 +4495,11 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     const cwd = validateWorkDir(parsed.workDir);
     if (parsed.docker) {
       validateDockerWorkDir(cwd ?? process.cwd());
+      try {
+        validateDockerWorkDirExcludesState(cwd ?? process.cwd(), headlessStateRoots(env));
+      } catch (error) {
+        throw toCliError(error);
+      }
     }
     const existingTmuxSession = parsed.tmux && parsed.sessionAlias
       ? await headlessTmuxSessionExists(buildHeadlessTmuxSessionName(parsed.agent, parsed.sessionAlias), env)
