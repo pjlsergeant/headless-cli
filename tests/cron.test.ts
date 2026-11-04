@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -481,6 +482,91 @@ test("cron daemon keeps its signal handlers until active executions are killed",
     assert.equal(process.listenerCount("SIGTERM"), sigtermListeners);
   } finally {
     if (child.pid && processAlive(child.pid)) process.kill(child.pid, "SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+function stubbornGroupLeader(): ReturnType<typeof spawn> {
+  return spawn(
+    process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);"],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+  );
+}
+
+function writeRunningExecution(
+  env: NodeJS.ProcessEnv,
+  record: { pid: number; agentPgid?: number },
+  agentPgidFile?: number,
+): string {
+  const now = new Date();
+  recordCronJob(env, {
+    agent: "codex",
+    command: { args: ["codex", "--prompt", "tick"], workDir: env.HOME as string },
+    id: "retry",
+    schedule: parseCronSchedule({ every: "1h" }),
+    now,
+  });
+  const job = readCronJob(env, "retry");
+  assert.ok(job);
+  recordCronJob(env, { ...job, activeExecutionId: "exec-retry" });
+  const executionRoot = join(cronRoot(env), "jobs", "retry", "executions", "exec-retry");
+  mkdirSync(executionRoot, { recursive: true });
+  writeFileSync(join(executionRoot, "result.json"), JSON.stringify({
+    version: 1, jobId: "retry", executionId: "exec-retry", status: "running", startedAt: now.toISOString(),
+    exitCode: null, signal: null, stdoutLog: join(executionRoot, "stdout.log"), stderrLog: join(executionRoot, "stderr.log"),
+    ...record,
+  }));
+  if (agentPgidFile !== undefined) writeFileSync(join(executionRoot, "agent.pgid"), `${agentPgidFile}\n`);
+  return executionRoot;
+}
+
+test("cron kill targets the agent group headless reported last, not a stale persisted one", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const headless = stubbornGroupLeader();
+  const currentAgent = stubbornGroupLeader();
+  try {
+    await Promise.all([once(headless.stdout, "data"), once(currentAgent.stdout, "data")]);
+    const env = testEnv(dir);
+    mkdirSync(env.HOME as string, { recursive: true });
+    // agentPgid persisted from an earlier (retried) attempt; agent.pgid names the current one.
+    const executionRoot = writeRunningExecution(env, { pid: headless.pid!, agentPgid: 2 ** 22 + 7 }, currentAgent.pid!);
+    assert.equal(await runCli(["cron", "kill", "retry"], { env, stdout: () => {} }), 0);
+    await Promise.all([
+      headless.exitCode !== null || headless.signalCode !== null ? undefined : once(headless, "exit"),
+      currentAgent.exitCode !== null || currentAgent.signalCode !== null ? undefined : once(currentAgent, "exit"),
+    ]);
+    assert.equal(currentAgent.signalCode, "SIGKILL");
+    const record = JSON.parse(readFileSync(join(executionRoot, "result.json"), "utf8"));
+    assert.equal(record.agentPgid, currentAgent.pid);
+    assert.equal(record.status, "killed");
+  } finally {
+    for (const child of [headless, currentAgent]) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron reconcile treats a zombie headless as dead and sweeps its agent group", { skip: process.platform !== "linux" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  // `sleep 30` (exec'd over sh) never reaps its background child, which
+  // therefore stays a zombie: a dead headless that kill(pid, 0) still finds.
+  const zombieParent = spawn("sh", ["-c", "sleep 0.05 & echo $!; exec sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+  const agent = stubbornGroupLeader();
+  try {
+    const zombiePid = Number(String(await once(zombieParent.stdout, "data")).trim());
+    await once(agent.stdout, "data");
+    await waitFor(() => readFileSync(`/proc/${zombiePid}/stat`, "utf8").split(") ")[1]?.startsWith("Z") ?? false);
+    const env = { ...testEnv(dir), HEADLESS_KILL_GRACE_MS: "200" };
+    mkdirSync(env.HOME as string, { recursive: true });
+    const executionRoot = writeRunningExecution(env, { pid: zombiePid }, agent.pid!);
+    await runDueCronJobsOnce(env, new Date(Date.now() - 60_000));
+    if (agent.exitCode === null && agent.signalCode === null) await once(agent, "exit");
+    assert.equal(agent.signalCode, "SIGKILL");
+    const record = JSON.parse(readFileSync(join(executionRoot, "result.json"), "utf8"));
+    assert.equal(record.status, "killed");
+    assert.equal(record.signal, "stale");
+  } finally {
+    for (const child of [zombieParent, agent]) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     rmSync(dir, { force: true, recursive: true });
   }
 });

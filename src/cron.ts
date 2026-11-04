@@ -15,7 +15,7 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
-import { killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
+import { killGraceMs, processRunning, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedule.js";
 import type { AgentName, Env } from "./types.js";
 
@@ -204,7 +204,8 @@ export async function killCronExecution(
   job: CronJobRecord,
   status: CronJobStatus = "disabled",
 ): Promise<CronJobRecord> {
-  const execution = job.activeExecutionId ? readExecution(env, job.id, job.activeExecutionId) : undefined;
+  const stored = job.activeExecutionId ? readExecution(env, job.id, job.activeExecutionId) : undefined;
+  const execution = stored ? refreshAgentPgid(env, job.id, stored) : undefined;
   const signal = execution ? await terminateExecution(env, job.id, execution) : "SIGTERM";
   if (execution) {
     writeExecution(env, job.id, {
@@ -311,7 +312,7 @@ function finishCronExecution(env: Env, jobId: string, executionId: string, code:
   const status = signal ? "killed" : code === 0 ? "succeeded" : "failed";
   writeExecution(env, jobId, {
     ...execution,
-    agentPgid: execution.agentPgid ?? readAgentPgid(env, jobId, executionId) ?? null,
+    agentPgid: readAgentPgid(env, jobId, executionId) ?? execution.agentPgid ?? null,
     status,
     completedAt: new Date().toISOString(),
     exitCode: code,
@@ -337,16 +338,11 @@ function reconcileCronJobs(env: Env): void {
     if (!job.activeExecutionId) {
       continue;
     }
-    const execution = readExecution(env, job.id, job.activeExecutionId);
-    if (execution && execution.agentPgid == null) {
-      const agentPgid = readAgentPgid(env, job.id, execution.executionId);
-      if (agentPgid !== undefined) {
-        execution.agentPgid = agentPgid;
-        writeExecution(env, job.id, execution);
-      }
-    }
-    // TODO(phase-2): verify the stored PID's identity before trusting it.
-    if (execution?.pid && processAlive(execution.pid)) {
+    const stored = readExecution(env, job.id, job.activeExecutionId);
+    const execution = stored ? refreshAgentPgid(env, job.id, stored) : undefined;
+    // Zombie-aware: a dead headless that a non-reaping PID 1 never reaps must
+    // not look alive forever. TODO(phase-2): verify the stored PID's identity.
+    if (execution?.pid && processRunning(execution.pid)) {
       continue;
     }
     // headless is gone; kill whatever is left of its agent tree.
@@ -550,12 +546,26 @@ async function terminateExecution(
   jobId: string,
   execution: CronExecutionRecord,
 ): Promise<NodeJS.Signals | null> {
-  const agentPgid = execution.agentPgid ?? readAgentPgid(env, jobId, execution.executionId);
   // Signal BOTH groups directly rather than trusting headless to forward:
   // headless may be wedged or killed before it reaches its agent's group.
-  const tree = executionTree({ ...execution, agentPgid });
+  const tree = executionTree(refreshAgentPgid(env, jobId, execution));
   const { signal } = await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
   return signal;
+}
+
+/**
+ * headless rewrites agent.pgid for every attempt (billing/capacity retries),
+ * so the file, not the first value persisted, names the live agent group.
+ * Persist it whenever it changes.
+ */
+function refreshAgentPgid(env: Env, jobId: string, execution: CronExecutionRecord): CronExecutionRecord {
+  const current = readAgentPgid(env, jobId, execution.executionId);
+  if (current === undefined || current === execution.agentPgid) return execution;
+  const refreshed = { ...execution, agentPgid: current };
+  if (readExecution(env, jobId, execution.executionId)?.status === execution.status) {
+    writeExecution(env, jobId, refreshed);
+  }
+  return refreshed;
 }
 
 async function sweepOrphanedAgent(env: Env, jobId: string, executionId: string): Promise<void> {
