@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Changed one-shot runs to terminate processes the agent left running when it exits on its own (after a one-grace-period output drain), so a finished run leaves no agent processes behind and a background process holding the agent's output no longer hangs a run without `--timeout`. Pass `--keep-background` (also for `cron add`, coordinated-run nodes, and the Python SDK's `keep_background=True`) to leave them running instead.
 - Fixed termination of native agents on POSIX: Headless now always runs the agent in its own process group and forwards `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` (and suspend/continue) to the whole group, with or without `--timeout`, escalating to `SIGKILL` after a shared grace period (`HEADLESS_KILL_GRACE_MS`, default 5s). `cron kill`/`stop`/`rm --force`, ACP server shutdown, and async run-message workers now terminate the full process tree with the same bounded escalation. Descendants that leave the group with `setsid` are tracked and killed too, cron reaches the agent's group even when Headless itself was killed, and `runCli` no longer returns while the tree is still dying.
 - Added automatic bounded retries for native Codex model-capacity failures in local, Docker, and Modal runs, preserving sessions, billing policy, cancellation, deadlines, and per-attempt usage. Set `HEADLESS_CAPACITY_RETRIES=0` to disable.
 - Fixed run coordination to recover stale run and node locks after owner crashes, retain async ownership for the full detached process tree, and handle Windows process probing and state replacement safely (#28).

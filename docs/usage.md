@@ -137,7 +137,7 @@ headless cron rm inbox-triage --force
 
 Paused jobs do not schedule new executions. `kill` terminates the active execution if present, clears pending work, and disables the job. `rm` refuses to delete a job with an active execution unless `--force` is set.
 
-Cron jobs accept detached-safe one-shot options: `--model`, Codex-only `--profile`, `--fast` (Codex and Claude only), `--reasoning-effort`, `--allow`, `--work-dir`, Docker and Modal options, `--timeout`, `--json`, `--debug`, and `--usage`. Interactive options such as `--tmux`, `--wait`, `--delete`, `--session`, and run-management flags are rejected for scheduled jobs.
+Cron jobs accept detached-safe one-shot options: `--model`, Codex-only `--profile`, `--fast` (Codex and Claude only), `--reasoning-effort`, `--allow`, `--work-dir`, Docker and Modal options, `--timeout`, `--keep-background`, `--json`, `--debug`, and `--usage`. Interactive options such as `--tmux`, `--wait`, `--delete`, `--session`, and run-management flags are rejected for scheduled jobs.
 
 If a job's next tick arrives while that job is still running, Headless records one pending execution. Further ticks keep the pending flag true instead of creating an unbounded backlog. When the active execution exits, the daemon immediately starts the single pending execution.
 
@@ -301,6 +301,7 @@ Options:
 - `--docker`: run the agent inside Docker; add `--session` for a durable multi-turn container home.
 - `--modal`: run the agent in a Modal CPU sandbox for one-shot headless execution.
 - `--timeout <s>`: stop one-shot local, Docker, Modal, or `--tmux --wait` execution after the given number of seconds. For Antigravity one-shot runs, Headless also forwards this budget to `agy --print-timeout`.
+- `--keep-background`: when the agent exits on its own, leave processes it started in the background (dev servers, watchers) running. By default Headless waits one kill grace period (`HEADLESS_KILL_GRACE_MS`, 5s) for the agent's output to drain, then terminates whatever the agent left behind (`SIGTERM`, grace, `SIGKILL`) before returning, so a finished run leaves no agent processes behind and a background process holding the agent's output can no longer hang the run. With `--keep-background`, Headless stops waiting on the output after that window and returns without killing anything. A `--timeout` or a signal to Headless still terminates the whole tree. Antigravity runs always clean up their descendants. Also accepted by `cron add` and stored on coordinated-run nodes.
 - `--json`: stream the raw agent JSON trace instead of extracting the final message.
 - `--debug`: stream the raw agent JSON trace and append the extracted final message.
 - `--usage`: append normalized token usage and cost JSON after the final message or streamed `--json` trace.
