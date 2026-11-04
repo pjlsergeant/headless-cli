@@ -1423,6 +1423,8 @@ test("CLI bounds timeout drain when a descendant retains stdout", async () => {
     const code = await runCli(["codex", "--prompt", "hello", "--json", "--usage", "--timeout", "3"], {
       env: {
         ...process.env,
+        // Keep the kill grace below the grandchild's 4s natural exit.
+        HEADLESS_KILL_GRACE_MS: "1000",
         HEADLESS_TEST_GRANDCHILD_PID: pidFile,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
       },
@@ -4259,7 +4261,8 @@ test("CLI bounds Antigravity stdout drain after the direct child exits", async (
     chmodSync(binary, 0o755);
 
     const code = await runCli(["antigravity", "--prompt", "hello", "--json", "--usage", "--timeout", "60"], {
-      env: { ...process.env, ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      // Keep the drain bound (one kill grace) below the grandchild's 4s natural exit.
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "1000", ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
       stdout: () => {},
     });
 

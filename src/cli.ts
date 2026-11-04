@@ -103,7 +103,12 @@ import {
   acquireLaunchLock,
   isDockerSessionLockSignalListener,
 } from "./launch-lock.js";
-import { forceKillWindowsProcessTree } from "./process-tree.js";
+import {
+  forceKillWindowsProcessTree,
+  killGraceMs,
+  processGroupAlive,
+  signalProcessGroup,
+} from "./process-tree.js";
 import { compactOversizedTraceLine } from "./relevant-trace.js";
 import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl } from "./run-commands.js";
@@ -1803,7 +1808,7 @@ async function executeCommand(
       let exitedBeforeClose: { code: number | null; signal: NodeJS.Signals | null } | undefined;
       const stdoutDrainController = new AbortController();
       let removeParentSignalHandlers = () => {};
-      const terminationGraceMs = 1000;
+      const terminationGraceMs = killGraceMs(env);
       const maxRelevantTraceBytes = 256 * 1024;
       const maxFinalMessageTraceBytes = options.maxFinalMessageTraceBytes ?? 64 * 1024;
       const maxCapturedTraceRowBytes = 4 * 1024 * 1024;
@@ -1912,12 +1917,21 @@ async function executeCommand(
         resolve(result);
       };
       const asyncMessageWorker = env.HEADLESS_ASYNC_MESSAGE_WORKER === "1";
-      const ownsChildProcessGroup = !asyncMessageWorker && process.platform !== "win32" && (
-        options.timeoutSeconds !== undefined
-        || options.cleanupBeforeParentSignalExit !== undefined
-      );
-      const handlesParentSignals = asyncMessageWorker
-        || ownsChildProcessGroup
+      // POSIX: the agent always leads its own process group (detached =>
+      // setsid) so every termination path can signal the whole agent tree.
+      // The one exception is the async message worker: it already spawned
+      // this headless as the leader of a dedicated group, records that group
+      // as the node lock's process tree, and signals/escalates on the group
+      // itself. Keeping the agent inside it means the lock stays held while
+      // any agent process is alive and the worker's SIGKILL reaches the agent
+      // even if headless dies first.
+      // The agent's stdio is never a TTY here (stdin is ignore/pipe/file,
+      // stdout/stderr are pipes), so leaving the terminal's session cannot
+      // cause SIGTTIN/SIGTTOU stops; terminal-generated signals (Ctrl-C,
+      // Ctrl-Z, Ctrl-\) now reach headless only and are forwarded below.
+      const ownsChildProcessGroup = process.platform !== "win32" && !asyncMessageWorker;
+      const handlesParentSignals = process.platform !== "win32"
+        || asyncMessageWorker
         || agent === "codex"
         || options.cleanupBeforeParentSignalExit !== undefined;
       waitForAsyncMessageOwnership(env, command);
@@ -1935,15 +1949,16 @@ async function executeCommand(
       });
 
       const signalChildTree = (signal: NodeJS.Signals) => {
-        if (ownsChildProcessGroup && child.pid) {
-          try {
-            process.kill(-child.pid, signal);
-            return;
-          } catch {
-            // Fall back to the direct child when the process group has already exited.
-          }
+        if (ownsChildProcessGroup) {
+          signalProcessGroup(child, signal);
+          return;
         }
         child.kill(signal);
+      };
+      const childTreeAlive = () => {
+        if (!child.pid) return false;
+        if (ownsChildProcessGroup) return processGroupAlive(child.pid);
+        return child.exitCode === null && child.signalCode === null;
       };
 
       const clearForceDrain = () => {
@@ -1984,13 +1999,39 @@ async function executeCommand(
 
       if (handlesParentSignals) {
         const handlers = new Map<NodeJS.Signals, () => void>();
-        removeParentSignalHandlers = () => {
+        // While a forwarded parent signal is pending and headless will re-raise
+        // it, headless stays alive to escalate and finish() must keep the
+        // handlers (a second signal then SIGKILLs the tree at once). When an
+        // embedding caller owns the signal instead, finish() still detaches
+        // them so runCli leaves no listeners behind; escalation timers go on.
+        let parentSignalExit: { signal: NodeJS.Signals; reraise: boolean } | undefined;
+        let parentSignalKill: NodeJS.Timeout | undefined;
+        let parentSignalPoll: NodeJS.Timeout | undefined;
+        const removeHandlers = () => {
           for (const [signal, handler] of handlers) {
             process.off(signal, handler);
           }
         };
+        removeParentSignalHandlers = () => {
+          if (!parentSignalExit?.reraise) removeHandlers();
+        };
+        const completeParentSignalExit = () => {
+          if (!parentSignalExit) return;
+          const { signal, reraise } = parentSignalExit;
+          parentSignalExit = undefined;
+          clearTimeout(parentSignalKill);
+          clearInterval(parentSignalPoll);
+          removeHandlers();
+          if (reraise) process.kill(process.pid, signal);
+        };
         for (const signal of parentExitSignals()) {
           const handler = () => {
+            if (parentSignalExit) {
+              // A second exit signal while the tree is draining: stop waiting.
+              signalChildTree("SIGKILL");
+              completeParentSignalExit();
+              return;
+            }
             parentTerminationSignal = signal;
             const inheritedListeners = options.inheritedSignalListeners?.get(signal);
             const hasExternalListener = inheritedListeners
@@ -2000,14 +2041,31 @@ async function executeCommand(
             try {
               options.cleanupBeforeParentSignalExit?.();
             } finally {
-              removeParentSignalHandlers();
-              if (!hasExternalListener) {
-                process.kill(process.pid, signal);
+              if (process.platform === "win32") {
+                removeHandlers();
+                if (!hasExternalListener) {
+                  process.kill(process.pid, signal);
+                }
+              } else {
+                // POSIX: re-raise only once the whole agent tree is gone, and
+                // SIGKILL the group if it outlives the grace period. Both
+                // timers stay referenced so headless cannot exit early and
+                // orphan the agent.
+                parentSignalExit = { signal, reraise: !hasExternalListener };
+                parentSignalKill = setTimeout(() => {
+                  // Keep polling so the killed tree is reaped before we die;
+                  // stop waiting one more grace period later regardless.
+                  signalChildTree("SIGKILL");
+                  parentSignalKill = setTimeout(completeParentSignalExit, terminationGraceMs);
+                }, terminationGraceMs);
+                parentSignalPoll = setInterval(() => {
+                  if (!childTreeAlive()) completeParentSignalExit();
+                }, 25);
               }
             }
           };
           handlers.set(signal, handler);
-          process.once(signal, handler);
+          process.on(signal, handler);
         }
         if (ownsChildProcessGroup) {
           const suspendHandler = () => {
