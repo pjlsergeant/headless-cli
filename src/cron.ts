@@ -15,7 +15,14 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
-import { processAlive as processRunning } from "./process-identity.js";
+import { readOwnerLockHolder, tryAcquireOwnerLock, withOwnerLockSync, type OwnerLockRecord } from "./owner-lock.js";
+import {
+  isSameProcess,
+  processAlive,
+  processStartIdentity,
+  signallableIds,
+  type ProcessIdentity,
+} from "./process-identity.js";
 import { killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedule.js";
 import type { AgentName, Env } from "./types.js";
@@ -58,12 +65,16 @@ export interface CronExecutionRecord {
   executionId: string;
   status: CronExecutionStatus;
   pid: number | null;
+  /** Start identity of `pid`; signals are refused once the PID is reused. */
+  pidIdentity?: string;
   /**
    * Process group of the agent headless spawned, reported by headless via
    * HEADLESS_AGENT_PGID_FILE. Lets cron kill/reconcile reach the agent even
    * when headless itself died (SIGKILL, OOM) without forwarding anything.
    */
   agentPgid?: number | null;
+  /** Start identity of the agent group's leader, reported with agent.pgid. */
+  agentPgidIdentity?: string;
   startedAt: string;
   completedAt?: string;
   exitCode: number | null;
@@ -91,8 +102,24 @@ export function cronRoot(env: Env): string {
   return join(env.HOME, ".headless", "cron");
 }
 
-export function cronPidPath(env: Env): string {
-  return join(cronRoot(env), "daemon.pid");
+/** Held by the running daemon for its whole life; the holder names its PID. */
+export function cronDaemonLockPath(env: Env): string {
+  return join(cronRoot(env), "locks", "daemon");
+}
+
+function cronJobLockPath(env: Env, id: string): string {
+  return join(cronRoot(env), "locks", "jobs", id);
+}
+
+/**
+ * Every job state transition (daemon and CLI alike) runs under the job's lock
+ * and re-reads the record inside it, so no writer persists a stale snapshot.
+ * Sections are short and synchronous; never await while holding one.
+ */
+function withCronJobLock<T>(env: Env, id: string, callback: () => T): T {
+  validateCronJobId(id);
+  ensurePrivateDir(dirname(cronJobLockPath(env, id)));
+  return withOwnerLockSync(cronJobLockPath(env, id), callback, { label: `cron job lock for ${id}` });
 }
 
 export function cronLogPath(env: Env): string {
@@ -101,6 +128,27 @@ export function cronLogPath(env: Env): string {
 
 export function recordCronJob(env: Env, input: NewCronJobInput | CronJobRecord): CronJobRecord {
   const job = "version" in input ? normalizeJob(input) : createJob(input);
+  return withCronJobLock(env, job.id, () => writeJob(env, job));
+}
+
+/**
+ * Re-reads job `id` under its lock and persists what `mutate` returns
+ * (undefined leaves it unchanged). Returns undefined if the job is gone.
+ */
+export function updateCronJob(
+  env: Env,
+  id: string,
+  mutate: (job: CronJobRecord) => CronJobRecord | undefined,
+): CronJobRecord | undefined {
+  return withCronJobLock(env, id, () => {
+    const job = readCronJob(env, id);
+    if (!job) return undefined;
+    const updated = mutate(job);
+    return updated ? writeJob(env, normalizeJob(updated)) : job;
+  });
+}
+
+function writeJob(env: Env, job: CronJobRecord): CronJobRecord {
   validateCronJobId(job.id);
   ensurePrivateDir(jobsRoot(env));
   ensurePrivateDir(jobHistoryRoot(env, job.id));
@@ -138,14 +186,44 @@ export function listCronJobs(env: Env): CronJobRecord[] {
 }
 
 export function deleteCronJob(env: Env, id: string): void {
-  validateCronJobId(id);
+  withCronJobLock(env, id, () => removeJobFiles(env, id));
+}
+
+function removeJobFiles(env: Env, id: string): void {
   rmSync(jobFilePath(env, id), { force: true });
   rmSync(jobHistoryRoot(env, id), { force: true, recursive: true });
 }
 
+/**
+ * Removes job `id`. Without `force` an active execution refuses; with it the
+ * job is first disabled (so nothing respawns it) and its execution killed.
+ */
+export async function removeCronJob(env: Env, id: string, force: boolean): Promise<boolean> {
+  const active = withCronJobLock(env, id, () => {
+    const job = readCronJob(env, id);
+    if (!job) return undefined;
+    if (!job.activeExecutionId) {
+      removeJobFiles(env, id);
+      return false;
+    }
+    if (!force) throw new Error(`job has an active execution; use --force to remove: ${id}`);
+    return true;
+  });
+  if (active === undefined) return false;
+  if (active) {
+    await killCronExecution(env, id, "disabled");
+    deleteCronJob(env, id);
+  }
+  return true;
+}
+
+/** The live daemon's lock record, if a daemon is running. */
+export function cronDaemonHolder(env: Env): OwnerLockRecord | undefined {
+  return readOwnerLockHolder(cronDaemonLockPath(env));
+}
+
 export function daemonRunning(env: Env): boolean {
-  const pid = readPidFile(cronPidPath(env));
-  return pid !== undefined && processAlive(pid);
+  return cronDaemonHolder(env) !== undefined;
 }
 
 export function resolveHeadlessCronBinary(env: Env): string {
@@ -154,25 +232,31 @@ export function resolveHeadlessCronBinary(env: Env): string {
 
 export async function runDueCronJobsOnce(env: Env, now = new Date()): Promise<void> {
   reconcileCronJobs(env);
-  for (const job of listCronJobs(env)) {
-    if (job.status !== "active" || job.nextRunAt > now.toISOString()) {
-      continue;
-    }
-    if (job.activeExecutionId) {
-      recordCronJob(env, {
-        ...job,
-        pending: true,
-        nextRunAt: nextCronRun(job.schedule, now).toISOString(),
-        updatedAt: now.toISOString(),
-      });
-      continue;
-    }
-    startCronExecution(env, job, now);
+  const due = (job: CronJobRecord | undefined): job is CronJobRecord =>
+    job?.status === "active" && job.nextRunAt <= now.toISOString();
+  for (const listed of listCronJobs(env)) {
+    if (!due(listed)) continue;
+    withCronJobLock(env, listed.id, () => {
+      const job = readCronJob(env, listed.id);
+      if (!due(job)) return;
+      if (job.activeExecutionId) {
+        writeJob(env, {
+          ...job,
+          pending: true,
+          nextRunAt: nextCronRun(job.schedule, now).toISOString(),
+          updatedAt: now.toISOString(),
+        });
+        return;
+      }
+      startCronExecution(env, job, now);
+    });
   }
 }
 
 export async function runCronDaemon(env: Env): Promise<void> {
-  const release = acquireDaemonLock(env);
+  ensurePrivateDir(dirname(cronDaemonLockPath(env)));
+  const lock = tryAcquireOwnerLock(cronDaemonLockPath(env));
+  if (!lock) throw new Error("cron daemon already running");
   let stopped = false;
   let stopPromise: Promise<void> | undefined;
   const stop = () => {
@@ -183,11 +267,14 @@ export async function runCronDaemon(env: Env): Promise<void> {
   // kill the daemon while it is still escalating on active executions.
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
-  writeJsonPrivate(cronPidPath(env), `${process.pid}\n`);
   appendDaemonLog(env, `started ${process.pid}\n`);
   try {
     while (!stopped) {
-      await runDueCronJobsOnce(env);
+      try {
+        await runDueCronJobsOnce(env);
+      } catch (error) {
+        appendDaemonLog(env, `tick failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
       await new Promise((resolve) => setTimeout(resolve, daemonPollMs));
     }
   } finally {
@@ -195,34 +282,54 @@ export async function runCronDaemon(env: Env): Promise<void> {
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
     appendDaemonLog(env, `stopped ${process.pid}\n`);
-    rmSync(cronPidPath(env), { force: true });
-    release();
+    lock.release();
   }
 }
 
+/**
+ * Kills job `jobId`'s active execution and sets its status (`status`
+ * undefined keeps the current one). The status is persisted *before* any
+ * signal so the daemon, seeing the execution exit, cannot respawn a pending
+ * run; the final record is re-read afterwards so concurrent changes (pause,
+ * delete) made during termination survive. Undefined if the job is gone.
+ */
 export async function killCronExecution(
   env: Env,
-  job: CronJobRecord,
-  status: CronJobStatus = "disabled",
-): Promise<CronJobRecord> {
-  const stored = job.activeExecutionId ? readExecution(env, job.id, job.activeExecutionId) : undefined;
-  const execution = stored ? refreshAgentPgid(env, job.id, stored) : undefined;
-  const signal = execution ? await terminateExecution(env, job.id, execution) : "SIGTERM";
-  if (execution) {
-    writeExecution(env, job.id, {
-      ...execution,
-      status: "killed",
-      completedAt: new Date().toISOString(),
-      exitCode: null,
-      signal,
+  jobId: string,
+  status?: CronJobStatus,
+): Promise<CronJobRecord | undefined> {
+  const started = withCronJobLock(env, jobId, () => {
+    const job = readCronJob(env, jobId);
+    if (!job) return undefined;
+    const stored = job.activeExecutionId ? readExecution(env, jobId, job.activeExecutionId) : undefined;
+    const execution = stored?.status === "running" ? refreshAgentPgid(env, jobId, stored) : undefined;
+    const updated = writeJob(env, {
+      ...job,
+      status: status ?? job.status,
+      pending: false,
+      activeExecutionId: execution ? job.activeExecutionId : null,
+      updatedAt: new Date().toISOString(),
     });
-  }
-  return recordCronJob(env, {
-    ...job,
-    status,
-    activeExecutionId: null,
-    pending: false,
-    updatedAt: new Date().toISOString(),
+    return { job: updated, execution };
+  });
+  if (!started?.execution) return started?.job;
+  const execution = started.execution;
+  const signal = await terminateExecution(env, jobId, execution);
+  return withCronJobLock(env, jobId, () => {
+    const job = readCronJob(env, jobId);
+    if (!job) return undefined;
+    const current = readExecution(env, jobId, execution.executionId);
+    if (current?.status === "running") {
+      writeExecution(env, jobId, {
+        ...withLatestAgentPgid(env, jobId, current),
+        status: "killed",
+        completedAt: new Date().toISOString(),
+        exitCode: null,
+        signal,
+      });
+    }
+    if (job.activeExecutionId !== execution.executionId) return job;
+    return writeJob(env, { ...job, activeExecutionId: null, pending: false, updatedAt: new Date().toISOString() });
   });
 }
 
@@ -239,6 +346,7 @@ export function recentCronExecutions(env: Env, jobId: string, limit = 10): CronE
     .slice(0, limit);
 }
 
+/** Spawns job `job`'s next execution. Caller holds the job's lock. */
 function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProcess {
   const executionId = generatedExecutionId(now);
   const executionDir = executionRoot(env, job.id, executionId);
@@ -271,6 +379,7 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     executionId,
     status: "running",
     pid: child.pid ?? null,
+    ...(child.pid ? identityField("pidIdentity", processStartIdentity(child.pid)) : {}),
     startedAt: now.toISOString(),
     exitCode: null,
     signal: null,
@@ -278,7 +387,7 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     stderrLog,
   };
   writeExecution(env, job.id, running);
-  recordCronJob(env, {
+  writeJob(env, {
     ...job,
     activeExecutionId: executionId,
     pending: false,
@@ -288,7 +397,16 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     updatedAt: now.toISOString(),
   });
 
-  const headlessPid = child.pid;
+  const headless: ProcessIdentity | undefined = child.pid
+    ? { pid: child.pid, startIdentity: running.pidIdentity }
+    : undefined;
+  const finish = (code: number | null, signal: string | null) => {
+    try {
+      finishCronExecution(env, job.id, executionId, code, signal);
+    } catch (error) {
+      appendDaemonLog(env, `finishing ${job.id}/${executionId} failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
   child.on("close", (code, signal) => {
     closeLogs();
     // headless killed by a signal (SIGKILL, OOM) could not clean up: sweep
@@ -297,80 +415,85 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     // not at all when the job asked to keep background processes.
     const abnormal = signal !== null;
     if (!abnormal && cronArgsKeepBackground(job.command.args)) {
-      finishCronExecution(env, job.id, executionId, code ?? null, null);
+      finish(code ?? null, null);
       return;
     }
-    void sweepOrphanedAgent(env, job.id, executionId, abnormal ? headlessPid : undefined).finally(() => {
-      finishCronExecution(env, job.id, executionId, code ?? null, signal ?? null);
+    void sweepOrphanedAgent(env, job.id, executionId, abnormal ? headless : undefined).finally(() => {
+      finish(code ?? null, signal ?? null);
     });
   });
   child.on("error", () => {
     closeLogs();
-    finishCronExecution(env, job.id, executionId, 127, null);
+    finish(127, null);
   });
   return child;
 }
 
 function finishCronExecution(env: Env, jobId: string, executionId: string, code: number | null, signal: string | null): void {
-  const execution = readExecution(env, jobId, executionId);
-  if (!execution || execution.status === "killed") {
-    return;
-  }
-  const stdout = existsSync(execution.stdoutLog) ? readFileSync(execution.stdoutLog, "utf8") : "";
-  const job = readCronJob(env, jobId);
-  const status = signal ? "killed" : code === 0 ? "succeeded" : "failed";
-  writeExecution(env, jobId, {
-    ...execution,
-    agentPgid: readAgentPgid(env, jobId, executionId) ?? execution.agentPgid ?? null,
-    status,
-    completedAt: new Date().toISOString(),
-    exitCode: code,
-    signal,
-    finalMessage: job ? extractFinalMessage(job.agent, stdout) || undefined : undefined,
+  withCronJobLock(env, jobId, () => {
+    const execution = readExecution(env, jobId, executionId);
+    // Already finalized (killed or reconciled), or the job was removed.
+    if (!execution || execution.status !== "running") return;
+    const job = readCronJob(env, jobId);
+    if (!job) return;
+    const stdout = existsSync(execution.stdoutLog) ? readFileSync(execution.stdoutLog, "utf8") : "";
+    const status = signal ? "killed" : code === 0 ? "succeeded" : "failed";
+    writeExecution(env, jobId, {
+      ...withLatestAgentPgid(env, jobId, execution),
+      status,
+      completedAt: new Date().toISOString(),
+      exitCode: code,
+      signal,
+      finalMessage: extractFinalMessage(job.agent, stdout) || undefined,
+    });
+    if (job.activeExecutionId !== executionId) return;
+    const updated = writeJob(env, {
+      ...job,
+      activeExecutionId: null,
+      lastExitCode: code,
+      updatedAt: new Date().toISOString(),
+    });
+    if (updated.pending && updated.status === "active") {
+      startCronExecution(env, { ...updated, activeExecutionId: null, pending: false }, new Date());
+    }
   });
-  if (!job || job.activeExecutionId !== executionId) {
-    return;
-  }
-  const updated = recordCronJob(env, {
-    ...job,
-    activeExecutionId: null,
-    lastExitCode: code,
-    updatedAt: new Date().toISOString(),
-  });
-  if (updated.pending && updated.status === "active") {
-    startCronExecution(env, { ...updated, activeExecutionId: null, pending: false }, new Date());
-  }
 }
 
 function reconcileCronJobs(env: Env): void {
-  for (const job of listCronJobs(env)) {
-    if (!job.activeExecutionId) {
-      continue;
-    }
-    const stored = readExecution(env, job.id, job.activeExecutionId);
-    const execution = stored ? refreshAgentPgid(env, job.id, stored) : undefined;
-    // Zombie-aware: a dead headless that a non-reaping PID 1 never reaps must
-    // not look alive forever. TODO(phase-2): verify the stored PID's identity.
-    if (execution?.pid && processRunning(execution.pid)) {
-      continue;
-    }
-    // headless is gone; kill whatever is left of its agent tree.
-    if (execution) void terminateProcessTree(executionTree(execution), { graceMs: killGraceMs(env) });
-    writeExecution(env, job.id, {
-      ...(execution ?? missingExecution(env, job)),
-      status: "killed",
-      completedAt: new Date().toISOString(),
-      exitCode: null,
-      signal: "stale",
+  for (const listed of listCronJobs(env)) {
+    if (!listed.activeExecutionId) continue;
+    withCronJobLock(env, listed.id, () => {
+      const job = readCronJob(env, listed.id);
+      if (!job?.activeExecutionId) return;
+      const stored = readExecution(env, job.id, job.activeExecutionId);
+      const execution = stored ? refreshAgentPgid(env, job.id, stored) : undefined;
+      // Zombie-aware and identity-checked: a dead headless that a non-reaping
+      // PID 1 never reaps, or whose PID was reused, is not "still running".
+      if (execution?.status === "running" && execution.pid && isSameProcess(execution.pid, execution.pidIdentity)) {
+        return;
+      }
+      // headless is gone; kill whatever is left of its agent tree.
+      if (execution) void terminateProcessTree(executionTree(execution), { graceMs: killGraceMs(env) });
+      if (!execution || execution.status === "running") {
+        writeExecution(env, job.id, {
+          ...(execution ?? missingExecution(env, job)),
+          status: "killed",
+          completedAt: new Date().toISOString(),
+          exitCode: null,
+          signal: "stale",
+        });
+      }
+      writeJob(env, { ...job, activeExecutionId: null, pending: false, updatedAt: new Date().toISOString() });
     });
-    recordCronJob(env, { ...job, activeExecutionId: null, pending: false, updatedAt: new Date().toISOString() });
   }
 }
 
 async function killAllActiveExecutions(env: Env): Promise<void> {
   for (const job of listCronJobs(env)) {
     if (job.activeExecutionId) {
-      await killCronExecution(env, job, job.status);
+      // Keep whatever status the job has when the kill lands (a concurrent
+      // `cron pause` must survive daemon shutdown).
+      await killCronExecution(env, job.id);
     }
   }
 }
@@ -515,38 +638,35 @@ function appendDaemonLog(env: Env, text: string): void {
   chmodSync(path, privateFileMode);
 }
 
-function readPidFile(path: string): number | undefined {
-  if (!existsSync(path)) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
-}
-
-// NOTE: treats EPERM (process exists, owned by someone else) as dead, which is
-// wrong for liveness. Left as-is until processAlive is consolidated across
-// modules; cron kill's own liveness probe (ProcessTree) handles EPERM.
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+function identityField<K extends string>(key: K, identity: string | undefined): Partial<Record<K, string>> {
+  return identity === undefined ? {} : ({ [key]: identity } as Record<K, string>);
 }
 
 function agentPgidPath(executionDir: string): string {
   return join(executionDir, "agent.pgid");
 }
 
-function readAgentPgid(env: Env, jobId: string, executionId: string): number | undefined {
-  return readPidFile(agentPgidPath(executionRoot(env, jobId, executionId)));
+/** agent.pgid: the group id on line 1, the leader's start identity (optional) on line 2. */
+function readAgentPgid(env: Env, jobId: string, executionId: string): ProcessIdentity | undefined {
+  const path = agentPgidPath(executionRoot(env, jobId, executionId));
+  let lines: string[];
+  try {
+    lines = readFileSync(path, "utf8").split("\n").map((line) => line.trim());
+  } catch {
+    return undefined;
+  }
+  const pid = Number.parseInt(lines[0] ?? "", 10);
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  return { pid, ...identityField("startIdentity", lines[1] || undefined) };
 }
 
 /** headless's own group plus the agent's group, with descendants of both. */
 function executionTree(execution: CronExecutionRecord): ProcessTree {
-  // TODO(phase-2): verify the stored PID/PGID identities before signalling.
-  const ids = [execution.pid, execution.agentPgid].filter((id): id is number => typeof id === "number" && id > 0);
+  // A stored PID/PGID whose number now belongs to another process is dropped.
+  const ids = signallableIds([
+    execution.pid ? { pid: execution.pid, startIdentity: execution.pidIdentity } : undefined,
+    execution.agentPgid ? { pid: execution.agentPgid, startIdentity: execution.agentPgidIdentity } : undefined,
+  ]);
   return new ProcessTree({ groups: ids, roots: ids, exclude: [process.pid] });
 }
 
@@ -557,7 +677,7 @@ async function terminateExecution(
 ): Promise<NodeJS.Signals | null> {
   // Signal BOTH groups directly rather than trusting headless to forward:
   // headless may be wedged or killed before it reaches its agent's group.
-  const tree = executionTree(refreshAgentPgid(env, jobId, execution));
+  const tree = executionTree(withLatestAgentPgid(env, jobId, execution));
   const { signal } = await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
   return signal;
 }
@@ -565,15 +685,25 @@ async function terminateExecution(
 /**
  * headless rewrites agent.pgid for every attempt (billing/capacity retries),
  * so the file, not the first value persisted, names the live agent group.
- * Persist it whenever it changes.
  */
-function refreshAgentPgid(env: Env, jobId: string, execution: CronExecutionRecord): CronExecutionRecord {
+function withLatestAgentPgid(env: Env, jobId: string, execution: CronExecutionRecord): CronExecutionRecord {
   const current = readAgentPgid(env, jobId, execution.executionId);
-  if (current === undefined || current === execution.agentPgid) return execution;
-  const refreshed = { ...execution, agentPgid: current };
-  if (readExecution(env, jobId, execution.executionId)?.status === execution.status) {
-    writeExecution(env, jobId, refreshed);
+  if (current === undefined) return execution;
+  if (current.pid === execution.agentPgid && (current.startIdentity ?? execution.agentPgidIdentity) === execution.agentPgidIdentity) {
+    return execution;
   }
+  // headless reports the leader's identity; if it did not, capture it now
+  // while the group is fresh.
+  const startIdentity = current.startIdentity
+    ?? (processAlive(current.pid) ? processStartIdentity(current.pid) : undefined);
+  const { agentPgidIdentity: _previous, ...rest } = execution;
+  return { ...rest, agentPgid: current.pid, ...identityField("agentPgidIdentity", startIdentity) };
+}
+
+/** withLatestAgentPgid, persisted. Caller holds the job's lock. */
+function refreshAgentPgid(env: Env, jobId: string, execution: CronExecutionRecord): CronExecutionRecord {
+  const refreshed = withLatestAgentPgid(env, jobId, execution);
+  if (refreshed !== execution) writeExecution(env, jobId, refreshed);
   return refreshed;
 }
 
@@ -581,14 +711,12 @@ async function sweepOrphanedAgent(
   env: Env,
   jobId: string,
   executionId: string,
-  headlessPid?: number,
+  headless?: ProcessIdentity,
 ): Promise<void> {
-  const agentPgid = readAgentPgid(env, jobId, executionId);
   // headless's own detached group catches anything it started besides the
   // agent; the agent's separate group is reachable only through agent.pgid.
-  const ids = [agentPgid, headlessPid].filter((id): id is number => id !== undefined && id > 0);
+  const ids = signallableIds([readAgentPgid(env, jobId, executionId), headless]);
   if (ids.length === 0) return;
-  // TODO(phase-2): verify the stored PID/PGID identities before signalling.
   const tree = new ProcessTree({ groups: ids, roots: ids, exclude: [process.pid] });
   if (tree.alive()) await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
 }
@@ -602,21 +730,4 @@ const cronValueOptions = new Set([
 /** True when a scheduled invocation carries --keep-background as a flag (not as an option value). */
 function cronArgsKeepBackground(args: readonly string[]): boolean {
   return args.some((arg, index) => arg === "--keep-background" && !cronValueOptions.has(args[index - 1] ?? ""));
-}
-
-function acquireDaemonLock(env: Env): () => void {
-  const lockPath = join(cronRoot(env), "daemon.lock");
-  ensurePrivateDir(dirname(lockPath));
-  let fd: number;
-  try {
-    fd = openSync(lockPath, "wx", privateFileMode);
-  } catch {
-    throw new Error("cron daemon already running");
-  }
-  chmodSync(lockPath, privateFileMode);
-  writeFileSync(fd, `${process.pid}\n`);
-  return () => {
-    closeSync(fd);
-    rmSync(lockPath, { force: true });
-  };
 }

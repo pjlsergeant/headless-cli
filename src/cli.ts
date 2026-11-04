@@ -116,6 +116,7 @@ import { runCronDaemon } from "./cron.js";
 import { extractRunNodeMetrics } from "./run-metrics.js";
 import { createRunStatusReporter, parseRunStatusIntervalMs } from "./run-status.js";
 import { isRunStoreLockSignalListener, waitForNodeStoreLockOwner } from "./run-storage.js";
+import { processStartIdentity } from "./process-identity.js";
 import {
   appendNodeLog,
   completeIdleRunNodes,
@@ -2084,7 +2085,9 @@ async function executeCommand(
       const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
       if (agentPgidFile && ownsChildProcessGroup && child.pid) {
         try {
-          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
+          // Line 2: the leader's start identity, so cron refuses to signal
+          // the group once its id has been reused.
+          writeFileSync(agentPgidFile, `${child.pid}\n${processStartIdentity(child.pid) ?? ""}\n`, { mode: 0o600 });
         } catch {
           // Best effort: the supervisor still sweeps this process's own group.
         }

@@ -1,10 +1,11 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { hostname } from "node:os";
 import { dirname } from "node:path";
 
 import {
+  cronDaemonHolder,
   cronLogPath,
-  cronPidPath,
   daemonRunning,
   deleteCronJob,
   killCronExecution,
@@ -14,7 +15,9 @@ import {
   readCronJob,
   recentCronExecutions,
   recordCronJob,
+  removeCronJob,
   resolveHeadlessCronBinary,
+  updateCronJob,
   type CronExecutionRecord,
   type CronJobRecord,
 } from "./cron.js";
@@ -287,44 +290,43 @@ function redactScheduledArgs(args: string[]): string[] {
 }
 
 function cronPause(jobId: string, handlers: CronCommandHandlers): number {
-  const job = requireJob(handlers.env, jobId);
-  recordCronJob(handlers.env, { ...job, status: "paused", pending: false, updatedAt: new Date().toISOString() });
+  requireUpdatedJob(jobId, updateCronJob(handlers.env, jobId, (job) => ({
+    ...job,
+    status: "paused",
+    pending: false,
+    updatedAt: new Date().toISOString(),
+  })));
   handlers.stdout(`paused: ${jobId}\n`);
   return 0;
 }
 
 function cronResume(jobId: string, handlers: CronCommandHandlers): number {
-  const job = requireJob(handlers.env, jobId);
   const now = new Date();
-  const schedule = parseCronSchedule(job.schedule.kind === "every" ? { every: job.schedule.value } : { schedule: job.schedule.value });
-  const resumed = recordCronJob(handlers.env, {
-    ...job,
-    schedule,
-    status: "active",
-    pending: false,
-    nextRunAt: nextCronRun(schedule, now).toISOString(),
-    updatedAt: now.toISOString(),
-  });
+  const resumed = requireUpdatedJob(jobId, updateCronJob(handlers.env, jobId, (job) => {
+    const schedule = parseCronSchedule(job.schedule.kind === "every" ? { every: job.schedule.value } : { schedule: job.schedule.value });
+    return {
+      ...job,
+      schedule,
+      status: "active",
+      pending: false,
+      nextRunAt: nextCronRun(schedule, now).toISOString(),
+      updatedAt: now.toISOString(),
+    };
+  }));
   handlers.stdout(`resumed: ${jobId}\nnext run: ${formatDisplayTime(resumed.nextRunAt)}\n`);
   return 0;
 }
 
 async function cronKill(jobId: string, handlers: CronCommandHandlers): Promise<number> {
-  const job = requireJob(handlers.env, jobId);
-  await killCronExecution(handlers.env, job);
+  requireJob(handlers.env, jobId);
+  requireUpdatedJob(jobId, await killCronExecution(handlers.env, jobId, "disabled"));
   handlers.stdout(`killed: ${jobId}\n`);
   return 0;
 }
 
 async function cronRemove(jobId: string, force: boolean, handlers: CronCommandHandlers): Promise<number> {
-  const job = requireJob(handlers.env, jobId);
-  if (job.activeExecutionId && !force) {
-    throw new Error(`job has an active execution; use --force to remove: ${jobId}`);
-  }
-  if (job.activeExecutionId) {
-    await killCronExecution(handlers.env, job);
-  }
-  deleteCronJob(handlers.env, jobId);
+  requireJob(handlers.env, jobId);
+  if (!(await removeCronJob(handlers.env, jobId, force))) throw new Error(`unknown cron job: ${jobId}`);
   handlers.stdout(`removed: ${jobId}\n`);
   return 0;
 }
@@ -340,13 +342,18 @@ async function cronStart(handlers: CronCommandHandlers): Promise<number> {
 }
 
 function cronStop(handlers: CronCommandHandlers): number {
-  const pid = readDaemonPid(handlers.env);
-  if (!pid) {
+  // The daemon lock's holder is verified to still be the same process (PID
+  // alive and start identity unchanged), so a reused PID is never signalled.
+  const holder = cronDaemonHolder(handlers.env);
+  if (!holder) {
     handlers.stdout("daemon already stopped\n");
     return 0;
   }
+  if (holder.hostname !== hostname()) {
+    throw new Error(`cron daemon runs on host ${holder.hostname}; stop it there`);
+  }
   try {
-    process.kill(pid, "SIGTERM");
+    process.kill(holder.pid, "SIGTERM");
   } catch {
     handlers.stdout("daemon already stopped\n");
     return 0;
@@ -449,6 +456,13 @@ function requireJob(env: Env, jobId: string): CronJobRecord {
   return job;
 }
 
+function requireUpdatedJob(jobId: string, job: CronJobRecord | undefined): CronJobRecord {
+  if (!job) {
+    throw new Error(`unknown cron job: ${jobId}`);
+  }
+  return job;
+}
+
 function scheduleLabel(job: CronJobRecord): string {
   return job.schedule.kind === "every" ? `every ${job.schedule.value}` : job.schedule.value;
 }
@@ -477,12 +491,4 @@ function renderTable(headers: string[], rows: string[][]): string {
   );
   const renderRow = (row: string[]) => row.map((cell, index) => cell.padEnd(widths[index] ?? 0)).join("  ").trimEnd();
   return [renderRow(headers), ...rows.map(renderRow)].join("\n").concat("\n");
-}
-
-function readDaemonPid(env: Env): number | undefined {
-  if (!existsSync(cronPidPath(env))) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(readFileSync(cronPidPath(env), "utf8").trim(), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }

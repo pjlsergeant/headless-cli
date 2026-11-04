@@ -46,7 +46,8 @@ function processGone(pid: number): boolean {
 
 function readPid(path: string): number | undefined {
   if (!existsSync(path)) return undefined;
-  const pid = Number(readFileSync(path, "utf8"));
+  // agent.pgid carries the leader's start identity on a second line.
+  const pid = Number(readFileSync(path, "utf8").split("\n")[0]);
   return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
