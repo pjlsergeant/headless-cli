@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 
@@ -950,6 +950,7 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
   const changed: string[] = [];
   const conflicts: string[] = [];
   const replacedAncestors = new Set<string>();
+  const createdLinks: string[] = [];
 
   for (const relPath of [...allPaths].sort()) {
     if (hasReplacedAncestor(relPath, replacedAncestors)) {
@@ -1001,8 +1002,13 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       mkdirSync(localPath, { recursive: true, mode: after.mode });
       chmodSync(localPath, after.mode);
     } else if (after.type === "symlink") {
+      if (!symlinkTargetIsWithin(options.workDir, localPath, after.target ?? "")) {
+        conflicts.push(relPath);
+        continue;
+      }
       removePathIfPresent(localPath);
       symlinkSync(after.target ?? "", localPath);
+      createdLinks.push(relPath);
     } else {
       removePathIfPresent(localPath);
       copyFileSync(join(options.resultDir, relPath), localPath);
@@ -1014,7 +1020,64 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
     }
   }
 
+  // Links applied later can change how an earlier link's target resolves, so
+  // check every link created from the sandbox again against the final tree.
+  for (const relPath of createdLinks) {
+    const localPath = resolve(options.workDir, relPath);
+    if (!symlinkTargetIsWithin(options.workDir, localPath, readlinkText(localPath))) {
+      rmSync(localPath, { force: true });
+      changed.splice(changed.indexOf(relPath), 1);
+      conflicts.push(relPath);
+    }
+  }
+
   return { changed, conflicts };
+}
+
+// A symlink from the sandbox is applied only when its target stays inside the
+// work dir: never absolute, inside lexically, and inside once the existing
+// part of the path is resolved through the local filesystem.
+function symlinkTargetIsWithin(workDir: string, linkPath: string, target: string): boolean {
+  const normalized = target.split("\\").join("/");
+  if (!normalized || isAbsolute(target) || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) {
+    return false;
+  }
+  const parent = dirname(linkPath);
+  if (!isWithin(workDir, resolve(parent, normalized))) {
+    return false;
+  }
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(workDir);
+  } catch {
+    return false;
+  }
+  let current: string;
+  try {
+    current = realpathSync(parent);
+  } catch {
+    // The parent does not exist yet; its existing ancestors were checked.
+    return true;
+  }
+  for (const segment of normalized.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      current = dirname(current);
+      continue;
+    }
+    current = join(current, segment);
+    try {
+      current = realpathSync(current);
+    } catch {
+      // A dangling link may point anywhere; a missing path resolves lexically.
+      try {
+        if (lstatSync(current).isSymbolicLink()) return false;
+      } catch {
+        // Missing component.
+      }
+    }
+  }
+  return isWithin(rootReal, current);
 }
 
 function snapshotTree(root: string): Map<string, FileState> {

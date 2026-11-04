@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -193,6 +193,48 @@ test("syncWorkspace does not delete local-only descendants when a remote directo
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("syncWorkspace refuses sandbox symlinks that point outside the work dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-links-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(join(result, "sub", "loop"), { recursive: true });
+    mkdirSync(work);
+    writeFileSync(join(dir, "secret"), "secret");
+    symlinkSync(join(dir, "secret"), join(result, "absolute"));
+    symlinkSync("../../secret", join(result, "sub", "escape"));
+    symlinkSync("../secret", join(result, "parent"));
+    symlinkSync("sub/target.txt", join(result, "inside"));
+    symlinkSync("../sub/target.txt", join(result, "sub", "inside-up"));
+    writeFileSync(join(result, "sub", "target.txt"), "in tree");
+    // Lexically inside, but "self" resolves to sub/loop itself, so ../.. leaves the tree.
+    symlinkSync(".", join(result, "sub", "loop", "self"));
+    symlinkSync("self/../../../secret", join(result, "sub", "loop", "physical"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts.sort(), ["absolute", "parent", "sub/escape", "sub/loop/physical"]);
+    for (const path of ["absolute", "parent", "sub/escape", "sub/loop/physical"]) {
+      assert.equal(existsSync(join(work, path)) || isSymlink(join(work, path)), false, path);
+    }
+    assert.equal(readlinkSync(join(work, "inside")), "sub/target.txt");
+    assert.equal(readFileSync(join(work, "inside"), "utf8"), "in tree");
+    assert.equal(readFileSync(join(work, "sub", "inside-up"), "utf8"), "in tree");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
 test("executeModalAgent runs through a Modal client and syncs results back", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-exec-"));
