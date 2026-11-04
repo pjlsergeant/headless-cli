@@ -2860,7 +2860,7 @@ test("CLI --docker print-command wraps the selected agent command", async () => 
     assert.equal(code, 0);
     assert.match(output, /^printf %s hello \| docker run --rm --interactive --tmpfs '\/headless-home:rw,mode=1777' --user \d+:\d+ /);
     assert.match(output, new RegExp(`--workdir ${quoteCommand({ command: realpathSync(projectDir), args: [] })}`));
-    assert.match(output, /--env EXTRA_TOKEN=value --env HOME=\/headless-home --network=host custom\/headless:dev sh -lc/);
+    assert.match(output, /--env EXTRA_TOKEN=value --env HOME=\/headless-home --network=host --env HEADLESS_IN_CONTAINER=1 custom\/headless:dev sh -lc/);
     assert.match(output, /headless-agent codex --dangerously-bypass-approvals-and-sandbox --profile research/);
     assert.match(output, /exec -c 'model_reasoning_effort="high"' --json --skip-git-repo-check -/);
   } finally {
@@ -5575,7 +5575,10 @@ test("CLI codex --tmux --wait holds the claim lock until the transcript appears"
           "    const fs = require('node:fs');",
           "    const path = require('node:path');",
           "    setTimeout(() => {",
-          "      fs.writeFileSync(process.env.HEADLESS_LOCK_OBSERVED, fs.existsSync(process.env.HEADLESS_LOCK_PATH) ? 'present' : 'missing');",
+          "      const lockDir = process.env.HEADLESS_LOCK_PATH;",
+          "      const top = fs.existsSync(lockDir) ? fs.readdirSync(lockDir).filter((name) => name[0] !== '.').sort().pop() : undefined;",
+          "      const held = top !== undefined && !JSON.parse(fs.readFileSync(path.join(lockDir, top), 'utf8')).released;",
+          "      fs.writeFileSync(process.env.HEADLESS_LOCK_OBSERVED, held ? 'present' : 'missing');",
           "      fs.mkdirSync(path.dirname(process.env.HEADLESS_TRANSCRIPT), { recursive: true });",
           "      fs.writeFileSync(process.env.HEADLESS_TRANSCRIPT, [",
           "        JSON.stringify({ timestamp: '2026-05-14T10:00:00.000Z', type: 'session_meta', payload: { id: 'delayed', cwd: process.env.HEADLESS_WORK_DIR } }),",

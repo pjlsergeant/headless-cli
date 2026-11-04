@@ -201,18 +201,20 @@ test("wraps stdin-based agent command in docker with workdir, user, env, and con
       "--env",
       "EXTRA_TOKEN",
     ]);
-    assert.deepEqual(command.args.slice(17, 25), [
+    assert.deepEqual(command.args.slice(17, 27), [
       "--env",
       "INLINE_TOKEN=value",
       "--env",
       "HOME=/headless-home",
       "--network=host",
+      "--env",
+      "HEADLESS_IN_CONTAINER=1",
       DEFAULT_DOCKER_IMAGE,
       "sh",
       "-lc",
     ]);
-    assert.match(command.args[25] ?? "", /cp -R "\/tmp\/headless-host-home\/\." "\$HOME"/);
-    assert.deepEqual(command.args.slice(26), ["headless-agent", "codex", "exec", "--json", "-"]);
+    assert.match(command.args[27] ?? "", /cp -R "\/tmp\/headless-host-home\/\." "\$HOME"/);
+    assert.deepEqual(command.args.slice(28), ["headless-agent", "codex", "exec", "--json", "-"]);
     assert.equal(command.stdinText, "hello");
   } finally {
     rmSync(dir, { force: true, recursive: true });
@@ -243,7 +245,7 @@ test("wraps argument-mode commands without stdin or unrelated env", () => {
     });
 
     assert.equal(command.command, "docker");
-    assert.deepEqual(command.args.slice(0, 11), [
+    assert.deepEqual(command.args.slice(0, 13), [
       "run",
       "--rm",
       "--tmpfs",
@@ -254,10 +256,12 @@ test("wraps argument-mode commands without stdin or unrelated env", () => {
       `${resolvedWorkDir}:${resolvedWorkDir}`,
       "--env",
       "HOME=/headless-home",
+      "--env",
+      "HEADLESS_IN_CONTAINER=1",
       "custom/headless:dev",
     ]);
-    assert.deepEqual(command.args.slice(11, 15), ["sh", "-lc", command.args[13], "headless-agent"]);
-    assert.deepEqual(command.args.slice(15), ["pi", "--no-session", "--mode", "json", "hello"]);
+    assert.deepEqual(command.args.slice(13, 17), ["sh", "-lc", command.args[15], "headless-agent"]);
+    assert.deepEqual(command.args.slice(17), ["pi", "--no-session", "--mode", "json", "hello"]);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -911,6 +915,32 @@ test("mounts provider credential files needed by forwarded env vars", () => {
     assert.ok(command.args.includes(`${join(home, ".aws")}:/tmp/headless-host-home/.aws:ro`));
     assert.ok(command.args.includes("AWS_PROFILE"));
     assert.ok(command.args.includes("GOOGLE_APPLICATION_CREDENTIALS"));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Docker runs always mark the container, after any user-supplied environment", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
+  try {
+    const workDir = join(dir, "project");
+    mkdirSync(workDir, { recursive: true });
+    const command = buildDockerAgentCommand({
+      agent: "codex",
+      command: { command: "codex", args: ["exec", "-"] },
+      dockerArgs: ["--env", "HEADLESS_IN_CONTAINER=0"],
+      dockerEnv: [],
+      env: { HOME: join(dir, "home") },
+      image: DEFAULT_DOCKER_IMAGE,
+      workDir,
+    });
+    const marker = command.args.lastIndexOf("HEADLESS_IN_CONTAINER=1");
+    assert.ok(marker > 0);
+    assert.equal(command.args[marker - 1], "--env");
+    assert.ok(marker > command.args.indexOf("HEADLESS_IN_CONTAINER=0"));
+    assert.ok(marker < command.args.indexOf(DEFAULT_DOCKER_IMAGE));
+    // Never set for the host-side command itself.
+    assert.equal(command.env?.HEADLESS_IN_CONTAINER, undefined);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

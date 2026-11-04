@@ -1,7 +1,6 @@
 import {
   closeSync,
   constants,
-  existsSync,
   fstatSync,
   mkdirSync,
   openSync,
@@ -15,6 +14,7 @@ import { dirname, join } from "node:path";
 
 import type { AgentName, Env } from "./types.js";
 import { validateCodexProfileName } from "./codex-profile.js";
+import { withOwnerLockSync } from "./owner-lock.js";
 
 export type StoredTmuxWaitStrategy =
   | { kind: "pin"; sessionId: string }
@@ -38,15 +38,41 @@ interface SessionStoreFile {
   agents: Partial<Record<AgentName, Record<string, StoredSession>>>;
 }
 
-export const SECURE_SESSION_STORE_ENV = "HEADLESS_INTERNAL_SECURE_SESSION_STORE";
 const maxSessionStoreBytes = 1024 * 1024;
+const sessionStoreLockMaxHoldMs = 60_000;
 
 export function sessionStorePath(env: Env): string | undefined {
   return env.HOME ? join(env.HOME, ".headless", "sessions.json") : undefined;
 }
 
 export function readStoredSession(env: Env, agent: AgentName, alias: string): StoredSession | undefined {
-  return readSessionStore(env).agents[agent]?.[alias];
+  const path = sessionStorePath(env);
+  return path ? readSessionStore(path).agents[agent]?.[alias] : undefined;
+}
+
+/**
+ * Every write is a read-modify-write of the whole store under its lock, so
+ * concurrent runs never drop each other's aliases. An unreadable store throws
+ * instead of being replaced by an empty one.
+ */
+function updateSessionStore(path: string, update: (store: SessionStoreFile) => StoredSession): StoredSession {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withOwnerLockSync(`${path}.lock`, (lock) => {
+    const store = readSessionStore(path);
+    const stored = update(store);
+    // A holder past maxHoldMs loses the lock; never publish over a newer
+    // writer. (Residual: losing it between this check and the rename.)
+    if (!lock.held()) throw new Error(`session store lock was lost before writing: ${path}`);
+    writeSessionStore(path, store);
+    return stored;
+  }, {
+    label: "session store lock",
+    // The holder may be a nested headless in a Docker container sharing this
+    // home, whose liveness the host cannot probe: a section this short that
+    // is still held after a minute has died.
+    maxHoldMs: sessionStoreLockMaxHoldMs,
+    timeoutMs: sessionStoreLockMaxHoldMs + 30_000,
+  });
 }
 
 export function writeStoredSession(
@@ -58,23 +84,22 @@ export function writeStoredSession(
     throw new Error("HOME is required for --session");
   }
 
-  const store = readSessionStore(env);
-  const existing = store.agents[session.agent]?.[session.alias];
-  const now = new Date().toISOString();
-  const stored: StoredSession = {
-    agent: session.agent,
-    alias: session.alias,
-    nativeId: session.nativeId,
-    profile: session.profile ?? existing?.profile,
-    tmuxWaitStrategy: existing?.tmuxWaitStrategy,
-    workDir: session.workDir,
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  };
-
-  store.agents[session.agent] = { ...(store.agents[session.agent] ?? {}), [session.alias]: stored };
-  writeSessionStore(path, store, env[SECURE_SESSION_STORE_ENV] === "1");
-  return stored;
+  return updateSessionStore(path, (store) => {
+    const existing = store.agents[session.agent]?.[session.alias];
+    const now = new Date().toISOString();
+    const stored: StoredSession = {
+      agent: session.agent,
+      alias: session.alias,
+      nativeId: session.nativeId,
+      profile: session.profile ?? existing?.profile,
+      tmuxWaitStrategy: existing?.tmuxWaitStrategy,
+      workDir: session.workDir,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    setStoredSession(store, stored);
+    return stored;
+  });
 }
 
 export function writeStoredTmuxSession(
@@ -86,65 +111,62 @@ export function writeStoredTmuxSession(
     throw new Error("HOME is required for --session");
   }
 
-  const store = readSessionStore(env);
-  const existing = store.agents[session.agent]?.[session.alias];
-  const now = new Date().toISOString();
-  const stored: StoredSession = {
-    agent: session.agent,
-    alias: session.alias,
-    nativeId: existing?.nativeId,
-    profile: session.profile ?? existing?.profile,
-    tmuxWaitStrategy: session.tmuxWaitStrategy,
-    workDir: session.workDir,
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  };
-
-  store.agents[session.agent] = { ...(store.agents[session.agent] ?? {}), [session.alias]: stored };
-  writeSessionStore(path, store, env[SECURE_SESSION_STORE_ENV] === "1");
-  return stored;
+  return updateSessionStore(path, (store) => {
+    const existing = store.agents[session.agent]?.[session.alias];
+    const now = new Date().toISOString();
+    const stored: StoredSession = {
+      agent: session.agent,
+      alias: session.alias,
+      nativeId: existing?.nativeId,
+      profile: session.profile ?? existing?.profile,
+      tmuxWaitStrategy: session.tmuxWaitStrategy,
+      workDir: session.workDir,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    setStoredSession(store, stored);
+    return stored;
+  });
 }
 
-function readSessionStore(env: Env): SessionStoreFile {
-  const path = sessionStorePath(env);
-  if (env[SECURE_SESSION_STORE_ENV] === "1") {
-    return path ? readSecureSessionStore(path) : emptyStore();
-  }
-  if (!path || !existsSync(path)) {
-    return emptyStore();
-  }
-
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<SessionStoreFile>;
-    if (parsed.version !== 1 || !parsed.agents || typeof parsed.agents !== "object") {
-      return emptyStore();
-    }
-    return { version: 1, agents: parsed.agents };
-  } catch {
-    return emptyStore();
-  }
+function setStoredSession(store: SessionStoreFile, stored: StoredSession): void {
+  const sessions = store.agents[stored.agent] ?? (Object.create(null) as Record<string, StoredSession>);
+  sessions[stored.alias] = stored;
+  store.agents[stored.agent] = sessions;
 }
 
-function readSecureSessionStore(path: string): SessionStoreFile {
+// The store may live in a Docker session home the container can write, so it
+// is read without following symlinks, bounded, and validated record by record.
+function readSessionStore(path: string): SessionStoreFile {
   let descriptor: number | undefined;
   try {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stats = fstatSync(descriptor);
     if (!stats.isFile() || stats.size > maxSessionStoreBytes) {
-      throw new Error("Docker session store must be a bounded regular file");
+      throw new Error("session store must be a bounded regular file");
     }
-    return normalizeSessionStore(JSON.parse(readFileSync(descriptor, "utf8")) as unknown);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(descriptor, "utf8"));
+    } catch (error) {
+      if (error instanceof SyntaxError) throw corruptStoreError(path);
+      throw error;
+    }
+    return normalizeSessionStore(parsed, path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStore();
-    if (error instanceof SyntaxError) return emptyStore();
     throw error;
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
-function normalizeSessionStore(value: unknown): SessionStoreFile {
-  if (!isRecord(value) || value.version !== 1 || !isRecord(value.agents)) return emptyStore();
+function corruptStoreError(path: string): Error {
+  return new Error(`session store is unreadable; fix or remove it: ${path}`);
+}
+
+function normalizeSessionStore(value: unknown, path: string): SessionStoreFile {
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.agents)) throw corruptStoreError(path);
   const store = emptyStore();
   for (const agent of ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"] as const) {
     const sessions = value.agents[agent];
@@ -181,7 +203,8 @@ function normalizeStoredSession(value: unknown, agent: AgentName, alias: string)
   const nativeId = boundedOptionalString(value.nativeId, 4096);
   const profile = boundedOptionalProfile(value.profile);
   const workDir = boundedOptionalString(value.workDir, 4096);
-  if (nativeId === null || profile === null || workDir === null) return undefined;
+  const tmuxWaitStrategy = optionalTmuxWaitStrategy(value.tmuxWaitStrategy);
+  if (nativeId === null || profile === null || workDir === null || tmuxWaitStrategy === null) return undefined;
   return {
     agent,
     alias,
@@ -189,8 +212,19 @@ function normalizeStoredSession(value: unknown, agent: AgentName, alias: string)
     updatedAt: value.updatedAt,
     ...(nativeId === undefined ? {} : { nativeId }),
     ...(profile === undefined ? {} : { profile }),
+    ...(tmuxWaitStrategy === undefined ? {} : { tmuxWaitStrategy }),
     ...(workDir === undefined ? {} : { workDir }),
   };
+}
+
+function optionalTmuxWaitStrategy(value: unknown): StoredTmuxWaitStrategy | undefined | null {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) return null;
+  const field = { pin: "sessionId", title: "title", dir: "sessionDir", claim: "claimed" }[String(value.kind)];
+  if (!field) return null;
+  const text = value[field];
+  if (typeof text !== "string" || text.length > 4096) return null;
+  return { kind: value.kind, [field]: text } as StoredTmuxWaitStrategy;
 }
 
 function boundedOptionalString(value: unknown, maxLength: number): string | undefined | null {
@@ -216,21 +250,10 @@ function emptyStore(): SessionStoreFile {
   return { version: 1, agents: {} };
 }
 
-function writeSessionStore(path: string, store: SessionStoreFile, secure: boolean): void {
-  if (secure) {
-    writeSecureSessionStore(path, store);
-    return;
-  }
-  mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmpPath, `${JSON.stringify(store, null, 2)}\n`);
-  renameSync(tmpPath, path);
-}
-
-function writeSecureSessionStore(path: string, store: SessionStoreFile): void {
+function writeSessionStore(path: string, store: SessionStoreFile): void {
   const contents = `${JSON.stringify(store, null, 2)}\n`;
   if (Buffer.byteLength(contents) > maxSessionStoreBytes) {
-    throw new Error("Docker session store exceeds its size limit");
+    throw new Error("session store exceeds its size limit");
   }
   const tmpPath = join(dirname(path), `.sessions.json.tmp-${process.pid}-${randomUUID()}`);
   let descriptor: number | undefined;

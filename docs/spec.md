@@ -86,8 +86,10 @@ Cron state lives under `~/.headless/cron`.
 
 ```text
 ~/.headless/cron/
-  daemon.pid
   daemon.log
+  locks/
+    daemon            # held by the running daemon (names its pid)
+    jobs/<job-id>     # per-job lock for every job state transition
   jobs/
     <job-id>.json
     <job-id>/

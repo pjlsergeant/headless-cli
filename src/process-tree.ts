@@ -1,6 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { win32 } from "node:path";
+
+import { linuxStateExited, processExists, readLinuxProcStat } from "./process-identity.js";
 
 export interface KillableProcess {
   pid?: number;
@@ -68,25 +70,12 @@ function readProcessTable(): ProcessTable | undefined {
 }
 
 function linuxProcessEntry(pid: number): ProcessEntry | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const state = fields[0] ?? "";
-    return { pid, ppid: Number(fields[1]), pgid: Number(fields[2]), exited: state === "Z" || state === "X" };
-  } catch {
-    return undefined; // Gone (or exited while we were scanning).
-  }
+  const stat = readLinuxProcStat(pid);
+  if (!stat) return undefined; // Gone (or exited while we were scanning).
+  return { pid, ppid: stat.ppid, pgid: stat.pgid, exited: linuxStateExited(stat.state) };
 }
 
-function probe(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to someone else.
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+const probe = processExists;
 
 function sendSignal(pid: number, signal: NodeJS.Signals): boolean {
   try {
@@ -261,16 +250,6 @@ export class ProcessTree {
     const pid = this.options.child?.pid;
     return pid === undefined ? undefined : probe(pid);
   }
-}
-
-/**
- * True while `pid` exists and has not terminated. Unlike kill(pid, 0) this
- * treats a zombie as dead (Linux), which matters where PID 1 never reaps.
- */
-export function processRunning(pid: number): boolean {
-  if (!probe(pid)) return false;
-  if (process.platform !== "linux") return true;
-  return linuxProcessEntry(pid)?.exited !== true;
 }
 
 /** Tree for a child spawned detached (leader of its own process group). */

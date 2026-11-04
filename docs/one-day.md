@@ -2,9 +2,6 @@
 
 Known non-show-stopper issues in process lifecycle handling, kept for later.
 
-- PID/PGID reuse: stored PIDs/PGIDs are signalled without an identity check (`TODO(phase-2)` at `src/cron.ts:352`, `src/cron.ts:547`, `src/cron.ts:590`).
-- The run-storage lock probe counts zombies as alive (`process.kill(-rootPid, 0)`, `src/run-storage.ts:364`), so a lock can stay blocked where PID 1 never reaps.
-- `processAlive` semantics differ per module: `src/cron.ts:528` treats EPERM as dead; `src/run-storage.ts:340` and `src/launch-lock.ts:267` treat it as alive. Consolidate into one zombie-aware, identity-checking helper.
 - Ctrl-Z: the agent's own session makes its group orphaned, so a forwarded SIGTSTP (`src/cli.ts:2316`) is discarded by the kernel for agents without a SIGTSTP handler.
 - New-session and double-fork escapes: descendants that leave via a new session and are reparented before headless looks are not cleaned up. Verified: Claude Code's Bash tool starts commands in a new session. Same for setsid, `tmux new-session -d`, pm2. Possible fix: a Linux subreaper supervisor (`PR_SET_CHILD_SUBREAPER`) so orphans reparent to headless.
 - Window between `spawn()` and writing `agent.pgid` (`src/cli.ts:2080`): a SIGKILL of headless there (or a failed write) leaves the agent's group unknown to cron.
@@ -13,3 +10,16 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - Docker runs only clean up the host-side `docker` client tree; processes the agent leaves inside the container are not touched.
 - Modal runs: post-exit cleanup and `--keep-background` are no-ops (the agent runs remotely).
 - Async run messages (`run message --async`) always clean up the node's tree; a node's stored `--keep-background` is ignored there (`src/async-run-message.ts:216`).
+- Run and node store locks (`src/run-storage.ts`) still use proper-lockfile's mtime staleness: two waiters that both see a stale lease can both reclaim it. Not moved onto `src/owner-lock.ts` because node locks hand ownership to another process tree and judge liveness by that tree, which the owner lock does not model.
+- Lock directories (`~/.headless/launch-locks/<key>`, `cron/locks/jobs/<id>`) are never removed, by design (removing one would break atomic reclaim); `cron rm` leaves its small lock directory behind.
+- Lock holders on another host (shared filesystem) count as alive indefinitely; a crashed remote holder needs its lock directory removed by hand.
+- A Docker session's store lock lives in the container-writable session home, so the container can make that session's store writes time out.
+- The session store drops records that fail validation the next time it is written (now for the local store too, not only Docker session stores).
+- Cron reconcile can mark an execution `killed`/`stale` when the post-exit sweep of its agent group outlasts a daemon tick, though it had finished normally.
+- A daemon tick already in progress at shutdown can start an execution after the shutdown kill passed that job; the next daemon's reconcile cleans it up.
+- `cron stop` sends SIGTERM and returns without waiting for the daemon to exit.
+- Two containers sharing a volume with the same explicitly set hostname and overlapping PIDs can misjudge a live lock holder as stale (`src/owner-lock.ts` host check).
+- The Docker session lock is acquired before the wrap-up guard is installed (`src/cli.ts` `acquireDockerSessionLock` vs `installWrapUpGuard`), so a signal in that window skips its release; the holder is on the host, so the lock is reclaimable, not wedged.
+- Locks with a maximum hold (session store, cron jobs: 60s; launch: 10 min or `--timeout` + 1 min) can be taken over from a holder that is alive but slower than that. Sections check `held()` before each write, which leaves only the window between that check and the rename; a tmux claim with no `--timeout` that takes over 10 minutes can be overtaken and lose transcript attribution.
+- A container started outside headless (so without `HEADLESS_IN_CONTAINER=1`) that mounts `~/.headless` can still take, and on dying wedge, the cron daemon lock or a Docker session lock, which have no maximum hold time.
+- Flaky under full-suite load: "Antigravity usage overlay ... SIGTERM handler" test (tests/headless.test.ts) failed once in a full run, passes alone and in later full runs; timing-sensitive.

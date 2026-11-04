@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { runCli } from "../src/cli.ts";
 import {
+  cronDaemonLockPath,
   cronRoot,
-  cronPidPath,
+  daemonRunning,
   listCronJobs,
   nextCronRun,
   parseCronSchedule,
@@ -18,6 +20,8 @@ import {
   runCronDaemon,
   runDueCronJobsOnce,
 } from "../src/cron.ts";
+import { readOwnerLockHolder, tryAcquireOwnerLock } from "../src/owner-lock.ts";
+import { processStartIdentity } from "../src/process-identity.ts";
 
 function testEnv(dir: string): NodeJS.ProcessEnv {
   return {
@@ -51,10 +55,24 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/** Takes the daemon lock in this process, so a daemon looks alive. */
 function markDaemonRunning(env: NodeJS.ProcessEnv): void {
-  mkdirSync(env.HEADLESS_CRON_DIR as string, { recursive: true });
-  writeFileSync(cronPidPath(env), `${process.pid}\n`);
+  mkdirSync(join(env.HEADLESS_CRON_DIR as string, "locks"), { recursive: true });
+  assert.ok(tryAcquireOwnerLock(cronDaemonLockPath(env)));
 }
+
+/** Writes a daemon lock record by hand, naming `pid` with `startIdentity`. */
+function forgeDaemonHolder(env: NodeJS.ProcessEnv, pid: number, startIdentity: string | undefined): void {
+  const lockPath = cronDaemonLockPath(env);
+  mkdirSync(lockPath, { recursive: true });
+  writeFileSync(join(lockPath, "000000000001"), JSON.stringify({
+    hostname: hostname(), pid, startIdentity, token: "forged", acquiredAt: new Date().toISOString(),
+  }));
+}
+
+const repoRoot = process.cwd();
+const cronModuleUrl = pathToFileURL(join(repoRoot, "src", "cron.ts")).href;
+const cliModuleUrl = pathToFileURL(join(repoRoot, "src", "cli.ts")).href;
 
 test("cron schedule parser accepts every durations and five-field cron expressions", () => {
   assert.deepEqual(parseCronSchedule({ every: "30m" }), {
@@ -368,7 +386,7 @@ test("cron start fails when the daemon process cannot be spawned", async () => {
     assert.equal(code, 2);
     assert.equal(stdout, "");
     assert.match(stderr, /cron daemon failed to start/);
-    assert.equal(existsSync(cronPidPath(env)), false);
+    assert.equal(daemonRunning(env), false);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -498,7 +516,7 @@ function stubbornGroupLeader(): ReturnType<typeof spawn> {
 
 function writeRunningExecution(
   env: NodeJS.ProcessEnv,
-  record: { pid: number; agentPgid?: number },
+  record: { pid: number; agentPgid?: number; pidIdentity?: string },
   agentPgidFile?: number,
 ): string {
   const now = new Date();
@@ -674,5 +692,290 @@ test("cron sweeps headless's own group when headless dies before reporting agent
     assert.equal(run.agentGone, false);
   } finally {
     run.cleanup();
+  }
+});
+
+function sleeper(): ReturnType<typeof spawn> {
+  return spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000);"], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+test("cron daemon lock is reclaimed after its holder is SIGKILLed", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const env = testEnv(dir);
+  const startDaemon = () => spawn(process.execPath, [
+    "--import", "tsx", "--input-type=module", "--eval",
+    `const { runCronDaemon } = await import(${JSON.stringify(cronModuleUrl)}); await runCronDaemon(process.env);`,
+  ], { cwd: repoRoot, env, stdio: ["ignore", "ignore", "pipe"] });
+  const daemons: ReturnType<typeof spawn>[] = [];
+  try {
+    const first = startDaemon();
+    daemons.push(first);
+    await waitFor(() => readOwnerLockHolder(cronDaemonLockPath(env))?.pid === first.pid);
+    first.kill("SIGKILL");
+    await once(first, "exit");
+    assert.equal(daemonRunning(env), false);
+
+    const second = startDaemon();
+    daemons.push(second);
+    let stderr = "";
+    second.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+    await waitFor(() => readOwnerLockHolder(cronDaemonLockPath(env))?.pid === second.pid);
+    assert.doesNotMatch(stderr, /already running/);
+
+    let stdout = "";
+    assert.equal(await runCli(["cron", "stop"], { env, stdout: (text) => { stdout += text; } }), 0);
+    assert.match(stdout, /daemon stopped/);
+    const [code] = await once(second, "exit");
+    assert.equal(code, 0);
+  } finally {
+    for (const daemon of daemons) if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron stop refuses to signal a daemon PID whose start identity changed", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const unrelated = sleeper();
+  try {
+    await once(unrelated.stdout!, "data");
+    const env = testEnv(dir);
+    // The daemon lock names a PID that now belongs to another process.
+    forgeDaemonHolder(env, unrelated.pid!, "linux:another-boot:1");
+    let stdout = "";
+    assert.equal(await runCli(["cron", "stop"], { env, stdout: (text) => { stdout += text; } }), 0);
+    assert.match(stdout, /daemon already stopped/);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(unrelated.exitCode, null);
+    assert.equal(unrelated.signalCode, null);
+
+    // The same PID with its real identity is the daemon: stop signals it.
+    forgeDaemonHolder(env, unrelated.pid!, processStartIdentity(unrelated.pid!));
+    stdout = "";
+    assert.equal(await runCli(["cron", "stop"], { env, stdout: (text) => { stdout += text; } }), 0);
+    assert.match(stdout, /daemon stopped/);
+    const [, signal] = await once(unrelated, "exit");
+    assert.equal(signal, "SIGTERM");
+  } finally {
+    if (unrelated.exitCode === null && unrelated.signalCode === null) unrelated.kill("SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron reconcile and kill refuse to signal an execution PID whose identity changed", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const unrelated = sleeper();
+  try {
+    await once(unrelated.stdout!, "data");
+    const env = { ...testEnv(dir), HEADLESS_KILL_GRACE_MS: "200" };
+    mkdirSync(env.HOME as string, { recursive: true });
+    // The stored headless PID (and agent group) now name an unrelated process.
+    const executionRoot = writeRunningExecution(env, { pid: unrelated.pid!, pidIdentity: "linux:another-boot:1" });
+    writeFileSync(join(executionRoot, "agent.pgid"), `${unrelated.pid}\nlinux:another-boot:2\n`);
+    assert.equal(await runCli(["cron", "kill", "retry"], { env, stdout: () => {} }), 0);
+    await runDueCronJobsOnce(env, new Date(Date.now() - 60_000));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(unrelated.exitCode, null);
+    assert.equal(unrelated.signalCode, null);
+    assert.equal(readCronJob(env, "retry")?.activeExecutionId, null);
+  } finally {
+    if (unrelated.exitCode === null && unrelated.signalCode === null) unrelated.kill("SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron pause during daemon shutdown survives the shutdown kill", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const child = stubbornGroupLeader();
+  try {
+    await once(child.stdout!, "data");
+    const env = testEnv(dir);
+    mkdirSync(env.HOME as string, { recursive: true });
+    writeRunningExecution(env, { pid: child.pid! });
+    const daemon = runCronDaemon(env);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    process.emit("SIGTERM");
+    // The daemon is now escalating on the stubborn execution (500ms grace).
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await runCli(["cron", "pause", "retry"], { env, stdout: () => {} }), 0);
+    await daemon;
+    const job = readCronJob(env, "retry");
+    assert.equal(job?.status, "paused");
+    assert.equal(job?.activeExecutionId, null);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+/**
+ * A pending job whose headless exits promptly on SIGTERM while its agent group
+ * ignores it: the daemon sees the execution finish while `cron kill`/`rm` is
+ * still escalating on the agent.
+ */
+async function startPendingKillableJob(dir: string, id: string): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => void }> {
+  const env = testEnv(dir);
+  const pidsFile = join(dir, "pids");
+  writeFileSync(env.HEADLESS_CLI_BIN as string, [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    "const fs = require('node:fs');",
+    `const agent = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: 'ignore' });`,
+    "fs.writeFileSync(process.env.HEADLESS_AGENT_PGID_FILE, agent.pid + '\\n');",
+    `fs.appendFileSync(${JSON.stringify(pidsFile)}, process.pid + ' ' + agent.pid + '\\n');`,
+    "agent.unref();",
+    "process.on('SIGTERM', () => process.exit(0));",
+    "setInterval(() => {}, 1000);",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  recordCronJob(env, {
+    agent: "codex",
+    // --keep-background: an ordinary headless exit finishes the execution at once.
+    command: { args: ["codex", "--prompt", "tick", "--keep-background"], workDir: dir },
+    id,
+    schedule: parseCronSchedule({ every: "1s" }),
+    now: new Date("2026-05-15T12:00:00.000Z"),
+  });
+  await runDueCronJobsOnce(env, new Date("2026-05-15T12:00:02.000Z"));
+  await runDueCronJobsOnce(env, new Date("2026-05-15T12:00:04.000Z"));
+  assert.equal(readCronJob(env, id)?.pending, true);
+  await waitFor(() => existsSync(pidsFile));
+  await new Promise((resolve) => setTimeout(resolve, 300)); // agent installs its SIGTERM handler
+  const pids = () => readFileSync(pidsFile, "utf8").trim().split(/\s+/).map(Number);
+  return {
+    env,
+    cleanup: () => {
+      for (const pid of existsSync(pidsFile) ? pids() : []) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    },
+  };
+}
+
+function executionCount(env: NodeJS.ProcessEnv, id: string): number {
+  const root = join(cronRoot(env), "jobs", id, "executions");
+  return existsSync(root) ? readdirSync(root).length : 0;
+}
+
+test("cron kill of a pending job does not leave a respawned execution running untracked", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  let cleanup = () => {};
+  try {
+    const started = await startPendingKillableJob(dir, "pending");
+    cleanup = started.cleanup;
+    const { env } = started;
+    assert.equal(await runCli(["cron", "kill", "pending"], { env, stdout: () => {} }), 0);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const job = readCronJob(env, "pending");
+    assert.equal(job?.status, "disabled");
+    assert.equal(job?.activeExecutionId, null);
+    assert.equal(executionCount(env, "pending"), 1, "the kill respawned a pending execution");
+  } finally {
+    cleanup();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron rm --force leaves nothing behind that resurrects the job", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  let cleanup = () => {};
+  try {
+    const started = await startPendingKillableJob(dir, "doomed");
+    cleanup = started.cleanup;
+    const { env } = started;
+    assert.equal(await runCli(["cron", "rm", "doomed", "--force"], { env, stdout: () => {} }), 0);
+    // Anything still running for the job now exits and reports back.
+    cleanup();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await runDueCronJobsOnce(env, new Date("2026-05-15T12:00:09.000Z"));
+    assert.equal(readCronJob(env, "doomed"), undefined);
+    assert.equal(existsSync(join(cronRoot(env), "jobs", "doomed")), false);
+  } finally {
+    cleanup();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("concurrent cron pause from another process vs daemon completion keeps every pause", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  try {
+    const env = testEnv(dir);
+    const goPath = join(dir, "go");
+    // Executions finish the moment the go file appears, racing the pauses.
+    writeFileSync(env.HEADLESS_CLI_BIN as string, [
+      "#!/usr/bin/env node",
+      "const { existsSync } = require('node:fs');",
+      `const poll = setInterval(() => { if (existsSync(${JSON.stringify(goPath)})) { clearInterval(poll); console.log('done'); } }, 1);`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const ids = Array.from({ length: 6 }, (_, index) => `race-${index}`);
+    for (const id of ids) {
+      recordCronJob(env, {
+        agent: "codex",
+        command: { args: ["codex", "--prompt", "tick"], workDir: dir },
+        id,
+        schedule: parseCronSchedule({ every: "1s" }),
+        now: new Date("2026-05-15T12:00:00.000Z"),
+      });
+    }
+    await runDueCronJobsOnce(env, new Date("2026-05-15T12:00:02.000Z"));
+    // A second due tick marks each running job pending: completion respawns.
+    await runDueCronJobsOnce(env, new Date("2026-05-15T12:00:04.000Z"));
+    assert.ok(ids.every((id) => readCronJob(env, id)?.pending));
+
+    const pauser = spawn(process.execPath, [
+      "--import", "tsx", "--input-type=module", "--eval",
+      [
+        `import { existsSync } from "node:fs";`,
+        `const { runCli } = await import(${JSON.stringify(cliModuleUrl)});`,
+        `process.stdout.write("ready\\n");`,
+        `while (!existsSync(${JSON.stringify(goPath)})) await new Promise((resolve) => setTimeout(resolve, 1));`,
+        `for (const id of ${JSON.stringify(ids)}) if (await runCli(["cron", "pause", id], { stdout: () => {} }) !== 0) process.exit(1);`,
+      ].join("\n"),
+    ], { cwd: repoRoot, env, stdio: ["ignore", "pipe", "inherit"] });
+    await once(pauser.stdout!, "data");
+    writeFileSync(goPath, "");
+    const [code] = await once(pauser, "exit");
+    assert.equal(code, 0);
+    await waitFor(() => ids.every((id) => readCronJob(env, id)?.activeExecutionId === null));
+    for (const id of ids) assert.equal(readCronJob(env, id)?.status, "paused", id);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("inside a headless Docker container, cron add/start, the daemon and --docker are refused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  try {
+    const env = { ...testEnv(dir), HEADLESS_IN_CONTAINER: "1" };
+    mkdirSync(env.HOME as string, { recursive: true });
+    const run = async (argv: string[]) => {
+      let stderr = "";
+      const code = await runCli(argv, { env, stdout: () => {}, stderr: (text) => { stderr += text; } });
+      return { code, stderr };
+    };
+    for (const argv of [
+      ["cron", "start"],
+      ["cron", "add", "codex", "--name", "inside", "--every", "1h", "--prompt", "x"],
+      ["cron-daemon"],
+      ["codex", "--docker", "--prompt", "x"],
+      ["codex", "--docker", "--session", "work", "--prompt", "x"],
+    ]) {
+      const { code, stderr } = await run(argv);
+      assert.equal(code, 2, argv.join(" "));
+      assert.match(stderr, /must run on the host, not inside a headless Docker container/, argv.join(" "));
+    }
+    await assert.rejects(runCronDaemon(env), /must run on the host/);
+    assert.equal(daemonRunning(env), false);
+    assert.equal(readCronJob(env, "inside"), undefined);
+    // Everything else still works inside the container.
+    assert.equal((await run(["cron", "list"])).code, 0);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
   }
 });

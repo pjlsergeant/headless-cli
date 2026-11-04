@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { runCli } from "../src/cli.ts";
 import { dockerSessionHomePath, ensureDockerSessionHome, ensureDockerSessionStoreDirectory } from "../src/docker.ts";
-import { SECURE_SESSION_STORE_ENV, writeStoredSession } from "../src/sessions.ts";
+import { writeStoredSession } from "../src/sessions.ts";
 
 for (const scenario of [
   { name: "resumes through API", mode: "auto", apiKey: "backup-secret", calls: 2, code: 0 },
@@ -92,7 +92,7 @@ test("Docker resumes the stored Codex profile before selecting billing", { skip:
     const sessionHome = ensureDockerSessionHome(dockerSessionHomePath("codex", "work", env)!);
     ensureDockerSessionStoreDirectory(sessionHome);
     const nativeId = "12345678-1234-1234-1234-123456789abc";
-    writeStoredSession({ HOME: sessionHome, [SECURE_SESSION_STORE_ENV]: "1" },
+    writeStoredSession({ HOME: sessionHome },
       { agent: "codex", alias: "work", profile: "custom", nativeId });
     writeFileSync(join(home, "docker"), `#!/usr/bin/env node
 require('node:fs').writeFileSync(process.env.HOME + '/docker-args', JSON.stringify(process.argv.slice(2)));

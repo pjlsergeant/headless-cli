@@ -6,11 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { macosProcessStartIdentity, windowsProcessStartIdentity } from "../src/process-identity.ts";
 import {
   acquireNodeStoreLock,
-  macosProcessStartIdentity,
   processTreeAliveFromProbes,
-  windowsProcessStartIdentity,
   windowsProcessTreeAlive,
 } from "../src/run-storage.ts";
 

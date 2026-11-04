@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
   readStoredSession,
-  SECURE_SESSION_STORE_ENV,
   writeStoredSession,
+  writeStoredTmuxSession,
 } from "../src/sessions.ts";
 
 test("secure session stores reject symlinks and oversized files", { skip: process.platform === "win32" }, () => {
@@ -17,7 +19,7 @@ test("secure session stores reject symlinks and oversized files", { skip: proces
     const storeDir = join(dir, ".headless");
     const storePath = join(storeDir, "sessions.json");
     const external = join(dir, "external.json");
-    const env = { HOME: dir, [SECURE_SESSION_STORE_ENV]: "1" };
+    const env = { HOME: dir };
     mkdirSync(storeDir);
     writeFileSync(external, "{}\n");
     symlinkSync(external, storePath);
@@ -43,7 +45,7 @@ test("secure session stores validate records and write private files atomically"
   try {
     const storeDir = join(dir, ".headless");
     const storePath = join(storeDir, "sessions.json");
-    const env = { HOME: dir, [SECURE_SESSION_STORE_ENV]: "1" };
+    const env = { HOME: dir };
     mkdirSync(storeDir);
     writeFileSync(
       storePath,
@@ -93,7 +95,7 @@ test("secure session stores preserve reserved aliases as own properties", () => 
   try {
     const storeDir = join(dir, ".headless");
     const storePath = join(storeDir, "sessions.json");
-    const env = { HOME: dir, [SECURE_SESSION_STORE_ENV]: "1" };
+    const env = { HOME: dir };
     const aliases = ["__proto__", "constructor", "prototype"];
     const sessions = Object.fromEntries(
       aliases.map((alias) => [
@@ -124,6 +126,94 @@ test("secure session stores preserve reserved aliases as own properties", () => 
       assert.equal(Object.hasOwn(stored.agents.codex, alias), true);
       assert.equal(readStoredSession(env, "codex", alias)?.nativeId, `${alias}-session`);
     }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("concurrent session writes from many processes keep every alias", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-sessions-test-"));
+  try {
+    const moduleUrl = pathToFileURL(join(process.cwd(), "src", "sessions.ts")).href;
+    const goPath = join(dir, "go");
+    const writer = (index: number) => spawn(process.execPath, [
+      "--import", "tsx", "--input-type=module", "--eval",
+      [
+        `import { existsSync } from "node:fs";`,
+        `const { writeStoredSession } = await import(${JSON.stringify(moduleUrl)});`,
+        `while (!existsSync(${JSON.stringify(goPath)})) await new Promise((resolve) => setTimeout(resolve, 1));`,
+        `for (let round = 0; round < 10; round += 1) {`,
+        `  writeStoredSession({ HOME: ${JSON.stringify(dir)} }, { agent: "codex", alias: "w${index}-" + round, nativeId: "n${index}-" + round, workDir: "/w" });`,
+        `}`,
+      ].join("\n"),
+    ], { cwd: process.cwd(), stdio: ["ignore", "ignore", "inherit"] });
+    const writers = Array.from({ length: 5 }, (_, index) => writer(index));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    writeFileSync(goPath, "");
+    const exits = await Promise.all(writers.map((child) => once(child, "exit")));
+    assert.deepEqual(exits.map(([code]) => code), writers.map(() => 0));
+    for (let index = 0; index < 5; index += 1) {
+      for (let round = 0; round < 10; round += 1) {
+        assert.equal(readStoredSession({ HOME: dir }, "codex", `w${index}-${round}`)?.nativeId, `n${index}-${round}`);
+      }
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a corrupt session store fails the write and is left untouched", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-sessions-test-"));
+  try {
+    const storePath = join(dir, ".headless", "sessions.json");
+    mkdirSync(dirname(storePath), { recursive: true });
+    for (const corrupt of ['{"version": 1, "agents": {"codex": {"work": ', '{"version": 2, "agents": {}}\n', "[]\n"]) {
+      writeFileSync(storePath, corrupt);
+      assert.throws(
+        () => writeStoredSession({ HOME: dir }, { agent: "codex", alias: "new", nativeId: "n", workDir: dir }),
+        /session store is unreadable/,
+      );
+      assert.throws(() => readStoredSession({ HOME: dir }, "codex", "work"), /session store is unreadable/);
+      assert.equal(readFileSync(storePath, "utf8"), corrupt);
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("session store keeps tmux wait strategies across unrelated writes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-sessions-test-"));
+  try {
+    const env = { HOME: dir };
+    writeStoredTmuxSession(env, {
+      agent: "codex",
+      alias: "tmux",
+      tmuxWaitStrategy: { kind: "claim", claimed: "/transcripts/a.jsonl" },
+      workDir: dir,
+    });
+    writeStoredSession(env, { agent: "codex", alias: "other", nativeId: "n", workDir: dir });
+    assert.deepEqual(readStoredSession(env, "codex", "tmux")?.tmuxWaitStrategy, {
+      kind: "claim",
+      claimed: "/transcripts/a.jsonl",
+    });
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a session store lock left by a dead container holder is reclaimed after its maximum hold", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-sessions-test-"));
+  try {
+    const lockPath = join(dir, ".headless", "sessions.json.lock");
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, "000000000001"), JSON.stringify({
+      hostname: "container-that-died",
+      pid: 1,
+      token: "forged",
+      acquiredAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+    }));
+    writeStoredSession({ HOME: dir }, { agent: "codex", alias: "work", nativeId: "n", workDir: dir });
+    assert.equal(readStoredSession({ HOME: dir }, "codex", "work")?.nativeId, "n");
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

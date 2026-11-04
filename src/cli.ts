@@ -101,7 +101,6 @@ import {
 import {
   acquireDockerSessionLock,
   acquireLaunchLock,
-  isDockerSessionLockSignalListener,
 } from "./launch-lock.js";
 import {
   childProcessTree,
@@ -114,9 +113,11 @@ import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl } from "./run-commands.js";
 import { handleCronCommand as handleCronCommandImpl, type CronCommand } from "./cron-commands.js";
 import { runCronDaemon } from "./cron.js";
+import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { extractRunNodeMetrics } from "./run-metrics.js";
 import { createRunStatusReporter, parseRunStatusIntervalMs } from "./run-status.js";
 import { isRunStoreLockSignalListener, waitForNodeStoreLockOwner } from "./run-storage.js";
+import { processStartIdentity } from "./process-identity.js";
 import {
   appendNodeLog,
   completeIdleRunNodes,
@@ -130,7 +131,6 @@ import {
 } from "./runs.js";
 import {
   readStoredSession,
-  SECURE_SESSION_STORE_ENV,
   sessionStorePath,
   writeStoredSession,
   writeStoredTmuxSession,
@@ -1426,8 +1426,16 @@ function installWrapUpGuard(
       armed = true;
     },
     release: () => {
-      if (received) reraise(received);
-      else remove();
+      const signal = received;
+      if (!signal) {
+        remove();
+        return;
+      }
+      // Deliver once runCli has returned to its caller. With no other JS
+      // listener left, a synchronous re-raise would end the process inside
+      // runCli's final block.
+      remove();
+      setImmediate(() => reraise(signal));
     },
   };
 }
@@ -2077,7 +2085,9 @@ async function executeCommand(
       const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
       if (agentPgidFile && ownsChildProcessGroup && child.pid) {
         try {
-          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
+          // Line 2: the leader's start identity, so cron refuses to signal
+          // the group once its id has been reused.
+          writeFileSync(agentPgidFile, `${child.pid}\n${processStartIdentity(child.pid) ?? ""}\n`, { mode: 0o600 });
         } catch {
           // Best effort: the supervisor still sweeps this process's own group.
         }
@@ -3748,7 +3758,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       signal,
       new Set(
         process.listeners(signal).filter(
-          (listener) => !isDockerSessionLockSignalListener(listener) && !isRunStoreLockSignalListener(listener),
+          (listener) => !isRunStoreLockSignalListener(listener),
         ),
       ),
     ] as const),
@@ -3784,6 +3794,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     });
   }
   if (argv[0] === "cron-daemon") {
+    if (runningInHeadlessContainer(env)) {
+      stderr(`headless: ${hostOnlyError("the cron daemon").message}\n`);
+      return 2;
+    }
     await runCronDaemon(env);
     return 0;
   }
@@ -4302,6 +4316,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     if (parsed.docker && parsed.modal) {
       throw new CliError("--docker cannot be used with --modal");
     }
+    if (parsed.docker && runningInHeadlessContainer(env)) {
+      // Its session lock is host-only (no maximum hold time).
+      throw new CliError(hostOnlyError("--docker").message);
+    }
     if (!parsed.agent) {
       parsed.agent = parsed.docker || parsed.modal
         ? (config.general.defaultAgent ?? autoAgentPreference[0])
@@ -4653,7 +4671,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       // appears, then releases before the long wait.
       const claimLock =
         waitPlan?.strategy.kind === "claim"
-          ? acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir))
+          ? await acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir), {
+              claimTimeoutSeconds: commandTimeoutSeconds,
+            })
           : undefined;
       const waitSnapshot = waitPlan
         ? createTmuxWaitSnapshot(parsed.agent, tmuxWaitWorkDir, env, waitPlan.strategy)
@@ -4791,9 +4811,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         ensureDockerSessionProfileDirectory(dockerSessionHome);
       }
     }
-    const sessionEnv = dockerSessionHome
-      ? { ...env, HOME: dockerSessionHome, [SECURE_SESSION_STORE_ENV]: "1" }
-      : env;
+    const sessionEnv = dockerSessionHome ? { ...env, HOME: dockerSessionHome } : env;
     let sessionPlan = buildSessionPlan(parsed.agent, sessionAlias, sessionEnv, parsed.profile);
     const effectiveProfile = sessionPlan?.profile ?? profile;
     const billingOptions = { ...billingPreviewOptions, profile: effectiveProfile };
