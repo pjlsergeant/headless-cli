@@ -14,6 +14,7 @@ import {
   parseCronSchedule,
   readCronJob,
   recordCronJob,
+  runCronDaemon,
   runDueCronJobsOnce,
 } from "../src/cron.ts";
 
@@ -433,6 +434,53 @@ test("cron daemon tick starts due jobs and collapses overlapping ticks to one pe
     assert.match(executions, /"status": "succeeded"/);
     assert.equal(readCronJob(env, "tick")?.pending, false);
   } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("cron daemon keeps its signal handlers until active executions are killed", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const child = spawn(
+    process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);"],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  const sigtermListeners = process.listenerCount("SIGTERM");
+  try {
+    assert.ok(child.pid);
+    await new Promise((resolve) => child.stdout.once("data", resolve));
+    const env = testEnv(dir);
+    const now = new Date();
+    recordCronJob(env, {
+      agent: "codex",
+      command: { args: ["codex", "--prompt", "tick"], workDir: dir },
+      id: "stubborn",
+      schedule: parseCronSchedule({ every: "1h" }),
+      now,
+    });
+    const job = readCronJob(env, "stubborn");
+    assert.ok(job);
+    recordCronJob(env, { ...job, activeExecutionId: "exec-stubborn" });
+    const executionRoot = join(cronRoot(env), "jobs", "stubborn", "executions", "exec-stubborn");
+    mkdirSync(executionRoot, { recursive: true });
+    writeFileSync(join(executionRoot, "result.json"), JSON.stringify({
+      version: 1, jobId: "stubborn", executionId: "exec-stubborn", status: "running", pid: child.pid,
+      startedAt: now.toISOString(), exitCode: null, signal: null,
+      stdoutLog: join(executionRoot, "stdout.log"), stderrLog: join(executionRoot, "stderr.log"),
+    }));
+
+    const daemon = runCronDaemon(env);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    process.emit("SIGTERM");
+    // While it escalates on the stubborn execution, a second SIGTERM must
+    // still hit the daemon's handler instead of the default (fatal) action.
+    assert.ok(process.listenerCount("SIGTERM") > sigtermListeners, "daemon dropped its SIGTERM handler mid-shutdown");
+    process.emit("SIGTERM");
+    await daemon;
+    assert.equal(child.exitCode !== null || child.signalCode !== null || !processAlive(child.pid), true);
+    assert.equal(process.listenerCount("SIGTERM"), sigtermListeners);
+  } finally {
+    if (child.pid && processAlive(child.pid)) process.kill(child.pid, "SIGKILL");
     rmSync(dir, { force: true, recursive: true });
   }
 });

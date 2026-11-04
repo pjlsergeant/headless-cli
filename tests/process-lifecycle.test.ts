@@ -203,7 +203,19 @@ test("embedded runCli does not resolve on a host-owned signal until the agent tr
   }
 });
 
-test("cron kill terminates the agent's grandchild, not just the headless process", posixOnly, async () => {
+interface CronAgentExecution {
+  dir: string;
+  env: NodeJS.ProcessEnv;
+  executionId: string;
+  headlessPid: number;
+  agentPid: number;
+  grandchildPid: number;
+  agentPidFile: string;
+  grandchildPidFile: string;
+}
+
+/** Starts a real cron execution of headless whose fake agent ignores SIGTERM and has a grandchild. */
+async function startCronAgentExecution(): Promise<CronAgentExecution> {
   const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-cron-test-"));
   const agentPidFile = join(dir, "agent.pid");
   const grandchildPidFile = join(dir, "grandchild.pid");
@@ -227,35 +239,89 @@ test("cron kill terminates the agent's grandchild, not just the headless process
     PATH: `${binDir}:${process.env.PATH ?? ""}`,
   };
   mkdirSync(env.HOME as string, { recursive: true });
-  let headlessPid: number | undefined;
+  recordCronJob(env, {
+    agent: "codex",
+    // repoRoot so the wrapper's `--import tsx` resolves.
+    command: { args: ["codex", "--prompt", "tick"], workDir: repoRoot },
+    id: "lifecycle",
+    schedule: parseCronSchedule({ every: "1h" }),
+    now: new Date("2026-05-15T12:00:00.000Z"),
+  });
+  await runDueCronJobsOnce(env, new Date("2026-05-15T13:00:01.000Z"));
+  const executionId = readCronJob(env, "lifecycle")?.activeExecutionId;
+  assert.ok(executionId);
+  const headlessPid = readExecutionRecord(env, executionId).pid;
+  await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
+  // Let the agent and grandchild install their SIGTERM handlers.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return {
+    dir, env, executionId, headlessPid, agentPidFile, grandchildPidFile,
+    agentPid: readPid(agentPidFile)!,
+    grandchildPid: readPid(grandchildPidFile)!,
+  };
+}
+
+function readExecutionRecord(env: NodeJS.ProcessEnv, executionId: string) {
+  return JSON.parse(
+    readFileSync(join(cronRoot(env), "jobs", "lifecycle", "executions", executionId, "result.json"), "utf8"),
+  ) as { pid: number; agentPgid?: number | null; status: string };
+}
+
+function cleanupCronAgentExecution(execution: CronAgentExecution | undefined): void {
+  if (!execution) return;
   try {
-    recordCronJob(env, {
-      agent: "codex",
-      // repoRoot so the wrapper's `--import tsx` resolves.
-      command: { args: ["codex", "--prompt", "tick"], workDir: repoRoot },
-      id: "lifecycle",
-      schedule: parseCronSchedule({ every: "1h" }),
-      now: new Date("2026-05-15T12:00:00.000Z"),
-    });
-    await runDueCronJobsOnce(env, new Date("2026-05-15T13:00:01.000Z"));
-    const executionId = readCronJob(env, "lifecycle")?.activeExecutionId;
-    assert.ok(executionId);
-    const result = JSON.parse(
-      readFileSync(join(cronRoot(env), "jobs", "lifecycle", "executions", executionId, "result.json"), "utf8"),
-    );
-    headlessPid = result.pid;
-    await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
-    const agentPid = readPid(agentPidFile)!;
-    const grandchildPid = readPid(grandchildPidFile)!;
+    process.kill(execution.headlessPid, "SIGCONT");
+  } catch {
+    // Already gone.
+  }
+  killQuietly(execution.headlessPid);
+  killQuietly(readPid(execution.agentPidFile));
+  killQuietly(readPid(execution.grandchildPidFile));
+  rmSync(execution.dir, { force: true, recursive: true });
+}
 
+test("cron kill terminates the agent's grandchild, not just the headless process", posixOnly, async () => {
+  let execution: CronAgentExecution | undefined;
+  try {
+    execution = await startCronAgentExecution();
+    const { env, headlessPid, agentPid, grandchildPid } = execution;
     assert.equal(await runCli(["cron", "kill", "lifecycle"], { env, stdout: () => {} }), 0);
-
-    await waitFor(() => processGone(headlessPid!) && processGone(agentPid) && processGone(grandchildPid));
+    // cron kill returns only after the whole tree is gone.
+    assert.ok(processGone(headlessPid) && processGone(agentPid) && processGone(grandchildPid));
   } finally {
-    killQuietly(headlessPid);
-    killQuietly(readPid(agentPidFile));
-    killQuietly(readPid(grandchildPidFile));
-    rmSync(dir, { force: true, recursive: true });
+    cleanupCronAgentExecution(execution);
+  }
+});
+
+test("cron kill reaches the agent's group directly when headless cannot forward", posixOnly, async () => {
+  let execution: CronAgentExecution | undefined;
+  try {
+    execution = await startCronAgentExecution();
+    const { env, executionId, headlessPid, agentPid, grandchildPid } = execution;
+    // A stopped headless can neither forward signals nor escalate.
+    process.kill(headlessPid, "SIGSTOP");
+    assert.equal(await runCli(["cron", "kill", "lifecycle"], { env, stdout: () => {} }), 0);
+    assert.ok(processGone(agentPid), "agent survived cron kill");
+    assert.ok(processGone(grandchildPid), "grandchild survived cron kill");
+    assert.equal(readExecutionRecord(env, executionId).status, "killed");
+  } finally {
+    cleanupCronAgentExecution(execution);
+  }
+});
+
+test("cron sweeps the agent's group when headless itself is SIGKILLed", posixOnly, async () => {
+  let execution: CronAgentExecution | undefined;
+  try {
+    execution = await startCronAgentExecution();
+    const { env, executionId, headlessPid, agentPid, grandchildPid } = execution;
+    // An OOM-kill or SIGKILL gives headless no chance to clean up.
+    process.kill(headlessPid, "SIGKILL");
+    await waitFor(() => readExecutionRecord(env, executionId).status !== "running");
+    assert.ok(processGone(agentPid), "agent survived its headless");
+    assert.ok(processGone(grandchildPid), "grandchild survived its headless");
+    assert.equal(readExecutionRecord(env, executionId).agentPgid, agentPid);
+  } finally {
+    cleanupCronAgentExecution(execution);
   }
 });
 

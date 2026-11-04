@@ -15,7 +15,7 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
-import { supervisorKillGraceMs, terminateProcessGroup } from "./process-tree.js";
+import { killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedule.js";
 import type { AgentName, Env } from "./types.js";
 
@@ -57,6 +57,12 @@ export interface CronExecutionRecord {
   executionId: string;
   status: CronExecutionStatus;
   pid: number | null;
+  /**
+   * Process group of the agent headless spawned, reported by headless via
+   * HEADLESS_AGENT_PGID_FILE. Lets cron kill/reconcile reach the agent even
+   * when headless itself died (SIGKILL, OOM) without forwarding anything.
+   */
+  agentPgid?: number | null;
   startedAt: string;
   completedAt?: string;
   exitCode: number | null;
@@ -172,8 +178,10 @@ export async function runCronDaemon(env: Env): Promise<void> {
     stopped = true;
     stopPromise ??= killAllActiveExecutions(env);
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
+  // Stay installed until shutdown finishes: a second SIGTERM/SIGINT must not
+  // kill the daemon while it is still escalating on active executions.
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
   writeJsonPrivate(cronPidPath(env), `${process.pid}\n`);
   appendDaemonLog(env, `started ${process.pid}\n`);
   try {
@@ -183,6 +191,8 @@ export async function runCronDaemon(env: Env): Promise<void> {
     }
   } finally {
     await stopPromise;
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
     appendDaemonLog(env, `stopped ${process.pid}\n`);
     rmSync(cronPidPath(env), { force: true });
     release();
@@ -195,7 +205,7 @@ export async function killCronExecution(
   status: CronJobStatus = "disabled",
 ): Promise<CronJobRecord> {
   const execution = job.activeExecutionId ? readExecution(env, job.id, job.activeExecutionId) : undefined;
-  const signal = execution?.pid ? await terminateProcess(env, execution.pid) : "SIGTERM";
+  const signal = execution ? await terminateExecution(env, job.id, execution) : "SIGTERM";
   if (execution) {
     writeExecution(env, job.id, {
       ...execution,
@@ -250,7 +260,7 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
   const child = spawn(resolveHeadlessCronBinary(env), job.command.args, {
     cwd: job.command.workDir,
     detached: true,
-    env: env as NodeJS.ProcessEnv,
+    env: { ...env, HEADLESS_AGENT_PGID_FILE: agentPgidPath(executionDir) } as NodeJS.ProcessEnv,
     stdio: ["ignore", stdoutFd, stderrFd],
   });
   const running: CronExecutionRecord = {
@@ -278,7 +288,11 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
 
   child.on("close", (code, signal) => {
     closeLogs();
-    finishCronExecution(env, job.id, executionId, code ?? null, signal ?? null);
+    // If headless died without cleaning up (SIGKILL, OOM), its agent group
+    // may still be running: sweep it before recording the outcome.
+    void sweepOrphanedAgent(env, job.id, executionId).finally(() => {
+      finishCronExecution(env, job.id, executionId, code ?? null, signal ?? null);
+    });
   });
   child.on("error", () => {
     closeLogs();
@@ -297,6 +311,7 @@ function finishCronExecution(env: Env, jobId: string, executionId: string, code:
   const status = signal ? "killed" : code === 0 ? "succeeded" : "failed";
   writeExecution(env, jobId, {
     ...execution,
+    agentPgid: execution.agentPgid ?? readAgentPgid(env, jobId, executionId) ?? null,
     status,
     completedAt: new Date().toISOString(),
     exitCode: code,
@@ -323,9 +338,19 @@ function reconcileCronJobs(env: Env): void {
       continue;
     }
     const execution = readExecution(env, job.id, job.activeExecutionId);
+    if (execution && execution.agentPgid == null) {
+      const agentPgid = readAgentPgid(env, job.id, execution.executionId);
+      if (agentPgid !== undefined) {
+        execution.agentPgid = agentPgid;
+        writeExecution(env, job.id, execution);
+      }
+    }
+    // TODO(phase-2): verify the stored PID's identity before trusting it.
     if (execution?.pid && processAlive(execution.pid)) {
       continue;
     }
+    // headless is gone; kill whatever is left of its agent tree.
+    if (execution) void terminateProcessTree(executionTree(execution), { graceMs: killGraceMs(env) });
     writeExecution(env, job.id, {
       ...(execution ?? missingExecution(env, job)),
       status: "killed",
@@ -495,7 +520,7 @@ function readPidFile(path: string): number | undefined {
 
 // NOTE: treats EPERM (process exists, owned by someone else) as dead, which is
 // wrong for liveness. Left as-is until processAlive is consolidated across
-// modules; cron kill's own liveness probe (processGroupAlive) handles EPERM.
+// modules; cron kill's own liveness probe (ProcessTree) handles EPERM.
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -505,14 +530,40 @@ function processAlive(pid: number): boolean {
   }
 }
 
-async function terminateProcess(env: Env, pid: number): Promise<NodeJS.Signals | null> {
-  // SIGTERM the execution's process group; headless forwards it to the
-  // agent's own group and escalates there after one grace period, so allow it
-  // that long (plus margin) before SIGKILLing headless's group ourselves.
-  return await terminateProcessGroup(
-    { pid, kill: (signal) => process.kill(pid, signal) },
-    { graceMs: supervisorKillGraceMs(env) },
-  );
+function agentPgidPath(executionDir: string): string {
+  return join(executionDir, "agent.pgid");
+}
+
+function readAgentPgid(env: Env, jobId: string, executionId: string): number | undefined {
+  return readPidFile(agentPgidPath(executionRoot(env, jobId, executionId)));
+}
+
+/** headless's own group plus the agent's group, with descendants of both. */
+function executionTree(execution: CronExecutionRecord): ProcessTree {
+  // TODO(phase-2): verify the stored PID/PGID identities before signalling.
+  const ids = [execution.pid, execution.agentPgid].filter((id): id is number => typeof id === "number" && id > 0);
+  return new ProcessTree({ groups: ids, roots: ids, exclude: [process.pid] });
+}
+
+async function terminateExecution(
+  env: Env,
+  jobId: string,
+  execution: CronExecutionRecord,
+): Promise<NodeJS.Signals | null> {
+  const agentPgid = execution.agentPgid ?? readAgentPgid(env, jobId, execution.executionId);
+  // Signal BOTH groups directly rather than trusting headless to forward:
+  // headless may be wedged or killed before it reaches its agent's group.
+  const tree = executionTree({ ...execution, agentPgid });
+  const { signal } = await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
+  return signal;
+}
+
+async function sweepOrphanedAgent(env: Env, jobId: string, executionId: string): Promise<void> {
+  const agentPgid = readAgentPgid(env, jobId, executionId);
+  if (agentPgid === undefined) return;
+  // TODO(phase-2): verify the stored PGID's identity before signalling.
+  const tree = new ProcessTree({ groups: [agentPgid], roots: [agentPgid], exclude: [process.pid] });
+  if (tree.alive()) await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
 }
 
 function acquireDaemonLock(env: Env): () => void {
