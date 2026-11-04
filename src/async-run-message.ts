@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 
-import { killGraceMs, signalProcessGroup, terminateProcessGroup, windowsTaskkillPath } from "./process-tree.js";
+import { killGraceMs, ProcessTree, terminateProcessTree, windowsTaskkillPath } from "./process-tree.js";
 import {
   handoffNodeStoreLockOwner,
   nodeStoreLockHasLiveSuccessor,
@@ -34,7 +34,8 @@ export type AsyncRunMessageResponse =
 let task: AsyncRunMessageTask | undefined;
 let releaseLock: (() => void) | undefined;
 let activeChild: ChildProcess | undefined;
-let activeChildTermination: Promise<NodeJS.Signals> | undefined;
+let activeTree: ProcessTree | undefined;
+let activeChildTermination: Promise<unknown> | undefined;
 let started = false;
 let finished = false;
 
@@ -84,14 +85,25 @@ function terminateActiveChild(signal: NodeJS.Signals): void {
     }
   }
   // The CLI leads its own process group and keeps the agent inside it, so
-  // signal the whole group and SIGKILL it if anything outlives the grace.
+  // signal the whole tree and SIGKILL it if anything outlives the grace.
+  const tree = activeTree ?? new ProcessTree({ child: activeChild });
   if (signal === "SIGKILL" || activeChildTermination) {
-    signalProcessGroup(activeChild, signal);
+    tree.signal(signal);
     return;
   }
-  activeChildTermination = terminateProcessGroup(activeChild, {
+  activeChildTermination = terminateProcessTree(tree, {
     signal,
     graceMs: killGraceMs(process.env),
+  });
+}
+
+function cliProcessTree(child: ChildProcess): ProcessTree {
+  const pid = child.pid;
+  return new ProcessTree({
+    groups: pid && process.platform !== "win32" ? [pid] : [],
+    roots: pid ? [pid] : [],
+    exclude: [process.pid],
+    child,
   });
 }
 
@@ -163,6 +175,8 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
       stdio: ["ignore", "ignore", "inherit"],
     });
     activeChild = child;
+    activeTree = cliProcessTree(child);
+    const tree = activeTree;
     child.once("error", reject);
     child.once("spawn", () => {
       try {
@@ -179,10 +193,23 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
       }
     });
     child.once("close", (code, signal) => {
-      activeChild = undefined;
-      resolve(signal ? 1 : (code ?? 1));
+      const status = signal ? 1 : (code ?? 1);
+      // Sweep whatever the CLI left in its group (or that escaped it) before
+      // the caller releases the node lock: the lock must not be released
+      // while any part of the agent tree is still running.
+      void sweep(tree).then(() => {
+        activeChild = undefined;
+        activeTree = undefined;
+        resolve(status);
+      });
     });
   });
+}
+
+async function sweep(tree: ProcessTree): Promise<void> {
+  if (process.platform === "win32" || !tree.alive()) return;
+  await (activeChildTermination ?? terminateProcessTree(tree, { graceMs: killGraceMs(process.env) }));
+  if (tree.alive()) await terminateProcessTree(tree, { signal: "SIGKILL", graceMs: killGraceMs(process.env) });
 }
 
 function finish(code = 0): void {
