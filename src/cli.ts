@@ -217,6 +217,7 @@ interface ParsedArgs {
   modalSecrets: string[];
   modalTimeoutSeconds?: number;
   timeoutSeconds?: number;
+  keepBackground: boolean;
   json: boolean;
   sdkFormat?: SdkFormat;
   debug: boolean;
@@ -332,6 +333,7 @@ function usage(): string {
     "  --modal-env <env>    Pass env into Modal as NAME or NAME=value. Repeatable.",
     "  --modal-include-git Include .git metadata in Modal uploads.",
     "  --timeout <s>        One-shot command timeout in seconds.",
+    "  --keep-background    Leave processes the agent started running after it exits.",
     "  --json               Stream raw agent JSON trace output.",
     "  --sdk-format <fmt>   Versioned SDK output: json or ndjson.",
     "  --debug              Stream raw trace and print extracted final message.",
@@ -390,6 +392,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     modalEnv: [],
     modalIncludeGit: false,
     modalSecrets: [],
+    keepBackground: false,
     json: false,
     debug: false,
     usage: false,
@@ -573,6 +576,9 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--timeout":
         parsed.timeoutSeconds = parsePositiveInteger(takeValue(args, arg), arg);
+        break;
+      case "--keep-background":
+        parsed.keepBackground = true;
         break;
       case "--name":
         if (parsed.cronCommand) {
@@ -1288,6 +1294,8 @@ interface ExecuteCommandOptions {
   captureRelevantTrace?: boolean;
   maxFinalMessageTraceBytes?: number;
   cleanupBeforeParentSignalExit?: () => void;
+  /** Leave descendants of a normally exited agent running (--keep-background). */
+  keepBackground?: boolean;
   inheritedSignalListeners?: ReadonlyMap<NodeJS.Signals, ReadonlySet<NodeJS.SignalsListener>>;
 }
 
@@ -2026,12 +2034,7 @@ async function executeCommand(
           child.stdout?.destroy();
           child.stderr?.destroy();
         }
-        finalize(treeShutdown.pendingResult ?? {
-          code: termination?.code ?? 1,
-          stdout: capturedStdout,
-          stdoutReceived,
-          stdoutEndsWithNewline,
-        });
+        finalize(treeShutdown.pendingResult ?? exitResult());
       };
       // SIGKILL now and keep re-sending it on every poll (catching anything
       // forked or regrouped since), still waiting for the tree to die.
@@ -2069,6 +2072,30 @@ async function executeCommand(
         }
       };
 
+      // Result for a direct child that exited on its own, used when its stdio
+      // never closes (a descendant holds it) and the drain window ends.
+      const exitResult = (): ExecuteResult => {
+        const exited = exitedBeforeClose;
+        const code = termination?.code
+          ?? (exited ? (exited.signal ? 1 : (exited.code ?? 1)) : 1);
+        return {
+          code,
+          ...(exited?.signal && !termination ? { terminationSignal: exited.signal } : {}),
+          stdout: capturedStdout,
+          stdoutReceived,
+          stdoutEndsWithNewline,
+        };
+      };
+      // Descendants the direct child leaves behind when it exits on its own
+      // are terminated (SIGTERM, grace, SIGKILL) before the run resolves,
+      // unless --keep-background asks to leave them running. Antigravity
+      // (cleanup hook) always kills: its descendants use the overlay home
+      // that the cleanup removes.
+      const keepBackground = options.keepBackground === true && options.cleanupBeforeParentSignalExit === undefined;
+
+      // After the direct child exits, give its stdio one grace period to
+      // drain. Then either terminate the remaining tree (whose death closes
+      // the pipes) or, with --keep-background, stop waiting and resolve.
       const armForceDrain = () => {
         if (
           forceDrain ||
@@ -2076,28 +2103,23 @@ async function executeCommand(
           termination ||
           treeShutdown ||
           stdoutDrainPending ||
-          options.cleanupBeforeParentSignalExit === undefined ||
           exitedBeforeClose === undefined
         ) {
           return;
         }
-        const { code, signal } = exitedBeforeClose;
         forceDrain = setTimeout(() => {
           forceDrain = undefined;
-          if (settled || termination || stdoutDrainPending) return;
-          // Kill what is left and hold this result until the tree is dead.
-          beginTreeShutdown("SIGKILL");
-          child.stdout?.destroy();
-          child.stderr?.destroy();
-          finish({
-            code: signal ? 1 : (code ?? 1),
-            ...(signal ? { terminationSignal: signal } : {}),
-            stdout: capturedStdout,
-            stdoutReceived,
-            stdoutEndsWithNewline,
-          });
+          if (settled || termination || treeShutdown || stdoutDrainPending) return;
+          if (keepBackground) {
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            finish(exitResult());
+            return;
+          }
+          // The result comes from "close" once the holders are dead, or from
+          // exitResult() at the bounded shutdown deadline.
+          beginTreeShutdown("SIGTERM");
         }, terminationGraceMs);
-        forceDrain.unref();
       };
 
       if (handlesParentSignals) {
@@ -2246,21 +2268,25 @@ async function executeCommand(
         finish({ code: termination?.code ?? 127, stdout: capturedStdout, stdoutReceived, stdoutEndsWithNewline });
       });
       child.on("exit", (code, signal) => {
-        if (options.cleanupBeforeParentSignalExit === undefined || termination !== undefined || settled) {
+        if (termination !== undefined || treeShutdown || settled) {
           return;
         }
         exitedBeforeClose = { code, signal };
         armForceDrain();
       });
       child.on("close", (code, signal) => {
-        // Antigravity (cleanup hook) and timed-out runs kill what the direct
-        // child left behind; finish() then holds the result until it is dead.
-        if (
-          (ownsChildProcessGroup && options.cleanupBeforeParentSignalExit !== undefined && tree.alive())
-          || termination
-        ) {
+        clearForceDrain();
+        if (termination) {
+          // Timed out: SIGKILL what the direct child left behind at once.
           beginTreeShutdown("SIGKILL");
+        } else if (options.cleanupBeforeParentSignalExit !== undefined && !treeShutdown && tree.alive()) {
+          // Antigravity: its descendants must not outlive the cleanup.
+          beginTreeShutdown("SIGKILL");
+        } else if (!keepBackground && !treeShutdown && tree.alive()) {
+          // Normal exit: terminate leftover descendants before resolving.
+          beginTreeShutdown("SIGTERM");
         }
+        // finish() holds the result while a shutdown is in progress.
         if (signal) {
           finish({ code: termination?.code ?? 1, terminationSignal: signal,
             stdout: capturedStdout, stdoutReceived, stdoutEndsWithNewline });
@@ -3345,6 +3371,7 @@ function validateCronCliOptions(parsed: ParsedArgs): void {
       parsed.modal ||
       hasModalOptions(parsed) ||
       parsed.timeoutSeconds !== undefined ||
+      parsed.keepBackground ||
       parsed.json ||
       parsed.debug ||
       parsed.usage;
@@ -3418,6 +3445,7 @@ async function executeStoredNode(
     allow?: AllowMode;
     coordination: CoordinationMode;
     fast?: boolean;
+    keepBackground?: boolean;
     model?: string;
     profile?: string;
     reasoningEffort?: ReasoningEffort;
@@ -3505,6 +3533,7 @@ async function executeStoredNode(
     stdoutLog: runStdoutLogger(env, node.runId, node.nodeId),
     stderr: runStderrLogger(env, node.runId, node.nodeId),
     timeoutSeconds: config.general.timeoutSeconds,
+    keepBackground: node.keepBackground,
   });
   if (result.code === 0 && sessionPlan) {
     await persistSessionPlan(node.agent, sessionPlan, result.stdout, node.workDir, env);
@@ -3677,6 +3706,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             modalSecrets: parsed.modalSecrets,
             modalTimeoutSeconds: parsed.modalTimeoutSeconds,
             timeoutSeconds: parsed.timeoutSeconds,
+            keepBackground: parsed.keepBackground,
             json: parsed.json,
             debug: parsed.debug,
             usage: parsed.usage,
@@ -3696,6 +3726,12 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         }
         throw toCliError(error);
       }
+    }
+    if (
+      parsed.keepBackground &&
+      (parsed.attach || parsed.rename || parsed.send || parsed.check || parsed.list || parsed.showConfig || parsed.dockerCommand || parsed.runCommand || parsed.tmux)
+    ) {
+      throw new CliError("--keep-background can only be used with one-shot agent runs or cron add");
     }
     if (
       parsed.fast !== undefined &&
@@ -4245,6 +4281,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     const storedNode = parsed.runId && nodeId ? readRun(env, parsed.runId)?.nodes[nodeId] : undefined;
     const storedFastMode = storedNode?.agent === parsed.agent ? storedNode.fast : undefined;
     const fast = parsed.fast ?? storedFastMode;
+    // Like Fast mode, a node's stored --keep-background applies to direct launches.
+    const keepBackground = parsed.keepBackground || storedNode?.keepBackground === true;
     const storedProfile = storedNode?.agent === parsed.agent ? storedNode.profile : undefined;
     const profile = parsed.profile ?? storedProfile ?? (
       parsed.agent === "codex" && parsed.sessionAlias
@@ -4272,6 +4310,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           model: teamDefaults.model,
           profile: teamNode.agent === "codex" ? profile : undefined,
           fast: teamNode.agent === "claude" || teamNode.agent === "codex" ? fast : undefined,
+          ...(parsed.keepBackground ? { keepBackground: true } : {}),
           reasoningEffort: teamDefaults.reasoningEffort,
           workDir: cwd ?? process.cwd(),
           sessionAlias: teamNode.nodeId,
@@ -4290,6 +4329,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         model: configuredDefaults.model,
         profile,
         fast,
+        ...(keepBackground ? { keepBackground: true } : {}),
         reasoningEffort: configuredDefaults.reasoningEffort,
         workDir: cwd ?? process.cwd(),
         sessionAlias: coordination === "session" ? (parsed.sessionAlias ?? nodeId) : parsed.sessionAlias,
@@ -4817,7 +4857,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             parsed.agent!, parsed.agent === "codex" || parsed.agent === "claude"
               ? buildAttemptCommand(attempt.env, attempt.options) : command,
             cwd, attempt.env, displayStderr, {
-              stdout: commandStdout, stdoutHandling,
+              stdout: commandStdout, stdoutHandling, keepBackground,
               stdoutLog: (text) => {
                 piCompletion?.write(text);
                 attempt.observe(text);

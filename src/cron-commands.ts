@@ -53,6 +53,7 @@ export interface CronCommandInput {
   modalSecrets: string[];
   modalTimeoutSeconds?: number;
   timeoutSeconds?: number;
+  keepBackground?: boolean;
   json: boolean;
   debug: boolean;
   usage: boolean;
@@ -379,6 +380,7 @@ function buildScheduledArgs(input: CronCommandInput): string[] {
   for (const value of input.modalSecrets) args.push("--modal-secret", value);
   if (input.modalTimeoutSeconds !== undefined) args.push("--modal-timeout", String(input.modalTimeoutSeconds));
   if (input.timeoutSeconds !== undefined) args.push("--timeout", String(input.timeoutSeconds));
+  if (input.keepBackground) args.push("--keep-background");
   if (input.json) args.push("--json");
   if (input.debug) args.push("--debug");
   if (input.usage) args.push("--usage");

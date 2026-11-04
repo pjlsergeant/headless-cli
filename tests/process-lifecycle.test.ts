@@ -269,6 +269,99 @@ test("headless reports the agent's group to its supervisor and hides the variabl
   }
 });
 
+/**
+ * Fake agent that starts a background grandchild and then exits on its own
+ * (unless HEADLESS_TEST_STAY=1). HEADLESS_TEST_GRANDCHILD_STDIO=inherit makes
+ * the grandchild hold the agent's stdout/stderr pipes.
+ */
+function writeExitingAgent(binDir: string, name: string): void {
+  mkdirSync(binDir, { recursive: true });
+  const binary = join(binDir, name);
+  writeFileSync(binary, [
+    `#!${process.execPath}`,
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    "const stdio = process.env.HEADLESS_TEST_GRANDCHILD_STDIO === 'inherit' ? ['ignore', 'inherit', 'inherit'] : 'ignore';",
+    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio });",
+    "writeFileSync(process.env.HEADLESS_TEST_GRANDCHILD_PID, String(child.pid));",
+    "child.unref();",
+    "console.log(JSON.stringify({ type: 'result', result: 'done' }));",
+    "if (process.env.HEADLESS_TEST_STAY === '1') setInterval(() => {}, 1000);",
+    "",
+  ].join("\n"));
+  chmodSync(binary, 0o755);
+}
+
+async function runExitingAgent(options: {
+  args?: string[];
+  grandchildStdio: "ignore" | "inherit";
+  stay?: boolean;
+}): Promise<{ code: number; elapsedMs: number; grandchildPid: number; grandchildGone: boolean }> {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-background-test-"));
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const binDir = join(dir, "bin");
+  writeExitingAgent(binDir, "claude");
+  try {
+    const started = Date.now();
+    const code = await runCli(["claude", "--prompt", "hello", ...(options.args ?? [])], {
+      env: {
+        ...process.env,
+        HEADLESS_KILL_GRACE_MS: "500",
+        HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+        HEADLESS_TEST_GRANDCHILD_STDIO: options.grandchildStdio,
+        HEADLESS_TEST_STAY: options.stay ? "1" : "0",
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    const elapsedMs = Date.now() - started;
+    const grandchildPid = readPid(grandchildPidFile)!;
+    assert.ok(grandchildPid);
+    // Sample at the moment runCli resolved, before cleanup.
+    return { code, elapsedMs, grandchildPid, grandchildGone: processGone(grandchildPid) };
+  } finally {
+    killQuietly(readPid(grandchildPidFile));
+    rmSync(dir, { force: true, recursive: true });
+  }
+}
+
+test("a background grandchild is killed after the agent exits normally, before runCli resolves", posixOnly, async () => {
+  const result = await runExitingAgent({ grandchildStdio: "ignore" });
+  assert.equal(result.code, 0);
+  assert.ok(result.grandchildGone, "background grandchild outlived the run");
+});
+
+for (const keepBackground of [false, true]) {
+  test(`a grandchild holding stdout does not hang a run without --timeout${keepBackground ? " (--keep-background)" : ""}`, posixOnly, async () => {
+    const result = await runExitingAgent({
+      grandchildStdio: "inherit",
+      args: keepBackground ? ["--keep-background"] : [],
+    });
+    assert.equal(result.code, 0);
+    // Drain window (500ms) plus, by default, SIGTERM; nowhere near the
+    // grandchild's 120s lifetime.
+    assert.ok(result.elapsedMs < 4000, `run took ${result.elapsedMs}ms`);
+    assert.equal(result.grandchildGone, !keepBackground);
+  });
+}
+
+test("--keep-background leaves a background grandchild running after a normal exit", posixOnly, async () => {
+  const result = await runExitingAgent({ grandchildStdio: "ignore", args: ["--keep-background"] });
+  assert.equal(result.code, 0);
+  assert.equal(result.grandchildGone, false);
+});
+
+test("--keep-background does not protect the tree from --timeout", posixOnly, async () => {
+  const result = await runExitingAgent({
+    grandchildStdio: "ignore",
+    stay: true,
+    args: ["--keep-background", "--timeout", "1"],
+  });
+  assert.equal(result.code, 124);
+  assert.ok(result.grandchildGone, "--timeout left the grandchild running");
+});
+
 interface CronAgentExecution {
   dir: string;
   env: NodeJS.ProcessEnv;

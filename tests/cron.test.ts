@@ -131,6 +131,7 @@ test("cron add persists safe detached command options and rejects unsafe tmux/se
         "read-only",
         "--work-dir",
         dir,
+        "--keep-background",
         "--json",
         "--usage",
       ],
@@ -162,6 +163,7 @@ test("cron add persists safe detached command options and rejects unsafe tmux/se
       "read-only",
       "--work-dir",
       dir,
+      "--keep-background",
       "--json",
       "--usage",
     ]);

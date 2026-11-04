@@ -466,6 +466,7 @@ function buildNodeInvocationCommand(env: Env, runId: string, nodeId: string, nod
       ...(node.model ? ["--model", node.model] : []),
       ...(node.profile ? ["--profile", node.profile] : []),
       ...(node.fast === undefined ? [] : [node.fast ? "--fast" : "--no-fast"]),
+      ...(node.keepBackground ? ["--keep-background"] : []),
       ...(node.reasoningEffort ? ["--reasoning-effort", node.reasoningEffort] : []),
       ...(node.workDir ? ["--work-dir", node.workDir] : []),
       ...(node.coordination === "session" ? ["--session", node.sessionAlias ?? nodeId] : []),

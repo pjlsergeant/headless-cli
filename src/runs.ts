@@ -41,6 +41,8 @@ export interface RunNode {
   model?: string;
   profile?: string;
   fast?: boolean;
+  /** --keep-background: leave the agent's background processes running. */
+  keepBackground?: boolean;
   reasoningEffort?: ReasoningEffort;
   workDir?: string;
   sessionAlias?: string;
@@ -122,6 +124,8 @@ export interface RegisterNodeInput {
   model?: string;
   profile?: string;
   fast?: boolean;
+  /** --keep-background: leave the agent's background processes running. */
+  keepBackground?: boolean;
   reasoningEffort?: ReasoningEffort;
   workDir?: string;
   sessionAlias?: string;
@@ -250,6 +254,7 @@ export function registerNode(env: Env, input: RegisterNodeInput): RunNode {
       model: input.model ?? existing?.model,
       profile: input.agent === existing?.agent ? (input.profile ?? existing.profile) : input.profile,
       fast: input.agent === existing?.agent ? (input.fast ?? existing.fast) : input.fast,
+      ...((input.keepBackground ?? existing?.keepBackground) ? { keepBackground: true } : {}),
       reasoningEffort: input.reasoningEffort ?? existing?.reasoningEffort,
       workDir: input.workDir ?? existing?.workDir,
       sessionAlias: input.sessionAlias ?? existing?.sessionAlias,
