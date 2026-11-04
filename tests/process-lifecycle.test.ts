@@ -59,12 +59,14 @@ function killQuietly(pid: number | undefined): void {
 /**
  * Writes a fake agent binary that records its PID, spawns a long-sleeping
  * grandchild (stdio detached from headless) and records that PID too. With
- * HEADLESS_TEST_IGNORE_TERM=1 both ignore SIGTERM.
+ * HEADLESS_TEST_IGNORE_TERM=1 both ignore SIGTERM (=grandchild: only the
+ * grandchild, so the agent exits at once and leaves it behind); with HEADLESS_TEST_SETSID=1
+ * the grandchild calls setsid (detached spawn) and so leaves the agent's group.
  */
 function writeFakeAgent(binDir: string, name: string): void {
   mkdirSync(binDir, { recursive: true });
   const grandchild = [
-    "if (process.env.HEADLESS_TEST_IGNORE_TERM === '1') process.on('SIGTERM', () => {});",
+    "if (process.env.HEADLESS_TEST_IGNORE_TERM === '1' || process.env.HEADLESS_TEST_IGNORE_TERM === 'grandchild') process.on('SIGTERM', () => {});",
     "setTimeout(() => {}, 120_000);",
   ].join("\n");
   const binary = join(binDir, name);
@@ -75,7 +77,7 @@ function writeFakeAgent(binDir: string, name: string): void {
       "const { spawn } = require('node:child_process');",
       "const { writeFileSync } = require('node:fs');",
       "if (process.env.HEADLESS_TEST_IGNORE_TERM === '1') process.on('SIGTERM', () => {});",
-      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`,
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore', detached: process.env.HEADLESS_TEST_SETSID === '1' });`,
       "writeFileSync(process.env.HEADLESS_TEST_GRANDCHILD_PID, String(child.pid));",
       "writeFileSync(process.env.HEADLESS_TEST_AGENT_PID, String(process.pid));",
       "setInterval(() => {}, 1000);",
@@ -85,7 +87,7 @@ function writeFakeAgent(binDir: string, name: string): void {
   chmodSync(binary, 0o755);
 }
 
-async function signalOneShotRun(options: { ignoreTerm: boolean }): Promise<{
+async function signalOneShotRun(options: { ignoreTerm: boolean; setsid?: boolean }): Promise<{
   exit: { code: number | null; signal: NodeJS.Signals | null };
   elapsedMs: number;
   agentPid: number;
@@ -109,6 +111,7 @@ async function signalOneShotRun(options: { ignoreTerm: boolean }): Promise<{
           HEADLESS_TEST_AGENT_PID: agentPidFile,
           HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
           HEADLESS_TEST_IGNORE_TERM: options.ignoreTerm ? "1" : "0",
+          HEADLESS_TEST_SETSID: options.setsid ? "1" : "0",
           PATH: `${binDir}:${process.env.PATH ?? ""}`,
         },
         stdio: "ignore",
@@ -117,6 +120,8 @@ async function signalOneShotRun(options: { ignoreTerm: boolean }): Promise<{
     await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
     const agentPid = readPid(agentPidFile)!;
     const grandchildPid = readPid(grandchildPidFile)!;
+    // Let the grandchild install its SIGTERM handler.
+    await new Promise((resolve) => setTimeout(resolve, 300));
     const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       headless?.once("exit", (code, signal) => resolve({ code, signal }));
     });
@@ -124,7 +129,9 @@ async function signalOneShotRun(options: { ignoreTerm: boolean }): Promise<{
     headless.kill("SIGTERM");
     const exit = await exited;
     const elapsedMs = Date.now() - started;
-    await waitFor(() => processGone(agentPid) && processGone(grandchildPid));
+    // headless must not exit before its whole tree is gone.
+    assert.ok(processGone(agentPid), "agent outlived headless");
+    assert.ok(processGone(grandchildPid), "grandchild outlived headless");
     return { exit, elapsedMs, agentPid, grandchildPid };
   } finally {
     if (headless && headless.exitCode === null && headless.signalCode === null) headless.kill("SIGKILL");
@@ -147,6 +154,53 @@ test("an agent tree that ignores SIGTERM is SIGKILLed after the grace period", p
   assert.ok(result.elapsedMs >= 450, `headless exited after ${result.elapsedMs}ms, before the grace period`);
   assert.ok(processGone(result.agentPid));
   assert.ok(processGone(result.grandchildPid));
+});
+
+test("a grandchild that escaped the agent's group with setsid is still killed", posixOnly, async () => {
+  const result = await signalOneShotRun({ ignoreTerm: true, setsid: true });
+  assert.deepEqual(result.exit, { code: null, signal: "SIGTERM" });
+  assert.ok(processGone(result.agentPid));
+  assert.ok(processGone(result.grandchildPid));
+});
+
+test("embedded runCli does not resolve on a host-owned signal until the agent tree is dead", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-embedded-test-"));
+  const agentPidFile = join(dir, "agent.pid");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const binDir = join(dir, "bin");
+  writeFakeAgent(binDir, "claude");
+  // The embedding host owns SIGTERM, so headless must not re-raise it.
+  const hostListener = () => {};
+  process.on("SIGTERM", hostListener);
+  const listenersBefore = process.listeners("SIGINT").length;
+  try {
+    const run = runCli(["claude", "--prompt", "hello"], {
+      env: {
+        ...process.env,
+        HEADLESS_KILL_GRACE_MS: "300",
+        HEADLESS_TEST_AGENT_PID: agentPidFile,
+        HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+        // The agent exits on SIGTERM at once; only its grandchild lingers.
+        HEADLESS_TEST_IGNORE_TERM: "grandchild",
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    process.emit("SIGTERM");
+    await run;
+    // An embedder may process.exit() right now: nothing may be left behind.
+    assert.ok(processGone(readPid(agentPidFile)!), "agent outlived runCli");
+    assert.ok(processGone(readPid(grandchildPidFile)!), "grandchild outlived runCli");
+    assert.equal(process.listeners("SIGINT").length, listenersBefore);
+  } finally {
+    process.off("SIGTERM", hostListener);
+    killQuietly(readPid(agentPidFile));
+    killQuietly(readPid(grandchildPidFile));
+    rmSync(dir, { force: true, recursive: true });
+  }
 });
 
 test("cron kill terminates the agent's grandchild, not just the headless process", posixOnly, async () => {

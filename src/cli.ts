@@ -104,10 +104,10 @@ import {
   isDockerSessionLockSignalListener,
 } from "./launch-lock.js";
 import {
+  childProcessTree,
   forceKillWindowsProcessTree,
   killGraceMs,
-  processGroupAlive,
-  signalProcessGroup,
+  ProcessTree,
 } from "./process-tree.js";
 import { compactOversizedTraceLine } from "./relevant-trace.js";
 import { OpencodeUsageAccumulator } from "./opencode-usage.js";
@@ -1889,11 +1889,12 @@ async function executeCommand(
           ? `${pinnedIdentityTrace}${rollingTrace}`
           : rollingTrace;
       };
-      const finish = (result: ExecuteResult) => {
+      const finalize = (result: ExecuteResult) => {
         if (settled) {
           return;
         }
         settled = true;
+        stopTreeShutdown();
         if (timeout) {
           clearTimeout(timeout);
         }
@@ -1907,6 +1908,7 @@ async function executeCommand(
           clearTimeout(forceDrain);
         }
         stdoutDrainController.abort();
+        // Always detach before resolving so runCli leaves no listeners behind.
         removeParentSignalHandlers();
         flushTraceBuffer();
         result.finalMessageTrace = finalMessageTrace.join("") || undefined;
@@ -1915,6 +1917,18 @@ async function executeCommand(
         result.stdoutEndsWithNewline = stdoutEndsWithNewline;
         result.terminationSignal ??= parentTerminationSignal;
         resolve(result);
+      };
+      // Once the tree is being shut down (timeout or parent signal), results
+      // are held back until the whole tree is dead or the final deadline
+      // passes, so no caller can exit and orphan a still-dying tree.
+      const finish = (result: ExecuteResult) => {
+        if (settled) return;
+        if (treeShutdown && !treeShutdown.completed) {
+          treeShutdown.pendingResult ??= result;
+          if (!tree.alive()) completeTreeShutdown(false);
+          return;
+        }
+        finalize(result);
       };
       const asyncMessageWorker = env.HEADLESS_ASYNC_MESSAGE_WORKER === "1";
       // POSIX: the agent always leads its own process group (detached =>
@@ -1948,17 +1962,85 @@ async function executeCommand(
         stdio,
       });
 
+      // The tree to terminate. Async worker mode shares this process's group
+      // with the agent, so the group is signalled member by member with this
+      // process excluded (it must outlive the agent to escalate); descendants
+      // that leave the group via setsid are tracked by parent PID either way.
+      const tree = process.platform === "win32" || !asyncMessageWorker
+        ? childProcessTree(child)
+        : new ProcessTree({ groups: [process.pid], roots: child.pid ? [child.pid] : [], exclude: [process.pid], child });
       const signalChildTree = (signal: NodeJS.Signals) => {
-        if (ownsChildProcessGroup) {
-          signalProcessGroup(child, signal);
+        if (process.platform === "win32") {
+          child.kill(signal);
           return;
         }
-        child.kill(signal);
+        tree.signal(signal);
       };
-      const childTreeAlive = () => {
-        if (!child.pid) return false;
-        if (ownsChildProcessGroup) return processGroupAlive(child.pid);
-        return child.exitCode === null && child.signalCode === null;
+      const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
+      if (agentPgidFile && ownsChildProcessGroup && child.pid) {
+        // Lets a supervisor (cron) reach the agent's group directly even if
+        // this headless process is SIGKILLed before it can forward anything.
+        try {
+          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
+        } catch {
+          // Best effort: the supervisor still signals this process's group.
+        }
+      }
+
+      // Unified bounded shutdown: signal now, SIGKILL after one grace, give up
+      // waiting after a second grace. All timers stay referenced so headless
+      // cannot exit (and orphan the tree) while it is still dying.
+      let treeShutdown: {
+        completed: boolean;
+        reraise?: NodeJS.Signals;
+        pendingResult?: ExecuteResult;
+        timers: NodeJS.Timeout[];
+        poll?: NodeJS.Timeout;
+      } | undefined;
+      const stopTreeShutdown = () => {
+        if (!treeShutdown) return;
+        for (const timer of treeShutdown.timers) clearTimeout(timer);
+        clearInterval(treeShutdown.poll);
+      };
+      const completeTreeShutdown = (forced: boolean) => {
+        if (!treeShutdown || treeShutdown.completed) return;
+        if (!forced && !treeShutdown.reraise && !treeShutdown.pendingResult) {
+          // Tree is dead but the child's stdio has not closed yet: keep only
+          // the final deadline and let "close" deliver the result.
+          clearInterval(treeShutdown.poll);
+          return;
+        }
+        treeShutdown.completed = true;
+        stopTreeShutdown();
+        if (treeShutdown.reraise) {
+          const signal = treeShutdown.reraise;
+          removeParentSignalHandlers();
+          process.kill(process.pid, signal);
+          return;
+        }
+        if (forced) {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
+        finalize(treeShutdown.pendingResult ?? {
+          code: termination?.code ?? 1,
+          stdout: capturedStdout,
+          stdoutReceived,
+          stdoutEndsWithNewline,
+        });
+      };
+      const beginTreeShutdown = (signal: NodeJS.Signals) => {
+        signalChildTree(signal);
+        if (treeShutdown) return;
+        treeShutdown = { completed: false, timers: [] };
+        treeShutdown.timers.push(setTimeout(() => signalChildTree("SIGKILL"), terminationGraceMs));
+        treeShutdown.timers.push(setTimeout(() => {
+          signalChildTree("SIGKILL");
+          completeTreeShutdown(true);
+        }, 2 * terminationGraceMs));
+        treeShutdown.poll = setInterval(() => {
+          if (!tree.alive()) completeTreeShutdown(false);
+        }, 25);
       };
 
       const clearForceDrain = () => {
@@ -1973,6 +2055,7 @@ async function executeCommand(
           forceDrain ||
           settled ||
           termination ||
+          treeShutdown ||
           stdoutDrainPending ||
           options.cleanupBeforeParentSignalExit === undefined ||
           exitedBeforeClose === undefined
@@ -1999,37 +2082,18 @@ async function executeCommand(
 
       if (handlesParentSignals) {
         const handlers = new Map<NodeJS.Signals, () => void>();
-        // While a forwarded parent signal is pending and headless will re-raise
-        // it, headless stays alive to escalate and finish() must keep the
-        // handlers (a second signal then SIGKILLs the tree at once). When an
-        // embedding caller owns the signal instead, finish() still detaches
-        // them so runCli leaves no listeners behind; escalation timers go on.
-        let parentSignalExit: { signal: NodeJS.Signals; reraise: boolean } | undefined;
-        let parentSignalKill: NodeJS.Timeout | undefined;
-        let parentSignalPoll: NodeJS.Timeout | undefined;
         const removeHandlers = () => {
           for (const [signal, handler] of handlers) {
             process.off(signal, handler);
           }
         };
-        removeParentSignalHandlers = () => {
-          if (!parentSignalExit?.reraise) removeHandlers();
-        };
-        const completeParentSignalExit = () => {
-          if (!parentSignalExit) return;
-          const { signal, reraise } = parentSignalExit;
-          parentSignalExit = undefined;
-          clearTimeout(parentSignalKill);
-          clearInterval(parentSignalPoll);
-          removeHandlers();
-          if (reraise) process.kill(process.pid, signal);
-        };
+        removeParentSignalHandlers = removeHandlers;
         for (const signal of parentExitSignals()) {
           const handler = () => {
-            if (parentSignalExit) {
+            if (treeShutdown && parentTerminationSignal) {
               // A second exit signal while the tree is draining: stop waiting.
               signalChildTree("SIGKILL");
-              completeParentSignalExit();
+              completeTreeShutdown(true);
               return;
             }
             parentTerminationSignal = signal;
@@ -2037,32 +2101,23 @@ async function executeCommand(
             const hasExternalListener = inheritedListeners
               ? process.listeners(signal).some((listener) => inheritedListeners.has(listener))
               : process.listeners(signal).some((listener) => listener !== handler);
-            signalChildTree(signal);
-            try {
-              options.cleanupBeforeParentSignalExit?.();
-            } finally {
-              if (process.platform === "win32") {
+            if (process.platform === "win32") {
+              signalChildTree(signal);
+              try {
+                options.cleanupBeforeParentSignalExit?.();
+              } finally {
                 removeHandlers();
                 if (!hasExternalListener) {
                   process.kill(process.pid, signal);
                 }
-              } else {
-                // POSIX: re-raise only once the whole agent tree is gone, and
-                // SIGKILL the group if it outlives the grace period. Both
-                // timers stay referenced so headless cannot exit early and
-                // orphan the agent.
-                parentSignalExit = { signal, reraise: !hasExternalListener };
-                parentSignalKill = setTimeout(() => {
-                  // Keep polling so the killed tree is reaped before we die;
-                  // stop waiting one more grace period later regardless.
-                  signalChildTree("SIGKILL");
-                  parentSignalKill = setTimeout(completeParentSignalExit, terminationGraceMs);
-                }, terminationGraceMs);
-                parentSignalPoll = setInterval(() => {
-                  if (!childTreeAlive()) completeParentSignalExit();
-                }, 25);
               }
+              return;
             }
+            // POSIX: forward to the whole tree, then hold the result (or the
+            // re-raise) until the tree is dead or the bounded deadline passes.
+            beginTreeShutdown(signal);
+            if (!hasExternalListener) treeShutdown!.reraise = signal;
+            options.cleanupBeforeParentSignalExit?.();
           };
           handlers.set(signal, handler);
           process.on(signal, handler);
@@ -2087,25 +2142,21 @@ async function executeCommand(
         termination = { code };
         if (process.platform === "win32") {
           forceKillWindowsProcessTree(child, terminationGraceMs);
-        } else {
-          signalChildTree("SIGTERM");
-        }
-        forceKill = setTimeout(() => {
-          if (settled) return;
-          if (process.platform === "win32") {
-            forceKillWindowsProcessTree(child, terminationGraceMs);
-          } else {
-            signalChildTree("SIGKILL");
-          }
-          forceFinish = setTimeout(() => {
+          forceKill = setTimeout(() => {
             if (settled) return;
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            finish({ code, stdout: capturedStdout });
+            forceKillWindowsProcessTree(child, terminationGraceMs);
+            forceFinish = setTimeout(() => {
+              if (settled) return;
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              finish({ code, stdout: capturedStdout });
+            }, terminationGraceMs);
+            forceFinish.unref();
           }, terminationGraceMs);
-          forceFinish.unref();
-        }, terminationGraceMs);
-        forceKill.unref();
+          forceKill.unref();
+          return;
+        }
+        beginTreeShutdown("SIGTERM");
       };
 
       if (options.timeoutSeconds !== undefined) {

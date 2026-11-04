@@ -46,6 +46,19 @@ async function waitFor(assertion: () => boolean): Promise<void> {
   assert.equal(assertion(), true);
 }
 
+// For "dead at the moment X returned" checks: a just-killed orphan stays a
+// zombie until init reaps it, which is asynchronous on any host.
+function processTerminated(pid: number): boolean {
+  if (!processIsAlive(pid)) return true;
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -1436,7 +1449,8 @@ test("CLI bounds timeout drain when a descendant retains stdout", async () => {
     grandchildPid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
     if (process.platform !== "win32") {
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while any part of the tree is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
       assert.equal(existsSync(naturalExitFile), false);
     }
   } finally {
@@ -1491,7 +1505,8 @@ test("CLI kills timeout descendants after the direct child closes", async () => 
     grandchildPid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
     if (process.platform !== "win32") {
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while any part of the tree is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     }
   } finally {
     if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
