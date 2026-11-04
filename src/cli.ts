@@ -255,6 +255,8 @@ interface CliDeps {
   /** Resolves when the sink can take more output again (--sdk-format ndjson). */
   waitForStdoutDrain?: (signal: AbortSignal) => Promise<void>;
   stderr?: (text: string) => void;
+  /** Test seam: awaited right after the agent has exited, before wrap-up. */
+  afterAgentExit?: () => Promise<void>;
   capacityRetrySleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   capacityRetryRandom?: () => number;
 }
@@ -1338,6 +1340,98 @@ const waitingSpinnerVerbs = [
   "output polishing",
 ];
 
+/**
+ * Re-sends `signal` to this process. While other listeners remain (the
+ * wrap-up guard, proper-lockfile's signal-exit) it is delivered to them
+ * asynchronously and they normally end the process; keep the event loop
+ * alive until then so headless cannot exit early with an unsettled run, and
+ * fall back to the conventional status if nothing ends it.
+ */
+function reraiseSignal(signal: NodeJS.Signals): void {
+  process.kill(process.pid, signal);
+  if (process.listenerCount(signal) > 0) {
+    setTimeout(() => {
+      process.exitCode = 128 + osConstants.signals[signal];
+    }, 100);
+  }
+}
+
+/**
+ * Number of headless-internal handlers (executeCommand, capacity backoff)
+ * currently owning exit signals; while one is active the wrap-up guard below
+ * stays passive and lets it act.
+ */
+let activeSignalOwners = 0;
+
+function claimParentSignals(): () => void {
+  activeSignalOwners += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeSignalOwners -= 1;
+  };
+}
+
+interface WrapUpGuard {
+  /** The agent has exited: from now on signals are deferred, not acted on. */
+  arm(): void;
+  /** runCli is done: remove the guard and re-raise a deferred signal. */
+  release(): void;
+}
+
+/**
+ * Keeps an exit signal from killing headless while it wraps up after the
+ * agent has exited (session persistence, run status, lock release, temp-dir
+ * removal). Once armed, the signal is recorded and re-raised when runCli is
+ * done, unless an embedding host listens for it; a second signal re-raises at
+ * once. Before arming it behaves like no listener at all (the default fatal
+ * action) whenever no headless handler owns the signal. It never touches
+ * processes: anything --keep-background left running stays running.
+ */
+function installWrapUpGuard(
+  inherited: ReadonlyMap<NodeJS.Signals, ReadonlySet<NodeJS.SignalsListener>>,
+): WrapUpGuard {
+  if (process.platform === "win32") return { arm: () => undefined, release: () => undefined };
+  let armed = false;
+  let received: NodeJS.Signals | undefined;
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  const remove = () => {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    handlers.clear();
+  };
+  const hostListens = (signal: NodeJS.Signals) => {
+    const host = inherited.get(signal);
+    return Boolean(host && process.listeners(signal).some((listener) => host.has(listener)));
+  };
+  const reraise = (signal: NodeJS.Signals) => {
+    remove();
+    if (hostListens(signal)) return;
+    reraiseSignal(signal);
+  };
+  for (const signal of parentExitSignals()) {
+    const handler = () => {
+      if (activeSignalOwners > 0) return; // The agent or a backoff is handling it.
+      if (!armed || received) {
+        reraise(signal);
+        return;
+      }
+      received = signal;
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  return {
+    arm: () => {
+      armed = true;
+    },
+    release: () => {
+      if (received) reraise(received);
+      else remove();
+    },
+  };
+}
+
 function parentExitSignals(): NodeJS.Signals[] {
   return process.platform === "win32"
     ? ["SIGINT", "SIGTERM", "SIGBREAK"]
@@ -2033,7 +2127,7 @@ async function executeCommand(
         if (treeShutdown.reraise) {
           const signal = treeShutdown.reraise;
           removeParentSignalHandlers();
-          process.kill(process.pid, signal);
+          reraiseSignal(signal);
           return;
         }
         if (forced) {
@@ -2164,10 +2258,12 @@ async function executeCommand(
 
       if (handlesParentSignals) {
         const handlers = new Map<NodeJS.Signals, () => void>();
+        const releaseSignals = claimParentSignals();
         const removeHandlers = () => {
           for (const [signal, handler] of handlers) {
             process.off(signal, handler);
           }
+          releaseSignals();
         };
         removeParentSignalHandlers = removeHandlers;
         for (const signal of parentExitSignals()) {
@@ -3646,6 +3742,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   );
   let registeredRunNode: { runId: string; nodeId: string } | undefined;
   let dockerSessionLock: { release: () => Promise<Error | undefined> } | undefined;
+  let wrapUpGuard: WrapUpGuard | undefined;
   let temporaryBillingRoot: string | undefined;
   let temporaryBillingVolume: string | undefined;
   let billingVolumeInitialized = false;
@@ -4812,6 +4909,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         displayStderr(`headless: could not prepare Antigravity usage capture: ${message}\n`);
       }
     }
+    // Installed for the whole run and removed only when runCli returns, so
+    // a signal after the agent exited cannot interrupt the wrap-up.
+    wrapUpGuard = installWrapUpGuard(inheritedSignalListeners);
     try {
       try {
         if (parsed.runId && parsed.role && nodeId) {
@@ -4828,6 +4928,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             signal: retryController.signal,
             random: deps.capacityRetryRandom,
             sleep: async (delayMs, signal) => {
+              const releaseSignals = claimParentSignals();
               const handlers = parentExitSignals().map((signalName) => {
                 const handler = () => retryController.abort(128 + osConstants.signals[signalName]);
                 process.on(signalName, handler);
@@ -4837,6 +4938,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                 await (deps.capacityRetrySleep ?? waitForCapacityRetry)(delayMs, signal);
               } finally {
                 for (const [signalName, handler] of handlers) process.off(signalName, handler);
+                releaseSignals();
               }
             },
             reportUsage: parsed.usage && (parsed.agent === "claude" || parsed.agent === "codex") ? async (trace, route) => {
@@ -4937,6 +5039,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       if (!result) {
         throw new CliError("agent execution did not produce a result");
       }
+      // The agent has exited: defer signals until the wrap-up below is done.
+      wrapUpGuard.arm();
+      await deps.afterAgentExit?.();
       const commandTrace = result.stdout || result.finalMessageTrace || result.usageTrace || "";
       const piOutcome = piCompletion?.outcome;
       const piError = piOutcome?.status === "error" ? `pi error: ${piOutcome.error}`
@@ -5116,6 +5221,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         (!billingHomeCompleted || !removeDockerBillingVolume(temporaryBillingVolume, env))) {
       stderr(`headless: retained native session volume for recovery: ${temporaryBillingVolume}\n`);
     }
+    // Last: re-raise a signal that arrived during wrap-up, now that it is done.
+    wrapUpGuard?.release();
   }
 }
 

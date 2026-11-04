@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { runAcpClient } from "../src/acp.ts";
 import { runCli } from "../src/cli.ts";
 import { cronRoot, parseCronSchedule, readCronJob, recordCronJob, runDueCronJobsOnce } from "../src/cron.ts";
+import { dockerSessionHomePath } from "../src/docker.ts";
+import { dockerSessionLockPath } from "../src/launch-lock.ts";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const posixOnly = { skip: process.platform === "win32" };
@@ -504,6 +506,75 @@ test("an agent that exits without reading its stdin prompt does not crash headle
     });
     assert.equal(code, 3);
   } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a signal during wrap-up lets cleanup finish, then exits with it, leaving --keep-background processes running", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-wrapup-test-"));
+  const binDir = join(dir, "bin");
+  const homeDir = join(dir, "home");
+  const projectDir = join(dir, "project");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const wrapUpMark = join(dir, "wrap-up-continued");
+  const returnMark = join(dir, "run-cli-returned");
+  for (const path of [binDir, homeDir, projectDir]) mkdirSync(path);
+  // Fake `docker run`: starts a background grandchild, prints a result, exits 0.
+  writeFileSync(join(binDir, "docker"), [
+    `#!${process.execPath}`,
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio: 'ignore' });",
+    "writeFileSync(process.env.HEADLESS_TEST_GRANDCHILD_PID, String(child.pid));",
+    "child.unref();",
+    "console.log(JSON.stringify({ type: 'thread.started', thread_id: '019ad9b8-0000-7000-8000-000000000001' }));",
+    "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } }));",
+    "",
+  ].join("\n"));
+  chmodSync(join(binDir, "docker"), 0o755);
+  // runCli with a wrap-up hook that signals itself, then keeps working.
+  const runner = join(dir, "runner.mjs");
+  writeFileSync(runner, [
+    "import { writeFileSync } from 'node:fs';",
+    `import { runCli } from ${JSON.stringify(join(repoRoot, "src", "cli.ts"))};`,
+    "const code = await runCli(process.argv.slice(2), {",
+    "  afterAgentExit: async () => {",
+    "    process.kill(process.pid, 'SIGTERM');",
+    "    await new Promise((resolve) => setTimeout(resolve, 300));",
+    `    writeFileSync(${JSON.stringify(wrapUpMark)}, 'yes');`,
+    "  },",
+    "});",
+    `writeFileSync(${JSON.stringify(returnMark)}, String(code));`,
+    "",
+  ].join("\n"));
+  const env = {
+    ...process.env,
+    HEADLESS_KILL_GRACE_MS: "300",
+    HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+    HOME: homeDir,
+    PATH: `${binDir}:${process.env.PATH ?? ""}`,
+  };
+  try {
+    const headless = spawn(process.execPath, [
+      "--import", "tsx", runner,
+      "codex", "--docker", "--session", "work", "--keep-background", "--prompt", "hello", "--work-dir", projectDir,
+    ], { cwd: repoRoot, env, stdio: "ignore" });
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      headless.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    // The signal was honoured, but only after the wrap-up finished.
+    assert.deepEqual(exit, { code: null, signal: "SIGTERM" });
+    assert.equal(existsSync(wrapUpMark), true, "wrap-up was cut short by the signal");
+    // runCli itself completed (exit status 0), and only then did the
+    // deferred signal end the process.
+    assert.equal(readFileSync(returnMark, "utf8"), "0");
+    const lockPath = dockerSessionLockPath(dockerSessionHomePath("codex", "work", { HOME: homeDir }) as string);
+    assert.equal(existsSync(lockPath), false, "Docker session lock was not released");
+    // The agent had already exited cleanly: its kept process is untouched.
+    const grandchildPid = readPid(grandchildPidFile)!;
+    assert.equal(processGone(grandchildPid), false, "--keep-background process was killed");
+  } finally {
+    killQuietly(readPid(grandchildPidFile));
     rmSync(dir, { force: true, recursive: true });
   }
 });
