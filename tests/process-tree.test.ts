@@ -150,3 +150,48 @@ test("process tree tracks a descendant that left the group with setsid", { skip:
     }
   }
 });
+
+test("Windows PID-rooted trees are terminated with an awaited taskkill /T /F", async () => {
+  // A real process stands in for the Windows one; the fake taskkill kills it.
+  const victim = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const invocations: Array<{ command: string; args: string[] }> = [];
+  const launch: TaskkillLauncher = (command, args) => {
+    invocations.push({ command, args });
+    const taskkill = new FakeTaskkill();
+    setTimeout(() => {
+      victim.kill("SIGKILL");
+      taskkill.emit("close", 0);
+    }, 20);
+    return taskkill;
+  };
+  try {
+    await once(victim, "spawn");
+    const tree = new ProcessTree({ roots: [victim.pid!], platform: "win32", taskkill: launch, systemRoot: "C:\\Windows" });
+    assert.equal(tree.alive(), true);
+    const exited = once(victim, "exit");
+    assert.deepEqual(await terminateProcessTree(tree, { graceMs: 1000 }), { signal: "SIGKILL", survived: false });
+    await exited;
+    assert.deepEqual(invocations, [{
+      command: "C:\\Windows\\System32\\taskkill.exe",
+      args: ["/pid", String(victim.pid), "/T", "/F"],
+    }]);
+  } finally {
+    if (victim.exitCode === null && victim.signalCode === null) victim.kill("SIGKILL");
+  }
+});
+
+test("Windows tree termination reports survivors when taskkill fails", async () => {
+  const victim = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const launch: TaskkillLauncher = () => {
+    const taskkill = new FakeTaskkill();
+    setTimeout(() => taskkill.emit("close", 128), 10);
+    return taskkill;
+  };
+  try {
+    await once(victim, "spawn");
+    const tree = new ProcessTree({ roots: [victim.pid!], platform: "win32", taskkill: launch });
+    assert.deepEqual(await terminateProcessTree(tree, { graceMs: 100 }), { signal: "SIGKILL", survived: true });
+  } finally {
+    victim.kill("SIGKILL");
+  }
+});

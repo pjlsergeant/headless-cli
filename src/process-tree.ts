@@ -114,6 +114,10 @@ export interface ProcessTreeOptions {
   exclude?: number[];
   /** Direct child, signalled when nothing else matched (and on Windows). */
   child?: KillableProcess;
+  /** Test seams for the Windows path (taskkill-based). */
+  platform?: NodeJS.Platform;
+  taskkill?: TaskkillLauncher;
+  systemRoot?: string;
 }
 
 /**
@@ -135,6 +139,24 @@ export class ProcessTree {
     this.groups = new Set((options.groups ?? []).filter((pid) => pid > 0));
     this.roots = new Set((options.roots ?? []).filter((pid) => pid > 0));
     this.exclude = new Set(options.exclude ?? []);
+  }
+
+  /** Windows has no process groups: trees are rooted PIDs killed with taskkill /T. */
+  get windows(): boolean {
+    return (this.options.platform ?? process.platform) === "win32";
+  }
+
+  private windowsTargets(): number[] {
+    const pids = new Set([...this.roots].filter((pid) => !this.exclude.has(pid)));
+    const childPid = this.options.child?.pid;
+    if (childPid && !this.exclude.has(childPid)) pids.add(childPid);
+    return [...pids];
+  }
+
+  /** Windows: `taskkill /PID <pid> /T /F` every root, awaiting each (bounded). */
+  async taskkillAll(timeoutMs: number): Promise<void> {
+    await Promise.all(this.windowsTargets().filter(probe).map((pid) =>
+      runTaskkill(pid, timeoutMs, this.options.taskkill, this.options.systemRoot)));
   }
 
   addGroup(pgid: number): void {
@@ -174,8 +196,13 @@ export class ProcessTree {
   }
 
   signal(signal: NodeJS.Signals): void {
-    if (process.platform === "win32") {
-      this.signalChild(signal);
+    if (this.windows) {
+      if (this.options.child) {
+        this.signalChild(signal);
+      } else if (signal === "SIGTERM" || signal === "SIGKILL") {
+        // PID-only tree (e.g. cron's stored PIDs): no handle to signal.
+        void this.taskkillAll(5000);
+      }
       return;
     }
     const table = readProcessTable();
@@ -206,7 +233,7 @@ export class ProcessTree {
   }
 
   alive(): boolean {
-    if (process.platform === "win32") return this.childAlive() ?? false;
+    if (this.windows) return this.windowsTargets().some(probe);
     const table = readProcessTable();
     if (!table) {
       if ([...this.groups].some((pgid) => probe(-pgid))) return true;
@@ -282,6 +309,12 @@ export async function terminateProcessTree(
   const signal = options.signal ?? "SIGTERM";
   const pollMs = options.pollMs ?? 25;
   if (!tree.alive()) return { signal, survived: false };
+  if (tree.windows) {
+    // No catchable termination on Windows: force-kill each root's tree.
+    await tree.taskkillAll(options.graceMs);
+    const dead = await waitUntilDead(tree, options.graceMs, pollMs);
+    return { signal: "SIGKILL", survived: !dead };
+  }
   tree.signal(signal);
   if (await waitUntilDead(tree, options.graceMs, pollMs)) return { signal, survived: false };
   tree.signal("SIGKILL");
@@ -323,6 +356,43 @@ const launchTaskkill: TaskkillLauncher = (command, args, options) => spawn(comma
 export function windowsTaskkillPath(systemRoot = process.env.SystemRoot): string {
   const root = systemRoot && win32.isAbsolute(systemRoot) ? systemRoot : "C:\\Windows";
   return win32.join(root, "System32", "taskkill.exe");
+}
+
+/**
+ * Runs `taskkill /PID <pid> /T /F` and resolves once it exits (true on
+ * success) or after `timeoutMs` (false; the hung taskkill is killed).
+ */
+export function runTaskkill(
+  pid: number,
+  timeoutMs: number,
+  launch: TaskkillLauncher = launchTaskkill,
+  systemRoot = process.env.SystemRoot,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let taskkill: TaskkillProcess;
+    try {
+      taskkill = launch(windowsTaskkillPath(systemRoot), ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => {
+      taskkill.kill("SIGKILL");
+      done(false);
+    }, timeoutMs);
+    taskkill.once("error", () => done(false));
+    taskkill.once("close", (code) => done(code === 0));
+  });
 }
 
 export function forceKillWindowsProcessTree(
