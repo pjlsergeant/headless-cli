@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Fixed Modal uploads failing before the agent started when a tracked file had been deleted from the worktree without staging the deletion.
 - Fixed Modal sync-back recreating sandbox symlinks with any target: links whose target is absolute or resolves outside the work dir are now reported as conflicts and not created.
 - Fixed Docker runs to refuse a work dir that overlaps Headless state in either direction (`~/.headless`, the run store, cron root, session store, or Docker session root), comparing configured and canonical paths, since the work dir is mounted read-write into the container. Docker run nodes pin the canonical run directory at launch for their mailbox and the nodes it starts.
 - Changed Docker run coordination so containers no longer get the host run directory: each Docker run node gets a mailbox (`/headless-mailbox`, requests read-write, replies and a run state snapshot read-only) and the host validates every request before applying it. Inside a container, `run view`/`list`/`wait` read the snapshot, `run message` starts an idle oneshot Docker target in its own container with the requester's Docker flags (other targets get the message recorded but not started), `run mark` is limited to the node itself, and launching new run nodes is refused. Docker orchestrator team children now run in their own containers instead of inside the orchestrator's.

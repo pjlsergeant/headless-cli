@@ -630,6 +630,50 @@ test("executeModalAgent rejects non-git workdirs instead of recursively uploadin
   }
 });
 
+test("executeModalAgent uploads a worktree with an unstaged tracked-file deletion", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-unstaged-delete-"));
+  try {
+    const work = join(dir, "work");
+    const remote = join(dir, "remote");
+    mkdirSync(work);
+    mkdirSync(remote);
+    initGitWorkdir(work);
+    writeFileSync(join(work, "input.txt"), "local");
+    writeFileSync(join(work, "gone.txt"), "tracked");
+    symlinkSync("missing-target", join(work, "dangling"));
+    assert.equal(spawnSync("git", ["add", "."], { cwd: work }).status, 0);
+    rmSync(join(work, "gone.txt"));
+    const sandbox = new FakeSandbox(remote);
+
+    const result = await executeModalAgent({
+      agent: "codex",
+      appName: "headless-test",
+      command: { command: "codex", args: ["exec", "--json", "-"], stdinText: "prompt" },
+      cpu: DEFAULT_MODAL_CPU,
+      env: { HOME: join(dir, "home"), OPENAI_API_KEY: "sk-test" },
+      image: DEFAULT_MODAL_IMAGE,
+      includeGit: false,
+      memoryMiB: DEFAULT_MODAL_MEMORY_MIB,
+      modalEnv: [],
+      modalSecrets: [],
+      stderr: () => {},
+      stdout: () => {},
+      stdoutHandling: "capture",
+      timeoutSeconds: DEFAULT_MODAL_TIMEOUT_SECONDS,
+      workDir: work,
+      clientFactory: async () => new FakeModalClient(sandbox),
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(existsSync(join(remote, "workspace", "gone.txt")), false);
+    assert.equal(readlinkSync(join(remote, "workspace", "dangling")), "missing-target");
+    assert.equal(existsSync(join(work, "gone.txt")), false);
+    assert.equal(readFileSync(join(work, "input.txt"), "utf8"), "remote");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("executeModalAgent includeGit uploads git metadata without ignored files", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-include-git-"));
   try {

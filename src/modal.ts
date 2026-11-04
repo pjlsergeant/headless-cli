@@ -588,7 +588,19 @@ async function listGitFiles(workDir: string): Promise<string[] | undefined> {
     .split("\0")
     .filter(Boolean)
     .filter((path) => path !== ".")
+    // --cached still lists tracked files deleted from the worktree but not
+    // staged; tar would fail on them. Existing symlinks are kept (lstat).
+    .filter((path) => pathExists(join(workDir, path)))
     .sort();
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function listFilesRecursive(root: string, options: { ignoredDirs?: Set<string> } = {}): string[] {
