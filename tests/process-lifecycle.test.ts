@@ -259,23 +259,30 @@ test("cron kill terminates the agent's grandchild, not just the headless process
   }
 });
 
-test("ACP shutdown is bounded when the server ignores SIGTERM", posixOnly, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-acp-test-"));
-  const serverPidFile = join(dir, "server.pid");
+/**
+ * Minimal ACP server that ignores SIGTERM and stdin EOF and spawns a
+ * background child that also ignores SIGTERM. HEADLESS_TEST_CHILD_STDIO picks
+ * the child's stdio ("ignore" or "inherit", the latter holding our stdout).
+ * With HEADLESS_TEST_DIE_ON_INITIALIZE=1 the server exits on `initialize`
+ * without answering, leaving the child behind.
+ */
+function writeFakeAcpServer(dir: string): string {
   const server = join(dir, "acp-server.js");
-  // Minimal ACP server that ignores SIGTERM and stdin EOF, so only SIGKILL
-  // can end it once the prompt is answered.
+  const background = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
   writeFileSync(
     server,
     [
+      "const { spawn } = require('node:child_process');",
       "const { writeFileSync } = require('node:fs');",
-      "writeFileSync(process.env.HEADLESS_TEST_SERVER_PID, String(process.pid));",
       "process.on('SIGTERM', () => {});",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(background)}], { stdio: ['ignore', process.env.HEADLESS_TEST_CHILD_STDIO, 'ignore'] });`,
+      "writeFileSync(process.env.HEADLESS_TEST_SERVER_PID, `${process.pid} ${child.pid}`);",
       "setInterval(() => {}, 1000);",
       "const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\\n');",
       "let buffer = '';",
       "process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data', (chunk) => {",
+      // Answer only once the background child has installed its SIGTERM handler.
+      "setTimeout(() => process.stdin.on('data', (chunk) => {",
       "  buffer += chunk;",
       "  let newline;",
       "  while ((newline = buffer.indexOf('\\n')) >= 0) {",
@@ -284,6 +291,7 @@ test("ACP shutdown is bounded when the server ignores SIGTERM", posixOnly, async
       "    if (!line.trim()) continue;",
       "    const request = JSON.parse(line);",
       "    if (request.method === 'initialize') {",
+      "      if (process.env.HEADLESS_TEST_DIE_ON_INITIALIZE === '1') process.exit(3);",
       "      send({ id: request.id, result: { protocolVersion: request.params.protocolVersion, agentCapabilities: {} } });",
       "    } else if (request.method === 'session/new') {",
       "      send({ id: request.id, result: { sessionId: 'stubborn' } });",
@@ -294,32 +302,70 @@ test("ACP shutdown is bounded when the server ignores SIGTERM", posixOnly, async
       "      send({ id: request.id, error: { code: -32601, message: 'unsupported' } });",
       "    }",
       "  }",
-      "});",
+      "}), 300);",
       "",
     ].join("\n"),
   );
-  let serverPid: number | undefined;
+  return server;
+}
+
+function readPids(path: string): number[] {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8").trim().split(" ").map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+async function runFakeAcp(extraEnv: NodeJS.ProcessEnv): Promise<{
+  code: number;
+  stdout: string;
+  elapsedMs: number;
+  serverGone: boolean;
+  backgroundGone: boolean;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-acp-test-"));
+  const pidFile = join(dir, "server.pid");
+  const server = writeFakeAcpServer(dir);
   try {
     const stdout: string[] = [];
     const started = Date.now();
     const code = await runAcpClient({
       agentCommand: { command: process.execPath, args: [server] },
       prompt: "hello",
-      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", HEADLESS_TEST_SERVER_PID: serverPidFile },
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", HEADLESS_TEST_SERVER_PID: pidFile, ...extraEnv },
       stdout: (text) => stdout.push(text),
       stderr: () => {},
     });
     const elapsedMs = Date.now() - started;
-    serverPid = readPid(serverPidFile);
-    assert.equal(code, 0);
-    assert.match(stdout.join(""), /done/);
-    assert.ok(serverPid);
-    assert.ok(processGone(serverPid), "ACP server survived shutdown");
-    assert.ok(elapsedMs < 3000, `ACP shutdown took ${elapsedMs}ms`);
+    const [serverPid, backgroundPid] = readPids(pidFile);
+    assert.ok(serverPid && backgroundPid);
+    // Sample liveness now, before the cleanup below kills any survivors.
+    return {
+      code,
+      stdout: stdout.join(""),
+      elapsedMs,
+      serverGone: processGone(serverPid),
+      backgroundGone: processGone(backgroundPid),
+    };
   } finally {
-    killQuietly(serverPid);
+    for (const pid of readPids(pidFile)) killQuietly(pid);
     rmSync(dir, { force: true, recursive: true });
   }
+}
+
+test("ACP shutdown is bounded and kills the server's descendants when they ignore SIGTERM", posixOnly, async () => {
+  const result = await runFakeAcp({ HEADLESS_TEST_CHILD_STDIO: "ignore" });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /done/);
+  assert.ok(result.serverGone, "ACP server survived shutdown");
+  assert.ok(result.backgroundGone, "ACP server's background child survived shutdown");
+  assert.ok(result.elapsedMs < 3000, `ACP shutdown took ${result.elapsedMs}ms`);
+});
+
+test("ACP client fails promptly when the server dies mid-initialize while a child holds its stdout", posixOnly, async () => {
+  const result = await runFakeAcp({ HEADLESS_TEST_CHILD_STDIO: "inherit", HEADLESS_TEST_DIE_ON_INITIALIZE: "1" });
+  assert.notEqual(result.code, 0);
+  assert.match(result.stdout, /ACP server exited/);
+  assert.ok(result.backgroundGone, "ACP server's background child survived");
+  assert.ok(result.elapsedMs < 3000, `ACP failure took ${result.elapsedMs}ms`);
 });
 
 test("ACP client reports a server that cannot be spawned instead of crashing", async () => {
