@@ -2940,6 +2940,33 @@ test("CLI --docker print-command wraps the selected agent command", async () => 
   }
 });
 
+test("CLI --docker mounts a staged selected AWS profile and removes it afterwards", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const homeDir = join(dir, "home");
+    const projectDir = join(dir, "project");
+    mkdirSync(join(homeDir, ".aws"), { recursive: true });
+    mkdirSync(projectDir);
+    writeFileSync(join(homeDir, ".aws", "credentials"), "[dev]\naws_access_key_id = dev\n[prod]\naws_access_key_id = prod\n");
+    const stdout: string[] = [];
+    const code = await runCli(
+      ["codex", "--prompt", "hello", "--work-dir", projectDir, "--docker", "--print-command"],
+      {
+        env: { ...process.env, CODEX_HOME: undefined, HOME: homeDir, AWS_PROFILE: "dev" },
+        stdout: (text) => stdout.push(text),
+      },
+    );
+    assert.equal(code, 0);
+    const output = stdout.join("");
+    assert.ok(!output.includes(`${join(homeDir, ".aws")}:`), output);
+    const match = /--volume '?([^ ']*headless-docker-credentials-[^ ']*\/aws\/\.aws):\/tmp\/headless-host-home\/\.aws:ro/.exec(output);
+    assert.ok(match, output);
+    assert.equal(existsSync(dirname(dirname(match[1]))), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("CLI --docker --session print-command prepares its bind-mount source", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
   try {

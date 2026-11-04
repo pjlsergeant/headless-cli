@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -888,11 +888,24 @@ test("mounts provider credential files needed by forwarded env vars", () => {
     mkdirSync(join(home, ".aws"), { recursive: true });
     mkdirSync(join(dir, "google"), { recursive: true });
     mkdirSync(workDir, { recursive: true });
-    writeFileSync(join(home, ".aws", "config"), "[profile dev]\nregion = us-west-2\n");
-    writeFileSync(join(home, ".aws", "credentials"), "[dev]\naws_access_key_id = test\n");
+    writeFileSync(
+      join(home, ".aws", "config"),
+      "[profile dev]\nregion = us-west-2\nsso_session = corp\n\n[profile prod]\nregion = eu-west-1\n\n" +
+        "[sso-session corp]\nsso_region = us-east-1\n\n[sso-session other]\nsso_region = eu-west-1\n",
+    );
+    writeFileSync(
+      join(home, ".aws", "credentials"),
+      "[dev]\naws_access_key_id = test\n\n[prod]\naws_access_key_id = prod-key\n",
+      { mode: 0o600 },
+    );
+    mkdirSync(join(home, ".aws", "sso", "cache"), { recursive: true });
+    writeFileSync(join(home, ".aws", "sso", "cache", "token.json"), "{}");
     writeFileSync(googleCredentials, "{}");
+    const stage = join(dir, "stage");
+    mkdirSync(stage, { mode: 0o700 });
 
     const command = buildDockerAgentCommand({
+      credentialStageDir: stage,
       agent: "codex",
       command: {
         command: "codex",
@@ -912,9 +925,31 @@ test("mounts provider credential files needed by forwarded env vars", () => {
     });
 
     assert.ok(command.args.includes(`${googleCredentials}:${googleCredentials}:ro`));
-    assert.ok(command.args.includes(`${join(home, ".aws")}:/tmp/headless-host-home/.aws:ro`));
+    assert.ok(!command.args.some((arg) => arg.startsWith(`${join(home, ".aws")}:`)));
+    const awsMount = `${join(stage, "aws", ".aws")}:/tmp/headless-host-home/.aws:ro`;
+    assert.ok(command.args.includes(awsMount));
+    const staged = join(stage, "aws", ".aws");
+    assert.deepEqual(readdirSync(staged).sort(), ["config", "credentials"]);
+    assert.equal(readFileSync(join(staged, "credentials"), "utf8"), "[dev]\naws_access_key_id = test\n");
+    assert.equal(statSync(join(staged, "credentials")).mode & 0o777, 0o600);
+    const config = readFileSync(join(staged, "config"), "utf8");
+    assert.match(config, /\[profile dev\]/);
+    assert.match(config, /\[sso-session corp\]/);
+    assert.doesNotMatch(config, /prod|other|eu-west-1/);
     assert.ok(command.args.includes("AWS_PROFILE"));
     assert.ok(command.args.includes("GOOGLE_APPLICATION_CREDENTIALS"));
+
+    // Without a stage directory nothing from ~/.aws is mounted.
+    const unstaged = buildDockerAgentCommand({
+      agent: "codex",
+      command: { command: "codex", args: ["exec", "-"] },
+      dockerArgs: [],
+      dockerEnv: [],
+      env: { AWS_PROFILE: "dev", HOME: home },
+      image: DEFAULT_DOCKER_IMAGE,
+      workDir,
+    });
+    assert.ok(!unstaged.args.some((arg) => arg.includes(".aws")));
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
