@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Fixed Modal recovery losing remote work in more cases: the workspace is recovered even when the agent execution fails, conflicting paths left unapplied by sync-back also save the recovery archive, the sandbox is terminated only once the result is applied or the archive is saved to disk (otherwise it is left running and its id printed), and the downloaded archive is streamed to a private file with compressed and extracted size limits (`HEADLESS_MODAL_MAX_ARCHIVE_BYTES`, `HEADLESS_MODAL_MAX_EXTRACTED_BYTES`).
 - Fixed Modal sync-back: symlink targets containing a backslash are refused, every sandbox symlink is checked against the final tree before anything is changed locally, and paths that differ from a local path only by case or Unicode normalisation are treated as conflicts.
 - Fixed prompts starting with "-" (such as markdown lists) being parsed as options by the agent CLI: Claude (one-shot and interactive) and interactive Codex now get the prompt after `--`, and Gemini one-shot reads inline prompts from stdin.
 - Fixed Docker runs mounting all of `~/.aws` when `AWS_PROFILE` is forwarded: like Modal, the container now gets only the selected profile (and its `sso-session`), staged in a private temporary directory removed after the run. The SSO token cache is no longer available in the container.

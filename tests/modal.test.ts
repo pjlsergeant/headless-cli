@@ -914,7 +914,7 @@ test("Modal saves the downloaded archive privately when extraction fails, then t
   }
 });
 
-test("Modal terminates and reports when the result download fails", async () => {
+test("Modal keeps the sandbox and prints its id when the result download fails", async () => {
   const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-download-");
   try {
     const sandbox = new FakeSandbox(remote, { captureError: "tar: connection lost" });
@@ -926,12 +926,134 @@ test("Modal terminates and reports when the result download fails", async () => 
       /modal result recovery failed: tar: connection lost/,
     );
 
-    assert.equal(sandbox.terminated, true);
-    assert.match(stderr.join(""), /modal result recovery failed: tar: connection lost/);
-    assert.doesNotMatch(stderr.join(""), /left running/);
+    // Nothing was saved locally, so the sandbox is the only copy of the work.
+    assert.equal(sandbox.terminated, false);
+    const output = stderr.join("");
+    assert.match(output, /modal result recovery failed: tar: connection lost/);
+    assert.match(output, /not saved locally, so Modal sandbox sb-download1 was left running/);
+    assert.match(output, /lifetime from creation ends/);
     assert.equal(existsSync(join(dir, "home", ".headless", "modal-recovery")), false);
   } finally {
     rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal recovers the workspace when execution fails, then rethrows the execution error", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-exec-error-");
+  try {
+    const sandbox = new FakeSandbox(remote);
+    await assert.rejects(
+      () =>
+        executeModalAgent({
+          ...modalRecoveryOptions(dir, work, sandbox, []),
+          invoke: async (execute) => {
+            await execute({ command: "codex", args: ["exec", "-"], stdinText: "prompt" }, {}, 60, () => {});
+            throw new Error("stdout stream broke");
+          },
+        }),
+      /stdout stream broke/,
+    );
+    assert.equal(readFileSync(join(work, "created.txt"), "utf8"), "created");
+    assert.equal(sandbox.terminated, true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("--modal-keep-sandbox applies when execution fails and the download fails too", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-exec-keep-");
+  try {
+    const sandbox = new FakeSandbox(remote, { captureError: "tar: gone" });
+    sandbox.sandboxId = "sb-execkeep";
+    const stderr: string[] = [];
+    await assert.rejects(
+      () =>
+        executeModalAgent({
+          ...modalRecoveryOptions(dir, work, sandbox, stderr),
+          keepSandboxOnFailure: true,
+          invoke: async () => {
+            throw new Error("wait rejected");
+          },
+        }),
+      /wait rejected/,
+    );
+    assert.equal(sandbox.terminated, false);
+    assert.match(stderr.join(""), /sb-execkeep/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal saves the archive when sync conflicts leave remote changes unapplied", async () => {
+  for (const keep of [false, true]) {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-conflict-");
+    try {
+      // The fake agent writes input.txt remotely; change it locally meanwhile.
+      const sandbox = new FakeSandbox(remote, { beforeCapture: () => writeFileSync(join(work, "input.txt"), "edited locally") });
+      sandbox.sandboxId = "sb-conflict1";
+      const stderr: string[] = [];
+      const result = await executeModalAgent({ ...modalRecoveryOptions(dir, work, sandbox, stderr), keepSandboxOnFailure: keep });
+      assert.equal(result.code, 0);
+      assert.deepEqual(result.conflicts, ["input.txt"]);
+      assert.equal(readFileSync(join(work, "input.txt"), "utf8"), "edited locally");
+      const recoveryDir = join(dir, "home", ".headless", "modal-recovery");
+      assert.equal(readdirSync(recoveryDir).length, 1);
+      assert.match(stderr.join(""), /saved the remote Modal workspace/);
+      assert.equal(sandbox.terminated, !keep);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
+test("Modal keeps the sandbox when the recovery archive cannot be saved", async () => {
+  const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-save-fail-");
+  try {
+    mkdirSync(join(dir, "home"), { recursive: true });
+    writeFileSync(join(dir, "home", ".headless"), "not a directory");
+    const sandbox = new FakeSandbox(remote, { resultArchive: makeTarGz([{ content: "x", name: "../escape.txt" }]) });
+    sandbox.sandboxId = "sb-nosave";
+    const stderr: string[] = [];
+    await assert.rejects(() => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)), /recovery failed/);
+    assert.equal(sandbox.terminated, false);
+    assert.match(stderr.join(""), /could not save the Modal workspace archive/);
+    assert.match(stderr.join(""), /sb-nosave was left running/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Modal bounds the downloaded and the extracted archive size", async () => {
+  {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-cap-download-");
+    try {
+      const sandbox = new FakeSandbox(remote);
+      const options = modalRecoveryOptions(dir, work, sandbox, []);
+      await assert.rejects(
+        () => executeModalAgent({ ...options, env: { ...options.env, HEADLESS_MODAL_MAX_ARCHIVE_BYTES: "64" } }),
+        /exceeds 64 bytes \(HEADLESS_MODAL_MAX_ARCHIVE_BYTES\)/,
+      );
+      assert.equal(sandbox.terminated, false);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+  {
+    const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-cap-extract-");
+    try {
+      const sandbox = new FakeSandbox(remote, { resultArchive: makeTarGz([{ content: "z".repeat(100_000), name: "big.txt" }]) });
+      const options = modalRecoveryOptions(dir, work, sandbox, []);
+      await assert.rejects(
+        () => executeModalAgent({ ...options, env: { ...options.env, HEADLESS_MODAL_MAX_EXTRACTED_BYTES: "50000" } }),
+        /expands beyond 50000 bytes/,
+      );
+      assert.equal(existsSync(join(work, "big.txt")), false);
+      // The (small) download itself was saved, so the sandbox can go.
+      assert.equal(readdirSync(join(dir, "home", ".headless", "modal-recovery")).length, 1);
+      assert.equal(sandbox.terminated, true);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
   }
 });
 
@@ -1029,6 +1151,7 @@ class FakeSandbox implements ModalSandboxLike {
     private root: string,
     public options: {
       agentStdoutChunks?: string[];
+      beforeCapture?: () => void;
       captureError?: string;
       resultArchive?: Uint8Array;
     } = {},
@@ -1097,6 +1220,7 @@ class FakeProcess implements ModalProcessLike<string | Uint8Array> {
       return;
     }
     if (isTarCommand(this.command[0]) && this.command[1] === "-czf") {
+      this.sandbox.options.beforeCapture?.();
       if (this.sandbox.options.captureError) throw new Error(this.sandbox.options.captureError);
       if (this.sandbox.options.resultArchive) {
         this.stdoutValue = this.sandbox.options.resultArchive;

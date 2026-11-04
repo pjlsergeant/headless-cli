@@ -1,13 +1,18 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
+  createReadStream,
+  fsyncSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readlinkSync,
   readdirSync,
   realpathSync,
@@ -15,11 +20,12 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { gunzipSync } from "node:zlib";
+import { createGunzip, gunzipSync } from "node:zlib";
 
 import { getAgentConfig } from "./agents.js";
 import { codexProfileSeedFiles, readCodexBaseFiles } from "./codex-profile.js";
@@ -39,6 +45,27 @@ export const MODAL_RECOVERY_TIMEOUT_SECONDS = 120;
 // Lifetime of a sandbox created with --modal-keep-sandbox, so it outlives a
 // failed recovery long enough to be inspected (Modal's sandbox maximum).
 export const MODAL_KEPT_SANDBOX_LIFETIME_SECONDS = 24 * 60 * 60;
+// Bounds on the untrusted result archive: downloaded (compressed) size and
+// the size it expands to. Overridable, in bytes, through these variables.
+export const MODAL_MAX_ARCHIVE_BYTES_ENV = "HEADLESS_MODAL_MAX_ARCHIVE_BYTES";
+export const MODAL_MAX_EXTRACTED_BYTES_ENV = "HEADLESS_MODAL_MAX_EXTRACTED_BYTES";
+const defaultMaxArchiveBytes = 4 * 1024 ** 3;
+const defaultMaxExtractedBytes = 16 * 1024 ** 3;
+
+export function modalArchiveLimits(env: Env): { archiveBytes: number; extractedBytes: number } {
+  const read = (name: string, fallback: number) => {
+    const value = env[name]?.trim();
+    if (!value) return fallback;
+    if (!/^\d+$/.test(value) || Number(value) <= 0 || !Number.isSafeInteger(Number(value))) {
+      throw new Error(`${name} must be a positive number of bytes`);
+    }
+    return Number(value);
+  };
+  return {
+    archiveBytes: read(MODAL_MAX_ARCHIVE_BYTES_ENV, defaultMaxArchiveBytes),
+    extractedBytes: read(MODAL_MAX_EXTRACTED_BYTES_ENV, defaultMaxExtractedBytes),
+  };
+}
 
 const remoteWorkDir = "/workspace";
 const remoteHome = "/home/node";
@@ -257,6 +284,7 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
     timeoutMs + recoveryTimeoutMs,
     options.keepSandboxOnFailure ? MODAL_KEPT_SANDBOX_LIFETIME_SECONDS * 1000 : 0,
   );
+  const limits = modalArchiveLimits(options.env);
   const env = collectModalEnv(options.env, options.command.env, options.modalEnv, { workDir });
   let client: ModalClientLike | undefined;
   let sandbox: ModalSandboxLike | undefined;
@@ -355,41 +383,36 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
       const [stdout, , code] = await Promise.all([stdoutPromise, stderrPromise, runProcess.wait()]);
       return { stdout, code };
     };
-    const { stdout, code } = options.invoke
-      ? await options.invoke(execute)
-      : await execute(options.command, options.env, options.timeoutSeconds, () => {});
-
-    const activeSandbox = sandbox;
-    const recoveryFailed = (error: unknown, archive?: Uint8Array): Error => {
-      const reason = error instanceof Error ? error.message.trim() : String(error);
-      options.stderr(`headless: modal result recovery failed: ${reason}\n`);
-      if (archive) {
-        reportSavedRecoveryArchive(options, activeSandbox, archive, workDir);
-      }
-      if (options.keepSandboxOnFailure) {
-        keepSandbox = true;
-        reportKeptSandbox(options, activeSandbox, sandboxLifetimeMs);
-      }
-      return new Error(`modal result recovery failed: ${reason}`);
-    };
-    let resultArchive: Uint8Array;
+    // Recover the remote workspace even when execution failed (stream error,
+    // wait() rejection): the agent may already have changed files.
+    let execution: ModalAttemptResult | undefined;
+    let executionError: unknown;
     try {
-      resultArchive = await captureRemoteArchive(sandbox, recoveryTimeoutMs);
+      execution = options.invoke
+        ? await options.invoke(execute)
+        : await execute(options.command, options.env, options.timeoutSeconds, () => {});
     } catch (error) {
-      throw recoveryFailed(error);
-    }
-    let sync: WorkspaceSyncResult;
-    try {
-      extractArchiveLocally(resultArchive, resultDir);
-      sync = syncWorkspace({ baselineDir, resultDir, workDir });
-    } catch (error) {
-      throw recoveryFailed(error, resultArchive);
-    }
-    for (const conflict of sync.conflicts) {
-      options.stderr(`headless: modal sync skipped local conflict: ${conflict}\n`);
+      executionError = error;
     }
 
-    return { code, stdout, conflicts: sync.conflicts };
+    const recovery = await recoverRemoteWorkspace({
+      baselineDir,
+      limits,
+      options,
+      recoveryTimeoutMs,
+      resultDir,
+      sandbox,
+      sandboxLifetimeMs,
+      workDir,
+    });
+    keepSandbox = !recovery.terminate;
+    if (executionError !== undefined) {
+      throw executionError;
+    }
+    if (recovery.failure) {
+      throw new Error(`modal result recovery failed: ${recovery.failure}`);
+    }
+    return { code: execution!.code, stdout: execution!.stdout, conflicts: recovery.conflicts };
   } finally {
     stdoutDrainController.abort();
     if (sandbox && !keepSandbox) {
@@ -401,39 +424,105 @@ export async function executeModalAgent(options: ExecuteModalOptions): Promise<E
   }
 }
 
+interface RemoteRecovery {
+  conflicts: string[];
+  /** Why the result could not be applied, if it could not. */
+  failure?: string;
+  /** False while the remote work exists only in the sandbox (or --modal-keep-sandbox applies). */
+  terminate: boolean;
+}
+
+/**
+ * Downloads the remote workspace to a private bounded file, validates and
+ * extracts it, and applies it. The sandbox may be terminated only when the
+ * result was fully applied or the archive is durably saved locally; with
+ * --modal-keep-sandbox it is kept whenever anything was left unapplied.
+ */
+async function recoverRemoteWorkspace(context: {
+  baselineDir: string;
+  limits: { archiveBytes: number; extractedBytes: number };
+  options: ExecuteModalOptions;
+  recoveryTimeoutMs: number;
+  resultDir: string;
+  sandbox: ModalSandboxLike;
+  sandboxLifetimeMs: number;
+  workDir: string;
+}): Promise<RemoteRecovery> {
+  const { options, sandbox } = context;
+  const scratch = mkdtempSync(join(tmpdir(), "headless-modal-archive-"));
+  const archivePath = join(scratch, "result.tar.gz");
+  try {
+    let failure: string | undefined;
+    let downloaded = false;
+    let conflicts: string[] = [];
+    try {
+      await captureRemoteArchiveToFile(sandbox, context.recoveryTimeoutMs, archivePath, context.limits.archiveBytes);
+      downloaded = true;
+      await validateArchiveFile(archivePath, context.limits.extractedBytes);
+      extractArchiveFile(archivePath, context.resultDir);
+      conflicts = syncWorkspace({ baselineDir: context.baselineDir, resultDir: context.resultDir, workDir: context.workDir }).conflicts;
+    } catch (error) {
+      failure = error instanceof Error ? error.message.trim() : String(error);
+    }
+
+    if (failure) {
+      options.stderr(`headless: modal result recovery failed: ${failure}\n`);
+    }
+    for (const conflict of conflicts) {
+      options.stderr(`headless: modal sync skipped local conflict: ${conflict}\n`);
+    }
+    const unapplied = Boolean(failure) || conflicts.length > 0;
+    let saved = !unapplied;
+    if (unapplied && downloaded) {
+      saved = reportSavedRecoveryArchive(options, sandbox, archivePath, context.workDir);
+    }
+    const keep = !saved || (unapplied && Boolean(options.keepSandboxOnFailure));
+    if (keep) {
+      reportKeptSandbox(options, sandbox, context.sandboxLifetimeMs, !saved);
+    }
+    return { conflicts, failure, terminate: !keep };
+  } finally {
+    rmSync(scratch, { force: true, recursive: true });
+  }
+}
+
+/** Saves the downloaded archive durably and says how to use it; false when it could not be saved. */
 function reportSavedRecoveryArchive(
   options: ExecuteModalOptions,
   sandbox: ModalSandboxLike,
-  archive: Uint8Array,
+  archivePath: string,
   workDir: string,
-): void {
+): boolean {
   let path: string;
   try {
-    path = saveRecoveryArchive(options.env, sandbox.sandboxId, archive);
+    path = saveRecoveryArchive(options.env, sandbox.sandboxId, archivePath);
   } catch (error) {
     options.stderr(
       `headless: could not save the Modal workspace archive: ${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return;
+    return false;
   }
   const extractDir = path.replace(/\.tar\.gz$/, "");
   options.stderr(
     [
-      `headless: saved the remote Modal workspace (not applied to your work dir) to ${path}`,
+      `headless: saved the remote Modal workspace (not fully applied to your work dir) to ${path}`,
       "headless: extract it into a new directory, compare, and copy back what you need:",
       `headless:   mkdir ${quoteArg(extractDir)} && tar -xzf ${quoteArg(path)} -C ${quoteArg(extractDir)}`,
       `headless:   diff -r ${quoteArg(workDir)} ${quoteArg(extractDir)}`,
       "",
     ].join("\n"),
   );
+  return true;
 }
 
-function reportKeptSandbox(options: ExecuteModalOptions, sandbox: ModalSandboxLike, lifetimeMs: number): void {
+function reportKeptSandbox(options: ExecuteModalOptions, sandbox: ModalSandboxLike, lifetimeMs: number, unsaved: boolean): void {
   const id = sandbox.sandboxId ?? "(unknown id)";
   const hours = Math.round(lifetimeMs / 3_600_000);
   options.stderr(
     [
-      `headless: WARNING: Modal sandbox ${id} was left running (--modal-keep-sandbox).`,
+      unsaved
+        ? `headless: WARNING: the remote work was not saved locally, so Modal sandbox ${id} was left running.`
+        : `headless: WARNING: Modal sandbox ${id} was left running (--modal-keep-sandbox).`,
       `headless: it keeps billing until you terminate it, or until its ${hours}h lifetime from creation ends.`,
       `headless: terminate it from the Modal dashboard, or with the Modal JS SDK:`,
       `headless:   await (await new ModalClient().sandboxes.fromId(${JSON.stringify(id)})).terminate()`,
@@ -442,7 +531,7 @@ function reportKeptSandbox(options: ExecuteModalOptions, sandbox: ModalSandboxLi
   );
 }
 
-function saveRecoveryArchive(env: Env, sandboxId: string | undefined, archive: Uint8Array): string {
+function saveRecoveryArchive(env: Env, sandboxId: string | undefined, archivePath: string): string {
   const dir = join(env.HOME || homedir(), ".headless", "modal-recovery");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = lstatSync(dir);
@@ -453,8 +542,38 @@ function saveRecoveryArchive(env: Env, sandboxId: string | undefined, archive: U
   const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
   const shortId = (sandboxId?.replace(/[^A-Za-z0-9]/g, "").slice(-8)) || randomBytes(4).toString("hex");
   const path = join(dir, `${timestamp}-${shortId}.tar.gz`);
-  writeFileSync(path, archive, { flag: "wx", mode: 0o600 });
+  const source = openSync(archivePath, "r");
+  const target = openSync(path, "wx", 0o600);
+  try {
+    const buffer = Buffer.alloc(1024 * 1024);
+    let position = 0;
+    for (;;) {
+      const read = readSync(source, buffer, 0, buffer.length, position);
+      if (read === 0) break;
+      writeSync(target, buffer, 0, read);
+      position += read;
+    }
+    fsyncSync(target);
+  } catch (error) {
+    closeSync(target);
+    rmSync(path, { force: true });
+    throw error;
+  } finally {
+    closeSync(source);
+  }
+  closeSync(target);
+  fsyncDirectory(dir);
   return path;
+}
+
+function fsyncDirectory(dir: string): void {
+  if (process.platform === "win32") return; // Directories cannot be opened for fsync there.
+  const fd = openSync(dir, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function createModalClient(): Promise<ModalClientLike> {
@@ -700,7 +819,12 @@ async function runRemoteTar(
   return typeof stdout === "string" ? stdout : "";
 }
 
-async function captureRemoteArchive(sandbox: ModalSandboxLike, timeoutMs: number): Promise<Uint8Array> {
+async function captureRemoteArchiveToFile(
+  sandbox: ModalSandboxLike,
+  timeoutMs: number,
+  path: string,
+  maxBytes: number,
+): Promise<void> {
   const process = await sandbox.exec([remoteTarCommand, "-czf", "-", "-C", remoteWorkDir, "."], {
     mode: "binary",
     stderr: "pipe",
@@ -708,15 +832,72 @@ async function captureRemoteArchive(sandbox: ModalSandboxLike, timeoutMs: number
     timeoutMs,
     workdir: remoteWorkDir,
   });
-  const [stdout, stderr, code] = await Promise.all([
-    readBytes(process.stdout as ModalReadStreamLike<Uint8Array>),
-    readTextStream(process.stderr),
-    process.wait(),
-  ]);
-  if (code !== 0) {
-    throw new Error(stderr || "could not download Modal workspace archive");
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    const [, stderr, code] = await Promise.all([
+      writeBoundedStream(process.stdout as ModalReadStreamLike<Uint8Array>, fd, maxBytes),
+      readTextStream(process.stderr),
+      process.wait(),
+    ]);
+    if (code !== 0) {
+      throw new Error(stderr || "could not download Modal workspace archive");
+    }
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
-  return stdout;
+}
+
+/** Writes a sandbox stream to a file, failing once it exceeds maxBytes. */
+async function writeBoundedStream(stream: ModalReadStreamLike<Uint8Array>, fd: number, maxBytes: number): Promise<void> {
+  let total = 0;
+  const write = (chunk: Uint8Array) => {
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      throw new Error(`Modal workspace archive exceeds ${maxBytes} bytes (${MODAL_MAX_ARCHIVE_BYTES_ENV})`);
+    }
+    writeSync(fd, chunk);
+  };
+  if (!stream.getReader) {
+    write((await stream.readBytes?.()) ?? new Uint8Array());
+    return;
+  }
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      write(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Validates a gzipped tar file while streaming it, bounding the decompressed size. */
+async function validateArchiveFile(path: string, maxExtractedBytes: number): Promise<void> {
+  const validator = new TarEntryValidator(maxExtractedBytes);
+  const gunzip = createReadStream(path).pipe(createGunzip());
+  try {
+    for await (const chunk of gunzip) {
+      validator.push(chunk as Buffer);
+      if (validator.complete) break;
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("unsafe Modal workspace archive entry")) throw error;
+    throw new Error("could not inspect Modal workspace archive");
+  } finally {
+    gunzip.destroy();
+  }
+  validator.finish();
+}
+
+function extractArchiveFile(path: string, dir: string): void {
+  const result = spawnSync(localTarCommand, ["-xzf", path, "-C", dir], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.error?.message || "could not extract Modal workspace archive");
+  }
 }
 
 function validateArchiveEntries(archive: Uint8Array): void {
@@ -726,58 +907,120 @@ function validateArchiveEntries(archive: Uint8Array): void {
   } catch {
     throw new Error("could not inspect Modal workspace archive");
   }
+  const validator = new TarEntryValidator(Number.POSITIVE_INFINITY);
+  validator.push(data);
+  validator.finish();
+}
 
-  let offset = 0;
-  let nextLongName: string | undefined;
-  let nextPaxPath: string | undefined;
-  while (offset + 512 <= data.length) {
-    const header = data.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) {
-      return;
+const maxTarMetadataBytes = 1024 * 1024;
+
+/**
+ * Incremental tar header check: every entry path is relative without "..",
+ * only regular files, directories and symlinks, honouring GNU long names and
+ * pax path/size overrides so entry boundaries match what tar will see.
+ */
+class TarEntryValidator {
+  complete = false;
+  private pending: Buffer = Buffer.alloc(0);
+  private skip = 0;
+  private meta?: { type: string; size: number; padded: number };
+  private nextLongName?: string;
+  private nextPaxPath?: string;
+  private nextPaxSize?: number;
+  private total = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  push(chunk: Buffer): void {
+    this.total += chunk.byteLength;
+    if (this.total > this.maxBytes) {
+      throw new Error(
+        `unsafe Modal workspace archive entry: archive expands beyond ${this.maxBytes} bytes (${MODAL_MAX_EXTRACTED_BYTES_ENV})`,
+      );
     }
+    if (this.complete) return;
+    let buf = this.pending.length > 0 ? Buffer.concat([this.pending, chunk]) : chunk;
+    let offset = 0;
+    while (!this.complete) {
+      if (this.skip > 0) {
+        const n = Math.min(this.skip, buf.length - offset);
+        this.skip -= n;
+        offset += n;
+        if (this.skip > 0) break;
+        continue;
+      }
+      if (this.meta) {
+        if (buf.length - offset < this.meta.padded) break;
+        this.readMeta(buf.subarray(offset, offset + this.meta.size), this.meta.type);
+        offset += this.meta.padded;
+        this.meta = undefined;
+        continue;
+      }
+      if (buf.length - offset < 512) break;
+      this.readHeader(buf.subarray(offset, offset + 512));
+      offset += 512;
+    }
+    this.pending = Buffer.from(buf.subarray(offset));
+    buf = Buffer.alloc(0);
+  }
 
-    const type = readTarString(header, 156, 1) || "0";
-    const size = readTarSize(header);
-    const contentStart = offset + 512;
-    const contentEnd = contentStart + size;
-    if (contentEnd > data.length) {
+  finish(): void {
+    if (this.complete) return;
+    if (this.skip > 0 || this.meta || this.pending.length > 0) {
       throw new Error("unsafe Modal workspace archive entry: truncated archive");
     }
+    throw new Error("unsafe Modal workspace archive entry: missing end marker");
+  }
 
-    if (type === "L") {
-      nextLongName = readNullTerminated(data.subarray(contentStart, contentEnd));
-      offset = nextTarOffset(contentEnd);
-      continue;
+  private readHeader(header: Buffer): void {
+    if (header.every((byte) => byte === 0)) {
+      this.complete = true;
+      return;
     }
-    if (type === "x") {
-      nextPaxPath = parsePaxRecords(data.subarray(contentStart, contentEnd)).path;
-      offset = nextTarOffset(contentEnd);
-      continue;
-    }
-    if (type === "g") {
-      const records = parsePaxRecords(data.subarray(contentStart, contentEnd));
-      if (records.path !== undefined) {
-        throw new Error("unsafe Modal workspace archive entry: global pax path is not supported");
+    const type = readTarString(header, 156, 1) || "0";
+    const size = this.nextPaxSize ?? readTarSize(header);
+    const padded = Math.ceil(size / 512) * 512;
+    if (type === "L" || type === "x" || type === "g") {
+      if (size > maxTarMetadataBytes) {
+        throw new Error("unsafe Modal workspace archive entry: oversized metadata header");
       }
-      offset = nextTarOffset(contentEnd);
-      continue;
+      this.meta = { type, size, padded };
+      return;
     }
-
     const prefix = readTarString(header, 345, 155);
-    const name = nextPaxPath ?? nextLongName ?? [prefix, readTarString(header, 0, 100)].filter(Boolean).join("/");
-    nextLongName = undefined;
-    nextPaxPath = undefined;
+    const name = this.nextPaxPath ?? this.nextLongName ?? [prefix, readTarString(header, 0, 100)].filter(Boolean).join("/");
+    this.nextLongName = undefined;
+    this.nextPaxPath = undefined;
+    this.nextPaxSize = undefined;
     if (!isSafeArchivePath(name)) {
       throw new Error(`unsafe Modal workspace archive entry: ${name}`);
     }
     if (!["0", "\0", "2", "5"].includes(type)) {
       throw new Error(`unsafe Modal workspace archive entry: unsupported type ${type || "unknown"} for ${name}`);
     }
-
-    offset = nextTarOffset(contentEnd);
+    this.skip = padded;
   }
 
-  throw new Error("unsafe Modal workspace archive entry: missing end marker");
+  private readMeta(data: Buffer, type: string): void {
+    if (type === "L") {
+      this.nextLongName = readNullTerminated(data);
+      return;
+    }
+    const records = parsePaxRecords(data);
+    if (type === "g") {
+      if (records.path !== undefined || records.size !== undefined) {
+        throw new Error("unsafe Modal workspace archive entry: global pax path or size is not supported");
+      }
+      return;
+    }
+    this.nextPaxPath = records.path;
+    if (records.size !== undefined) {
+      if (!/^\d+$/.test(records.size)) {
+        throw new Error("unsafe Modal workspace archive entry: invalid pax size");
+      }
+      this.nextPaxSize = Number(records.size);
+    }
+  }
 }
 
 function readTarString(header: Buffer, start: number, length: number): string {
@@ -820,10 +1063,6 @@ function parsePaxRecords(data: Buffer): Record<string, string> {
     offset += length;
   }
   return records;
-}
-
-function nextTarOffset(contentEnd: number): number {
-  return Math.ceil(contentEnd / 512) * 512;
 }
 
 function isSafeArchivePath(path: string): boolean {
