@@ -1007,6 +1007,10 @@ class TarEntryValidator {
       return;
     }
     const records = parsePaxRecords(data);
+    // GNU sparse files expand to a declared size the payload does not bound.
+    if (Object.keys(records).some((key) => key.startsWith("GNU.sparse."))) {
+      throw new Error("unsafe Modal workspace archive entry: sparse files are not supported");
+    }
     if (type === "g") {
       if (records.path !== undefined || records.size !== undefined) {
         throw new Error("unsafe Modal workspace archive entry: global pax path or size is not supported");
@@ -1571,7 +1575,24 @@ function snapshotPath(root: string, relPath: string): FileState | undefined {
   if (!stat.isFile()) {
     return undefined;
   }
-  return { hash: createHash("sha256").update(readFileSync(path)).digest("hex"), mode, type: "file" };
+  return { hash: hashFile(path), mode, type: "file" };
+}
+
+/** Hashes a file in bounded chunks instead of reading it into memory whole. */
+function hashFile(path: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(1024 * 1024);
+    for (;;) {
+      const read = readSync(fd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
 }
 
 function sameState(left: FileState | undefined, right: FileState | undefined): boolean {

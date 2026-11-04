@@ -1057,6 +1057,31 @@ test("Modal bounds the downloaded and the extracted archive size", async () => {
   }
 });
 
+test("Modal refuses sparse result entries in pax and GNU formats", async () => {
+  for (const format of ["pax", "gnu"]) {
+    const { dir, work, remote } = setupRecoveryWorkdir(`headless-modal-recovery-sparse-${format}-`);
+    try {
+      const source = join(dir, "sparse-source");
+      mkdirSync(source);
+      // 1 GiB logical size, almost no payload.
+      assert.equal(spawnSync("truncate", ["-s", "1G", join(source, "huge.bin")]).status, 0);
+      const archive = spawnSync("tar", ["--sparse", `--format=${format}`, "-czf", "-", "-C", source, "."], { encoding: "buffer" });
+      assert.equal(archive.status, 0, archive.stderr?.toString());
+      assert.ok(archive.stdout.byteLength < 100_000);
+      const sandbox = new FakeSandbox(remote, { resultArchive: archive.stdout });
+      const stderr: string[] = [];
+      await assert.rejects(
+        () => executeModalAgent(modalRecoveryOptions(dir, work, sandbox, stderr)),
+        /sparse files are not supported|unsupported type S/,
+      );
+      assert.equal(existsSync(join(work, "huge.bin")), false);
+      assert.match(stderr.join(""), /saved the remote Modal workspace/);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  }
+});
+
 test("--modal-keep-sandbox leaves the sandbox running and prints its id when recovery fails", async () => {
   const { dir, work, remote } = setupRecoveryWorkdir("headless-modal-recovery-keep-");
   try {
