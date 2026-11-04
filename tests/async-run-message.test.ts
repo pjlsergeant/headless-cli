@@ -91,7 +91,7 @@ async function startAsyncMessage(env: Env): Promise<void> {
   );
 }
 
-test("async run message preserves ownership while a signaled agent remains alive", { skip: process.platform === "win32" }, async () => {
+test("async run message keeps ownership until a signaled agent that ignores SIGTERM is killed", { skip: process.platform === "win32" }, async () => {
   const processDirectory = mkdtempSync(join(tmpdir(), "headless-async-agent-test-"));
   const agentProcessFile = join(processDirectory, "agent-process.json");
   const signalFile = join(processDirectory, "agent-signal");
@@ -111,6 +111,7 @@ test("async run message preserves ownership while a signaled agent remains alive
   const { directory, env } = await createFixture(agentSource, {
     HEADLESS_AGENT_PROCESS: agentProcessFile,
     HEADLESS_AGENT_SIGNAL: signalFile,
+    HEADLESS_KILL_GRACE_MS: "1500",
   });
   let agentPid: number | undefined;
   let cliPid: number | undefined;
@@ -127,14 +128,23 @@ test("async run message preserves ownership while a signaled agent remains alive
 
     process.kill(cliPid!, "SIGTERM");
     await waitFor(() => existsSync(signalFile));
-    await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
+    // The agent ignores SIGTERM: while it lives the CLI stays up and the node
+    // stays locked; after the grace period it is SIGKILLed and ownership ends.
     assert.equal(processAlive(agentPid!), true);
+    assert.notEqual(readRun(env, "auth")?.nodes["worker-1"].status, "failed");
     assert.throws(() => acquireNodeLock(env, "auth", "worker-1"), /node is locked: worker-1/);
 
-    process.kill(agentPid!, "SIGKILL");
-    await waitFor(() => !processAlive(agentPid!));
+    await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
+    assert.equal(processAlive(agentPid!), false);
     agentPid = undefined;
-    acquireNodeLock(env, "auth", "worker-1")();
+    await waitFor(() => {
+      try {
+        acquireNodeLock(env, "auth", "worker-1")();
+        return true;
+      } catch {
+        return false;
+      }
+    });
   } finally {
     if (agentPid && processAlive(agentPid)) process.kill(agentPid, "SIGKILL");
     if (cliPid && processAlive(cliPid)) process.kill(cliPid, "SIGKILL");

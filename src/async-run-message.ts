@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 
-import { windowsTaskkillPath } from "./process-tree.js";
+import { killGraceMs, signalProcessGroup, terminateProcessGroup, windowsTaskkillPath } from "./process-tree.js";
 import {
   handoffNodeStoreLockOwner,
   nodeStoreLockHasLiveSuccessor,
@@ -34,6 +34,7 @@ export type AsyncRunMessageResponse =
 let task: AsyncRunMessageTask | undefined;
 let releaseLock: (() => void) | undefined;
 let activeChild: ChildProcess | undefined;
+let activeChildTermination: Promise<NodeJS.Signals> | undefined;
 let started = false;
 let finished = false;
 
@@ -82,7 +83,16 @@ function terminateActiveChild(signal: NodeJS.Signals): void {
       return;
     }
   }
-  activeChild.kill(signal);
+  // The CLI leads its own process group and keeps the agent inside it, so
+  // signal the whole group and SIGKILL it if anything outlives the grace.
+  if (signal === "SIGKILL" || activeChildTermination) {
+    signalProcessGroup(activeChild, signal);
+    return;
+  }
+  activeChildTermination = terminateProcessGroup(activeChild, {
+    signal,
+    graceMs: killGraceMs(process.env),
+  });
 }
 
 function failBeforeStart(message: string): void {
