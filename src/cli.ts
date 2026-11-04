@@ -130,7 +130,6 @@ import {
 } from "./runs.js";
 import {
   readStoredSession,
-  SECURE_SESSION_STORE_ENV,
   sessionStorePath,
   writeStoredSession,
   writeStoredTmuxSession,
@@ -4801,9 +4800,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         ensureDockerSessionProfileDirectory(dockerSessionHome);
       }
     }
-    const sessionEnv = dockerSessionHome
-      ? { ...env, HOME: dockerSessionHome, [SECURE_SESSION_STORE_ENV]: "1" }
-      : env;
+    const sessionEnv = dockerSessionHome ? { ...env, HOME: dockerSessionHome } : env;
     let sessionPlan = buildSessionPlan(parsed.agent, sessionAlias, sessionEnv, parsed.profile);
     const effectiveProfile = sessionPlan?.profile ?? profile;
     const billingOptions = { ...billingPreviewOptions, profile: effectiveProfile };
