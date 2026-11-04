@@ -1972,6 +1972,18 @@ async function executeCommand(
         env: childEnv as NodeJS.ProcessEnv,
         stdio,
       });
+      // Report the agent's group to a supervisor (cron) synchronously, before
+      // anything else runs, so it can reach the agent directly even if this
+      // headless process is SIGKILLed before it can forward anything. The
+      // only remaining gap is a kill between fork() and this write.
+      const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
+      if (agentPgidFile && ownsChildProcessGroup && child.pid) {
+        try {
+          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
+        } catch {
+          // Best effort: the supervisor still sweeps this process's own group.
+        }
+      }
 
       // The tree to terminate. Async worker mode shares this process's group
       // with the agent, so the group is signalled member by member with this
@@ -1987,16 +1999,6 @@ async function executeCommand(
         }
         tree.signal(signal);
       };
-      const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
-      if (agentPgidFile && ownsChildProcessGroup && child.pid) {
-        // Lets a supervisor (cron) reach the agent's group directly even if
-        // this headless process is SIGKILLed before it can forward anything.
-        try {
-          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
-        } catch {
-          // Best effort: the supervisor still signals this process's group.
-        }
-      }
 
       // Unified bounded shutdown: signal now, SIGKILL after one grace, give up
       // waiting after a second grace. All timers stay referenced so headless

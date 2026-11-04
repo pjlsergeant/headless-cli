@@ -572,3 +572,107 @@ test("cron reconcile treats a zombie headless as dead and sweeps its agent group
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+/**
+ * Stand-in for headless under the cron daemon: starts an "agent" in its own
+ * group (reported via HEADLESS_AGENT_PGID_FILE unless FAKE_NO_PGID=1) and a
+ * helper in headless's own group, records both PIDs, then exits 0 or, with
+ * FAKE_SELF_KILL=1, SIGKILLs itself like an OOM kill.
+ */
+function writeFakeCronHeadless(env: NodeJS.ProcessEnv, pidsFile: string): void {
+  const keepAlive = "setInterval(() => {}, 1000)";
+  writeFileSync(env.HEADLESS_CLI_BIN as string, [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    `const agent = spawn(process.execPath, ['-e', ${JSON.stringify(keepAlive)}], { detached: true, stdio: 'ignore' });`,
+    `const helper = spawn(process.execPath, ['-e', ${JSON.stringify(keepAlive)}], { stdio: 'ignore' });`,
+    "if (process.env.FAKE_NO_PGID !== '1') writeFileSync(process.env.HEADLESS_AGENT_PGID_FILE, agent.pid + '\\n');",
+    `writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ agent: agent.pid, helper: helper.pid }));`,
+    "agent.unref(); helper.unref();",
+    "setTimeout(() => process.env.FAKE_SELF_KILL === '1' ? process.kill(process.pid, 'SIGKILL') : process.exit(0), 300);",
+    "",
+  ].join("\n"), { mode: 0o755 });
+}
+
+function cronProcessGone(pid: number): boolean {
+  if (!processAlive(pid)) return true;
+  try {
+    return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.startsWith("Z") ?? false;
+  } catch {
+    return true;
+  }
+}
+
+async function runFakeCronExecution(
+  extraArgs: string[],
+  fakeEnv: NodeJS.ProcessEnv,
+): Promise<{ agentGone: boolean; helperGone: boolean; cleanup: () => void }> {
+  const dir = mkdtempSync(join(tmpdir(), "headless-cron-test-"));
+  const pidsFile = join(dir, "pids.json");
+  const env = { ...testEnv(dir), HEADLESS_KILL_GRACE_MS: "300", ...fakeEnv };
+  writeFakeCronHeadless(env, pidsFile);
+  recordCronJob(env, {
+    agent: "codex",
+    command: { args: ["codex", "--prompt", "tick", ...extraArgs], workDir: dir },
+    id: "sweep",
+    schedule: parseCronSchedule({ every: "1h" }),
+    now: new Date("2026-05-15T12:00:00.000Z"),
+  });
+  await runDueCronJobsOnce(env, new Date("2026-05-15T13:00:01.000Z"));
+  await waitFor(() => readCronJob(env, "sweep")?.activeExecutionId === null);
+  const pids = JSON.parse(readFileSync(pidsFile, "utf8")) as { agent: number; helper: number };
+  const result = { agentGone: cronProcessGone(pids.agent), helperGone: cronProcessGone(pids.helper) };
+  return {
+    ...result,
+    cleanup: () => {
+      for (const pid of [pids.agent, pids.helper]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+      rmSync(dir, { force: true, recursive: true });
+    },
+  };
+}
+
+test("cron leaves a --keep-background job's processes running after an ordinary exit", { skip: process.platform === "win32" }, async () => {
+  const run = await runFakeCronExecution(["--keep-background"], {});
+  try {
+    assert.equal(run.agentGone, false, "cron swept the agent group despite --keep-background");
+  } finally {
+    run.cleanup();
+  }
+});
+
+test("cron sweeps the agent group after an ordinary exit without --keep-background", { skip: process.platform === "win32" }, async () => {
+  const run = await runFakeCronExecution([], {});
+  try {
+    assert.equal(run.agentGone, true);
+  } finally {
+    run.cleanup();
+  }
+});
+
+test("cron sweeps headless's own group and the agent group when headless is SIGKILLed, even with --keep-background", { skip: process.platform === "win32" }, async () => {
+  const run = await runFakeCronExecution(["--keep-background"], { FAKE_SELF_KILL: "1" });
+  try {
+    assert.equal(run.agentGone, true, "agent group survived its SIGKILLed headless");
+    assert.equal(run.helperGone, true, "headless's own group survived");
+  } finally {
+    run.cleanup();
+  }
+});
+
+test("cron sweeps headless's own group when headless dies before reporting agent.pgid", { skip: process.platform === "win32" }, async () => {
+  const run = await runFakeCronExecution([], { FAKE_SELF_KILL: "1", FAKE_NO_PGID: "1" });
+  try {
+    assert.equal(run.helperGone, true, "headless's own group survived");
+    // The unreported agent group is the documented residual window.
+    assert.equal(run.agentGone, false);
+  } finally {
+    run.cleanup();
+  }
+});

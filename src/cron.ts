@@ -287,11 +287,19 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     updatedAt: now.toISOString(),
   });
 
+  const headlessPid = child.pid;
   child.on("close", (code, signal) => {
     closeLogs();
-    // If headless died without cleaning up (SIGKILL, OOM), its agent group
-    // may still be running: sweep it before recording the outcome.
-    void sweepOrphanedAgent(env, job.id, executionId).finally(() => {
+    // headless killed by a signal (SIGKILL, OOM) could not clean up: sweep
+    // its own group and its agent's group. After an ordinary exit headless
+    // already cleaned up, so only sweep its agent group as a safety net, and
+    // not at all when the job asked to keep background processes.
+    const abnormal = signal !== null;
+    if (!abnormal && cronArgsKeepBackground(job.command.args)) {
+      finishCronExecution(env, job.id, executionId, code ?? null, null);
+      return;
+    }
+    void sweepOrphanedAgent(env, job.id, executionId, abnormal ? headlessPid : undefined).finally(() => {
       finishCronExecution(env, job.id, executionId, code ?? null, signal ?? null);
     });
   });
@@ -568,12 +576,31 @@ function refreshAgentPgid(env: Env, jobId: string, execution: CronExecutionRecor
   return refreshed;
 }
 
-async function sweepOrphanedAgent(env: Env, jobId: string, executionId: string): Promise<void> {
+async function sweepOrphanedAgent(
+  env: Env,
+  jobId: string,
+  executionId: string,
+  headlessPid?: number,
+): Promise<void> {
   const agentPgid = readAgentPgid(env, jobId, executionId);
-  if (agentPgid === undefined) return;
-  // TODO(phase-2): verify the stored PGID's identity before signalling.
-  const tree = new ProcessTree({ groups: [agentPgid], roots: [agentPgid], exclude: [process.pid] });
+  // headless's own detached group catches anything it started besides the
+  // agent; the agent's separate group is reachable only through agent.pgid.
+  const ids = [agentPgid, headlessPid].filter((id): id is number => id !== undefined && id > 0);
+  if (ids.length === 0) return;
+  // TODO(phase-2): verify the stored PID/PGID identities before signalling.
+  const tree = new ProcessTree({ groups: ids, roots: ids, exclude: [process.pid] });
   if (tree.alive()) await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
+}
+
+const cronValueOptions = new Set([
+  "--prompt", "--prompt-file", "--model", "--profile", "--reasoning-effort", "--allow", "--work-dir",
+  "--docker-image", "--docker-arg", "--docker-env", "--modal-app", "--modal-cpu", "--modal-env",
+  "--modal-image", "--modal-image-secret", "--modal-memory", "--modal-secret", "--modal-timeout", "--timeout",
+]);
+
+/** True when a scheduled invocation carries --keep-background as a flag (not as an option value). */
+function cronArgsKeepBackground(args: readonly string[]): boolean {
+  return args.some((arg, index) => arg === "--keep-background" && !cronValueOptions.has(args[index - 1] ?? ""));
 }
 
 function acquireDaemonLock(env: Env): () => void {
