@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Fixed Modal sync-back: symlink targets containing a backslash are refused, every sandbox symlink is checked against the final tree before anything is changed locally, and paths that differ from a local path only by case or Unicode normalisation are treated as conflicts.
 - Fixed prompts starting with "-" (such as markdown lists) being parsed as options by the agent CLI: Claude (one-shot and interactive) and interactive Codex now get the prompt after `--`, and Gemini one-shot reads inline prompts from stdin.
 - Fixed Docker runs mounting all of `~/.aws` when `AWS_PROFILE` is forwarded: like Modal, the container now gets only the selected profile (and its `sso-session`), staged in a private temporary directory removed after the run. The SSO token cache is no longer available in the container.
 - Fixed ACP file reads being unconfined: `fs/read_text_file` requests from an ACP server are now limited to the invocation work dir (resolved through symlinks), under every `--allow` mode; other paths are refused with an error the server sees.

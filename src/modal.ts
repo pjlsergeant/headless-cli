@@ -12,11 +12,12 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 
@@ -970,16 +971,32 @@ async function readBytes(stream: ModalReadStreamLike<Uint8Array>): Promise<Uint8
   return output;
 }
 
-export function syncWorkspace(options: { baselineDir: string; resultDir: string; workDir: string }): WorkspaceSyncResult {
+interface SyncOp {
+  relPath: string;
+  before?: FileState;
+  after?: FileState;
+  local?: FileState;
+}
+
+export function syncWorkspace(options: {
+  baselineDir: string;
+  resultDir: string;
+  workDir: string;
+  /** Test seam; detected from the work dir's filesystem when omitted. */
+  caseInsensitive?: boolean;
+}): WorkspaceSyncResult {
   const baseline = snapshotTree(options.baselineDir);
   const result = snapshotTree(options.resultDir);
   const localTree = snapshotTree(options.workDir);
+  const fold = pathFolder(options.workDir, options.caseInsensitive);
+  const collides = collisionChecker(fold, [baseline.keys(), result.keys(), localTree.keys()]);
   const allPaths = new Set([...baseline.keys(), ...result.keys()]);
   const changed: string[] = [];
   const conflicts: string[] = [];
   const replacedAncestors = new Set<string>();
-  const createdLinks: string[] = [];
+  const ops: SyncOp[] = [];
 
+  // Plan every change before touching the work dir.
   for (const relPath of [...allPaths].sort()) {
     if (hasReplacedAncestor(relPath, replacedAncestors)) {
       continue;
@@ -998,6 +1015,13 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       conflicts.push(relPath);
       continue;
     }
+    // On a case- or normalisation-insensitive filesystem a differently
+    // spelled path is the same file: never touch it.
+    if (collides(relPath)) {
+      conflicts.push(relPath);
+      replacedAncestors.add(relPath);
+      continue;
+    }
     const local = localTree.get(relPath);
     if (!before && local) {
       conflicts.push(relPath);
@@ -1012,14 +1036,50 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       replacedAncestors.add(relPath);
       continue;
     }
+    if (after?.type === "symlink" && !isSafeLinkText(after.target ?? "")) {
+      conflicts.push(relPath);
+      continue;
+    }
+    ops.push({ relPath, before, after, local });
+    if (before?.type === "directory" && after?.type !== "directory") {
+      replacedAncestors.add(relPath);
+    }
+  }
+
+  // Judge every sandbox symlink against the tree as it would be once all
+  // planned changes are applied. Dropping a rejected link changes that tree,
+  // so repeat until nothing more is rejected. Nothing is mutated before this.
+  const rejected = new Set<string>();
+  if (ops.some((op) => op.after?.type === "symlink")) {
+    for (;;) {
+      const tree = virtualTree(localTree, ops.filter((op) => !rejected.has(op.relPath)), fold);
+      let rejectedMore = false;
+      for (const op of ops) {
+        if (op.after?.type !== "symlink" || rejected.has(op.relPath)) continue;
+        if (!virtualLinkStaysInside(tree, op.relPath, op.after.target ?? "", fold)) {
+          rejected.add(op.relPath);
+          rejectedMore = true;
+        }
+      }
+      if (!rejectedMore) break;
+    }
+  }
+
+  const createdLinks: SyncOp[] = [];
+  for (const op of ops) {
+    const { relPath, after, local } = op;
+    if (rejected.has(relPath)) {
+      conflicts.push(relPath);
+      continue;
+    }
+    const localPath = resolve(options.workDir, relPath);
+    if (!parentRealPathIsWithin(options.workDir, localPath)) {
+      conflicts.push(relPath);
+      continue;
+    }
     if (!after) {
-      if (existsSync(localPath)) {
-        rmSync(localPath, { force: true, recursive: true });
-      }
+      removePathIfPresent(localPath);
       changed.push(relPath);
-      if (before?.type === "directory") {
-        replacedAncestors.add(relPath);
-      }
       continue;
     }
     mkdirSync(dirname(localPath), { recursive: true });
@@ -1030,46 +1090,170 @@ export function syncWorkspace(options: { baselineDir: string; resultDir: string;
       mkdirSync(localPath, { recursive: true, mode: after.mode });
       chmodSync(localPath, after.mode);
     } else if (after.type === "symlink") {
-      if (!symlinkTargetIsWithin(options.workDir, localPath, after.target ?? "")) {
-        conflicts.push(relPath);
-        continue;
-      }
       removePathIfPresent(localPath);
       symlinkSync(after.target ?? "", localPath);
-      createdLinks.push(relPath);
+      createdLinks.push(op);
     } else {
       removePathIfPresent(localPath);
       copyFileSync(join(options.resultDir, relPath), localPath);
       chmodSync(localPath, after.mode);
     }
     changed.push(relPath);
-    if (before?.type === "directory" && after.type !== "directory") {
-      replacedAncestors.add(relPath);
-    }
   }
 
-  // Links applied later can change how an earlier link's target resolves, so
-  // check every link created from the sandbox again against the final tree.
-  for (const relPath of createdLinks) {
-    const localPath = resolve(options.workDir, relPath);
+  // Check the created links again on the real filesystem. One that escapes
+  // after all is removed and its path restored from the baseline.
+  for (const op of createdLinks) {
+    const localPath = resolve(options.workDir, op.relPath);
     if (!symlinkTargetIsWithin(options.workDir, localPath, readlinkText(localPath))) {
-      rmSync(localPath, { force: true });
-      changed.splice(changed.indexOf(relPath), 1);
-      conflicts.push(relPath);
+      removePathIfPresent(localPath);
+      restoreBaselinePath(options.baselineDir, op.relPath, op.before, localPath);
+      changed.splice(changed.indexOf(op.relPath), 1);
+      conflicts.push(op.relPath);
     }
   }
 
   return { changed, conflicts };
 }
 
+function restoreBaselinePath(baselineDir: string, relPath: string, before: FileState | undefined, localPath: string): void {
+  if (!before) return;
+  const source = join(baselineDir, relPath);
+  if (before.type === "directory") {
+    cpSync(source, localPath, { recursive: true, verbatimSymlinks: true });
+  } else if (before.type === "symlink") {
+    symlinkSync(before.target ?? "", localPath);
+  } else {
+    copyFileSync(source, localPath);
+    chmodSync(localPath, before.mode);
+  }
+}
+
+// Sandbox link text is accepted only as a plain relative POSIX path: no
+// absolute paths, drive letters, backslashes (a name character on POSIX but
+// a separator on Windows, so checks and the created link could disagree) or NUL.
+function isSafeLinkText(target: string): boolean {
+  return Boolean(target) && !target.includes("\\") && !target.includes("\0") && !target.startsWith("/") &&
+    !isAbsolute(target) && !/^[A-Za-z]:/.test(target);
+}
+
+/**
+ * Folds paths the way the work dir's filesystem compares them: always NFC
+ * (macOS is normalisation-insensitive), and lower-cased unless the
+ * filesystem is known to be case-sensitive.
+ */
+function pathFolder(workDir: string, caseInsensitive?: boolean): (path: string) => string {
+  const insensitive = caseInsensitive ?? probeCaseInsensitive(workDir);
+  return (path) => {
+    const normalized = path.normalize("NFC");
+    return insensitive ? normalized.toLowerCase() : normalized;
+  };
+}
+
+function probeCaseInsensitive(workDir: string): boolean {
+  const name = basename(workDir);
+  const swapped = [...name].map((char) => (char === char.toLowerCase() ? char.toUpperCase() : char.toLowerCase())).join("");
+  if (swapped === name) {
+    return true; // Cannot tell from this name; assume the cautious answer.
+  }
+  try {
+    const original = statSync(workDir);
+    const other = statSync(join(dirname(workDir), swapped));
+    return original.ino === other.ino && original.dev === other.dev;
+  } catch {
+    return false;
+  }
+}
+
+/** True when a path or one of its ancestors also exists under another spelling that folds to the same name. */
+function collisionChecker(fold: (path: string) => string, sources: Iterable<string>[]): (relPath: string) => boolean {
+  const spellings = new Map<string, Set<string>>();
+  const add = (path: string) => {
+    const key = fold(path);
+    const set = spellings.get(key) ?? new Set<string>();
+    set.add(path);
+    spellings.set(key, set);
+  };
+  for (const source of sources) {
+    for (const path of source) add(path);
+  }
+  return (relPath) => {
+    const segments = relPath.split("/");
+    for (let index = 1; index <= segments.length; index += 1) {
+      if ((spellings.get(fold(segments.slice(0, index).join("/")))?.size ?? 0) > 1) return true;
+    }
+    return false;
+  };
+}
+
+type VirtualEntry = Pick<FileState, "type" | "target">;
+
+function virtualTree(localTree: Map<string, FileState>, ops: SyncOp[], fold: (path: string) => string): Map<string, VirtualEntry> {
+  const tree = new Map<string, VirtualEntry>();
+  for (const [path, state] of localTree) tree.set(fold(path), state);
+  const removeSubtree = (key: string) => {
+    tree.delete(key);
+    for (const other of [...tree.keys()]) {
+      if (other.startsWith(`${key}/`)) tree.delete(other);
+    }
+  };
+  for (const op of ops) {
+    const key = fold(op.relPath);
+    if (!op.after || op.after.type !== "directory") removeSubtree(key);
+    if (op.after) tree.set(key, op.after);
+  }
+  return tree;
+}
+
+/** Resolves a link through the simulated final tree; false when it leaves the work dir. */
+function virtualLinkStaysInside(
+  tree: Map<string, VirtualEntry>,
+  relPath: string,
+  target: string,
+  fold: (path: string) => string,
+): boolean {
+  return resolveVirtual(tree, relPath.split("/").slice(0, -1), target, fold, 0) !== undefined;
+}
+
+function resolveVirtual(
+  tree: Map<string, VirtualEntry>,
+  start: string[],
+  target: string,
+  fold: (path: string) => string,
+  depth: number,
+): string[] | undefined {
+  // Absolute targets (including local links the user made) count as leaving.
+  if (depth > 40 || !target || target.startsWith("/") || isAbsolute(target) || target.includes("\0")) {
+    return undefined;
+  }
+  let segments = [...start];
+  for (const part of target.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (segments.length === 0) return undefined;
+      segments.pop();
+      continue;
+    }
+    segments.push(part);
+    const entry = tree.get(fold(segments.join("/")));
+    if (entry?.type === "symlink") {
+      segments.pop();
+      const resolved = resolveVirtual(tree, segments, entry.target ?? "", fold, depth + 1);
+      if (!resolved) return undefined;
+      segments = resolved;
+    }
+  }
+  return segments;
+}
+
 // A symlink from the sandbox is applied only when its target stays inside the
 // work dir: never absolute, inside lexically, and inside once the existing
 // part of the path is resolved through the local filesystem.
 function symlinkTargetIsWithin(workDir: string, linkPath: string, target: string): boolean {
-  const normalized = target.split("\\").join("/");
-  if (!normalized || isAbsolute(target) || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) {
+  if (!isSafeLinkText(target)) {
     return false;
   }
+  const normalized = target;
   const parent = dirname(linkPath);
   if (!isWithin(workDir, resolve(parent, normalized))) {
     return false;

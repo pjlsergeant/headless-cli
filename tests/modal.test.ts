@@ -230,6 +230,84 @@ test("syncWorkspace refuses sandbox symlinks that point outside the work dir", (
   }
 });
 
+test("syncWorkspace refuses sandbox symlink targets containing a backslash", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-backslash-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(result);
+    mkdirSync(work);
+    symlinkSync("a\\b/../../secret", join(result, "sneaky"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts, ["sneaky"]);
+    assert.equal(isSymlink(join(work, "sneaky")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("syncWorkspace judges links against the final tree before deleting anything", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-final-tree-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    for (const root of [baseline, result, work]) mkdirSync(join(root, "a"), { recursive: true });
+    mkdirSync(join(result, "s"));
+    writeFileSync(join(baseline, "a", "x"), "precious");
+    writeFileSync(join(work, "a", "x"), "precious");
+    // Checked alone, a/x stays inside (s/self does not exist yet). Once
+    // s/self -> "." exists it resolves to s, and the two ".." leave the tree.
+    symlinkSync("../s/self/../../secret", join(result, "a", "x"));
+    symlinkSync(".", join(result, "s", "self"));
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work });
+
+    assert.deepEqual(sync.conflicts, ["a/x"]);
+    assert.equal(isSymlink(join(work, "a", "x")), false);
+    assert.equal(readFileSync(join(work, "a", "x"), "utf8"), "precious");
+    assert.equal(readlinkSync(join(work, "s", "self")), ".");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("syncWorkspace treats case and Unicode-normalisation collisions as conflicts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-sync-case-"));
+  try {
+    const baseline = join(dir, "baseline");
+    const result = join(dir, "result");
+    const work = join(dir, "work");
+    mkdirSync(baseline);
+    mkdirSync(join(result, "docs"), { recursive: true });
+    mkdirSync(join(work, "Docs"), { recursive: true });
+    writeFileSync(join(work, "README.md"), "local untracked");
+    writeFileSync(join(result, "readme.md"), "remote");
+    writeFileSync(join(work, "Docs", "guide.md"), "local guide");
+    writeFileSync(join(result, "docs", "guide.md"), "remote guide");
+    const nfc = "caf\u00e9.txt";
+    const nfd = "cafe\u0301.txt";
+    writeFileSync(join(work, nfc), "local cafe");
+    writeFileSync(join(result, nfd), "remote cafe");
+    writeFileSync(join(result, "fresh.txt"), "new");
+
+    const sync = syncWorkspace({ baselineDir: baseline, resultDir: result, workDir: work, caseInsensitive: true });
+
+    assert.deepEqual(sync.changed, ["fresh.txt"]);
+    assert.deepEqual(sync.conflicts.sort(), [nfd, "docs", "readme.md"].sort());
+    assert.equal(readFileSync(join(work, "README.md"), "utf8"), "local untracked");
+    assert.equal(readFileSync(join(work, "Docs", "guide.md"), "utf8"), "local guide");
+    assert.equal(readFileSync(join(work, nfc), "utf8"), "local cafe");
+    assert.equal(existsSync(join(work, "readme.md")) && readFileSync(join(work, "readme.md"), "utf8") === "remote", false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 function isSymlink(path: string): boolean {
   try {
     return lstatSync(path).isSymbolicLink();
