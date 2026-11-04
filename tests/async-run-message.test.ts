@@ -11,6 +11,7 @@ import { runCli } from "../src/cli.ts";
 import {
   acquireNodeLock,
   nodeLockPath,
+  nodeLogPath,
   readRun,
   registerNode,
   runDirectory,
@@ -84,6 +85,7 @@ async function createFixture(agentSource?: string, extraEnv: Env = {}): Promise<
   };
   registerNode(env, {
     runId: "auth",
+    sandbox: "none",
     nodeId: "worker-1",
     role: "worker",
     agent: "codex",
@@ -235,7 +237,7 @@ test("async run message releases handed-off ownership after normal completion", 
     await startAsyncMessage(env);
     await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status !== "busy");
     const node = readRun(env, "auth")?.nodes["worker-1"];
-    assert.equal(node?.status, "idle", readFileSync(node?.logs?.stderr ?? "", "utf8"));
+    assert.equal(node?.status, "idle", readFileSync(nodeLogPath(env, "auth", "worker-1", "stderr"), "utf8"));
     const lockPath = nodeLockPath(env, "auth", "worker-1");
     await waitFor(() => !existsSync(lockPath) && !existsSync(`${lockPath}.owner`));
     acquireNodeLock(env, "auth", "worker-1")();
@@ -250,7 +252,7 @@ test("async run message handles a missing agent without leaking its lock", async
     await startAsyncMessage(env);
     await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
     const node = readRun(env, "auth")?.nodes["worker-1"];
-    const stderr = readFileSync(node?.logs?.stderr ?? "", "utf8");
+    const stderr = readFileSync(nodeLogPath(env, "auth", "worker-1", "stderr"), "utf8");
     assert.match(stderr, /spawn codex ENOENT/);
     assert.doesNotMatch(stderr, /Unhandled 'error' event|Emitted 'error' event/);
     const lockPath = nodeLockPath(env, "auth", "worker-1");
@@ -287,7 +289,7 @@ test("async run message rolls back when its worker cannot spawn the CLI", async 
 test("async run message rolls back busy status when startup logging fails", async () => {
   const { directory, env } = await createFixture();
   try {
-    const stdoutLog = readRun(env, "auth")?.nodes["worker-1"].logs?.stdout;
+    const stdoutLog = nodeLogPath(env, "auth", "worker-1", "stdout");
     assert.ok(stdoutLog);
     await mkdir(stdoutLog, { recursive: true });
     const stderr: string[] = [];

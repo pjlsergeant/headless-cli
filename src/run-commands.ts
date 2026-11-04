@@ -1,6 +1,5 @@
-import { closeSync, openSync } from "node:fs";
+import { closeSync } from "node:fs";
 import { fork, type ChildProcess } from "node:child_process";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { extractFinalMessage } from "./output.js";
@@ -11,9 +10,10 @@ import {
   acquireNodeLock,
   appendNodeLog,
   listRuns,
+  nodeLogPath,
+  openNodeLog,
   readRun,
   recordMessage,
-  runDirectory,
   updateNodeStatus,
   type RunNode,
   type RunRecord,
@@ -68,7 +68,7 @@ export async function handleRunCommand(input: RunCommandInput, handlers: RunComm
     handlers.stdout(
       input.sdkFormat
         ? renderSdkResult("runs.view", { run: sdkRunView(run) })
-        : renderRunView(run),
+        : renderRunView(run, (nodeId) => nodeLogPath(handlers.env, runId, nodeId, "stdout")),
     );
     return 0;
   }
@@ -180,6 +180,14 @@ async function handleRunMessage(
   const node = run.nodes[nodeId];
   if (!node) {
     throw new Error(`unknown node in run ${runId}: ${nodeId}`);
+  }
+  if (node.sandbox !== "none") {
+    // The host never runs a sandboxed node outside its sandbox: its stored
+    // settings (work dir, permissions) were chosen for that sandbox.
+    throw new Error(
+      `node ${nodeId} in run ${runId} runs in ${node.sandbox}; headless cannot relaunch it on the host. `
+      + `Run it again with headless ${node.agent} --role ${node.role} --run ${runId} --node ${nodeId} --${node.sandbox} --prompt "..."`,
+    );
   }
   const prompt = await handlers.resolvePrompt();
 
@@ -309,8 +317,7 @@ async function startAsyncRunMessage(
   node: RunNode,
   prompt: string,
 ): Promise<number> {
-  const stderrLog = node.logs?.stderr ?? join(runDirectory(handlers.env, runId), "nodes", nodeId, "latest.stderr.log");
-  const errFd = openSync(stderrLog, "a");
+  const errFd = openNodeLog(handlers.env, runId, nodeId, "stderr");
   let worker: ChildProcess;
   try {
     worker = fork(asyncRunMessageWorkerPath(), [], {

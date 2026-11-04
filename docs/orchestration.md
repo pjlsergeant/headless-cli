@@ -95,6 +95,8 @@ Tune polling with `HEADLESS_RUN_STATUS_INTERVAL_MS`. Modal orchestrator runs rel
 Docker run coordination mounts the host run directory into containers with `HEADLESS_RUN_DIR`, so containerized nodes can read and update the same local run state.
 Containerized run nodes currently support `oneshot` coordination only; explicit `--docker --coordination session` and `--docker --session` run-node combinations are rejected because follow-up `run message` invocations do not persist Docker launch options.
 
+Each node records the sandbox it was launched in (`none`, `docker`, or `modal`). Headless never runs a Docker or Modal node on the host: a host-side `run message` to one is refused, and relaunching it directly must use the same sandbox flag.
+
 ```bash
 headless codex --role worker --run auth --node worker-1 --docker --prompt "Implement the next task"
 ```

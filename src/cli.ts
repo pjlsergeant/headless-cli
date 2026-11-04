@@ -126,6 +126,7 @@ import {
   registerNode,
   runDirectory,
   updateNodeStatus,
+  type SandboxKind,
   validateRunId,
   type RunNode,
 } from "./runs.js";
@@ -4474,6 +4475,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       throw new CliError("--role orchestrator with --run cannot use --allow read-only; it must be able to launch child nodes and update run state");
     }
     const team = parsed.teamSpecs.length > 0 ? expandTeamSpecs(parsed.agent, parsed.teamSpecs) : [];
+    // From this invocation, never from run state: team nodes share the
+    // orchestrator's sandbox, and a sandboxed node is never run on the host.
+    const runSandbox: SandboxKind = parsed.docker ? "docker" : parsed.modal ? "modal" : "none";
     if (!parsed.printCommand && parsed.runId && parsed.role && nodeId) {
       for (const teamNode of team) {
         const teamDefaults = resolveInvocationDefaults(teamNode.agent, teamNode.role, {}, env, config);
@@ -4493,6 +4497,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           reasoningEffort: teamDefaults.reasoningEffort,
           workDir: cwd ?? process.cwd(),
           sessionAlias: teamNode.nodeId,
+          sandbox: runSandbox,
         });
       }
       registerNode(env, {
@@ -4512,6 +4517,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         reasoningEffort: configuredDefaults.reasoningEffort,
         workDir: cwd ?? process.cwd(),
         sessionAlias: coordination === "session" ? (parsed.sessionAlias ?? nodeId) : parsed.sessionAlias,
+        sandbox: runSandbox,
       });
       registeredRunNode = { runId: parsed.runId, nodeId };
     }
@@ -4583,6 +4589,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                   workDir: cwd ?? process.cwd(),
                   sessionAlias: parsed.sessionAlias ?? nodeId,
                   tmuxSessionName: sessionName,
+                  sandbox: "none",
                 });
               } else {
                 updateNodeStatus(env, parsed.runId, nodeId, "failed", `tmux command exited with code ${code}`);
@@ -4730,6 +4737,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                 workDir: cwd ?? process.cwd(),
                 sessionAlias: parsed.sessionAlias ?? parsed.tmuxName ?? nodeId,
                 tmuxSessionName: tmuxCommands.sessionName,
+                sandbox: "none",
               });
             } else {
               updateNodeStatus(env, parsed.runId, nodeId, "failed", `tmux command exited with code ${code}`);

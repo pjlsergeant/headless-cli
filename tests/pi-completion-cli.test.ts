@@ -205,7 +205,7 @@ for (const scenario of [
     const f = fixture(scenario.records, scenario.exitCode, scenario.rawTail);
     try {
       for (const status of ["idle", "planned"] as const) {
-        registerNode(f.env, { runId: "design-run", nodeId: `${status}-worker`, role: "worker",
+        registerNode(f.env, { sandbox: "none", runId: "design-run", nodeId: `${status}-worker`, role: "worker",
           agent: "pi", coordination: "oneshot", status });
       }
       const result = await f.run(["--run", "design-run", "--role", "orchestrator",
@@ -224,7 +224,7 @@ for (const role of ["orchestrator", "worker"] as const) {
   test(`Pi reused ${role} clears prior prose after confirmed empty success`, async () => {
     const f = fixture();
     try {
-      registerNode(f.env, { runId: "reused-run", nodeId: role, role, agent: "pi",
+      registerNode(f.env, { sandbox: "none", runId: "reused-run", nodeId: role, role, agent: "pi",
         coordination: "oneshot", status: "idle" });
       updateNodeStatus(f.env, "reused-run", role, "idle", "previous invocation answer");
       const result = await f.run(["--run", "reused-run", "--role", role, "--node", role,
