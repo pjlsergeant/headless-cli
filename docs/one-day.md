@@ -38,6 +38,7 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - The kept-sandbox message points at the Modal dashboard or the JS SDK to terminate; Headless has no command to terminate (or fetch from) a kept sandbox.
 - ACP SDK logs "Error handling request" to stderr for each refused ACP file read (SDK console logging of handler errors).
 - ACP `fs/read_text_file` ignores the request's `line`/`limit` and returns the whole file.
-- AWS profile filtering (Docker and Modal) skips `~/.aws/credentials`/`config` when they are symlinks, drops `source_profile` chains and the SSO token cache (`~/.aws/sso/cache`), so SSO or chained profiles need credentials supplied another way in the container.
 - `--docker --print-command` prints an AWS mount source in a staged temp dir that is removed when Headless exits, so the printed command is not runnable as is when `AWS_PROFILE` is forwarded.
 - The staged Docker AWS credentials temp dir is left behind if Headless is killed without running its cleanup (e.g. SIGKILL).
+- AWS profile staging copies the SSO token cache file but not the SSO client registration cache, so an expired SSO token cannot be refreshed inside the container (run `aws sso login` on the host). `credential_process` profiles run their host command inside the container, where it usually does not exist.
+- ACP `readTextFile` confinement is check-then-read (realpath, then read), so a path swapped in between can escape (TOCTOU). The ACP agent is a local process that can read files itself, so this is a policy guard, not a security boundary; a proper fix needs openat-style fd-relative resolution, which Node lacks.

@@ -441,6 +441,11 @@ function bootstrapScript(
       'refresh_codex_file() { source="$1"; destination="$2"; refresh_tmp="$(mktemp "$HOME/.codex/.headless-refresh.XXXXXX")"; trap \'rm -f "$refresh_tmp"\' EXIT HUP INT TERM; cp "$source" "$refresh_tmp"; chmod 600 "$refresh_tmp"; mv -fT "$refresh_tmp" "$destination"; trap - EXIT HUP INT TERM; }',
     );
   }
+  if (persistentHome) {
+    // AWS files are staged per run with only the selected profile; never keep
+    // an earlier run's copy (possibly every profile) in a durable home.
+    commands.push('rm -rf "$HOME/.aws"');
+  }
   commands.push(
     `if [ -d "${hostHomeMountRoot}" ]; then cp ${copyFlags} "${hostHomeMountRoot}/." "$HOME"/; fi`,
   );

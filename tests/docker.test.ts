@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -950,6 +951,129 @@ test("mounts provider credential files needed by forwarded env vars", () => {
       workDir,
     });
     assert.ok(!unstaged.args.some((arg) => arg.includes(".aws")));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+function stageAwsProfile(home: string, stage: string, workDir: string, profile: string): string {
+  const command = buildDockerAgentCommand({
+    agent: "codex",
+    command: { command: "codex", args: ["exec", "-"] },
+    credentialStageDir: stage,
+    dockerArgs: [],
+    dockerEnv: [],
+    env: { AWS_PROFILE: profile, HOME: home },
+    image: DEFAULT_DOCKER_IMAGE,
+    workDir,
+  });
+  const staged = join(stage, "aws", ".aws");
+  assert.ok(command.args.includes(`${staged}:/tmp/headless-host-home/.aws:ro`));
+  return staged;
+}
+
+test("Docker AWS staging follows source_profile chains", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-aws-chain-"));
+  try {
+    const home = join(dir, "home");
+    const workDir = join(dir, "project");
+    mkdirSync(join(home, ".aws"), { recursive: true });
+    mkdirSync(workDir);
+    mkdirSync(join(dir, "stage"));
+    writeFileSync(
+      join(home, ".aws", "config"),
+      "[profile admin]\nrole_arn = arn:aws:iam::1:role/admin\nsource_profile = jump\n\n" +
+        "[profile jump]\nrole_arn = arn:aws:iam::1:role/jump\nsource_profile = base\n\n" +
+        "[profile base]\nregion = us-east-1\n\n[profile unrelated]\nregion = eu-west-1\n",
+    );
+    // Credentials read through a symlink.
+    writeFileSync(
+      join(dir, "real-credentials"),
+      "[base]\naws_access_key_id = base-key\n\n[unrelated]\naws_access_key_id = other-key\n",
+      { mode: 0o600 },
+    );
+    symlinkSync(join(dir, "real-credentials"), join(home, ".aws", "credentials"));
+
+    const staged = stageAwsProfile(home, join(dir, "stage"), workDir, "admin");
+
+    const config = readFileSync(join(staged, "config"), "utf8");
+    for (const section of ["[profile admin]", "[profile jump]", "[profile base]"]) assert.ok(config.includes(section), section);
+    assert.doesNotMatch(config, /unrelated/);
+    assert.equal(readFileSync(join(staged, "credentials"), "utf8"), "[base]\naws_access_key_id = base-key\n");
+    assert.equal(lstatSync(join(staged, "credentials")).isSymbolicLink(), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Docker AWS staging includes the SSO session and only its token cache files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-aws-sso-"));
+  try {
+    const home = join(dir, "home");
+    const workDir = join(dir, "project");
+    const cache = join(home, ".aws", "sso", "cache");
+    mkdirSync(cache, { recursive: true });
+    mkdirSync(workDir);
+    mkdirSync(join(dir, "stage"));
+    writeFileSync(
+      join(home, ".aws", "config"),
+      "[profile dev]\nsso_session = corp\nsso_account_id = 1\n\n" +
+        "[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = us-east-1\n\n" +
+        "[profile legacy]\nsso_start_url = https://legacy.awsapps.com/start\n\n[sso-session other]\nsso_region = eu-west-1\n",
+    );
+    const sha1 = (value: string) => createHash("sha1").update(value).digest("hex");
+    writeFileSync(join(cache, `${sha1("corp")}.json`), '{"accessToken":"corp"}');
+    writeFileSync(join(cache, `${sha1("other")}.json`), '{"accessToken":"other"}');
+    writeFileSync(join(cache, `${sha1("https://legacy.awsapps.com/start")}.json`), '{"accessToken":"legacy"}');
+
+    const staged = stageAwsProfile(home, join(dir, "stage"), workDir, "dev");
+    assert.match(readFileSync(join(staged, "config"), "utf8"), /\[sso-session corp\]/);
+    assert.doesNotMatch(readFileSync(join(staged, "config"), "utf8"), /other|legacy/);
+    assert.deepEqual(readdirSync(join(staged, "sso", "cache")), [`${sha1("corp")}.json`]);
+
+    rmSync(join(dir, "stage", "aws"), { recursive: true });
+    const legacy = stageAwsProfile(home, join(dir, "stage"), workDir, "legacy");
+    assert.deepEqual(readdirSync(join(legacy, "sso", "cache")), [`${sha1("https://legacy.awsapps.com/start")}.json`]);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a durable Docker session home gets a fresh ~/.aws on every start", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-aws-stale-"));
+  try {
+    const persistentHome = join(dir, "session");
+    const seedHome = join(dir, "seed");
+    const workDir = join(dir, "project");
+    mkdirSync(join(persistentHome, ".aws"), { recursive: true });
+    mkdirSync(join(seedHome, ".aws"), { recursive: true });
+    mkdirSync(workDir);
+    writeFileSync(join(persistentHome, ".aws", "credentials"), "[every]\n[profile]\n");
+    writeFileSync(join(persistentHome, ".aws", "old-extra"), "stale");
+    writeFileSync(join(seedHome, ".aws", "credentials"), "[dev]\n");
+    const command = buildDockerAgentCommand({
+      agent: "codex",
+      command: { command: "codex", args: ["exec", "-"] },
+      dockerArgs: [],
+      dockerEnv: [],
+      env: {},
+      image: DEFAULT_DOCKER_IMAGE,
+      persistentHome,
+      workDir,
+    });
+    const bootstrap = (command.args.find((arg) => arg.includes("cp -R -n")) ?? "")
+      .replaceAll("/tmp/headless-host-home", seedHome)
+      .replaceAll("/headless-home", persistentHome);
+
+    const run = spawnSync("sh", ["-c", bootstrap, "headless-agent", "true"], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(readFileSync(join(persistentHome, ".aws", "credentials"), "utf8"), "[dev]\n");
+    assert.equal(existsSync(join(persistentHome, ".aws", "old-extra")), false);
+
+    rmSync(join(seedHome, ".aws"), { recursive: true });
+    const again = spawnSync("sh", ["-c", bootstrap, "headless-agent", "true"], { encoding: "utf8" });
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(existsSync(join(persistentHome, ".aws")), false);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
