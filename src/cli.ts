@@ -16,7 +16,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { runAcpClient, runAcpStdioAgent } from "./acp.js";
 import { randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { constants as osConstants, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { PiCompletionObserver } from "./pi-completion.js";
@@ -127,6 +127,7 @@ import {
   nodeLockPath,
   readRun,
   registerNode,
+  runDirectory,
   runStoreRoot,
   updateNodeStatus,
   type SandboxKind,
@@ -3582,7 +3583,19 @@ function validateCronAddCliOptions(parsed: ParsedArgs): void {
   }
 }
 
-/** Everything Headless trusts on the host; a Docker work dir must contain none of it. */
+/**
+ * Returns env with HEADLESS_RUN_DIR set to the run directory's canonical
+ * path, resolved now. Detached workers inherit it, so they never re-resolve.
+ */
+function pinRunDirectoryEnv(env: Env, runId: string): Env {
+  const canonical = realpathSync(runDirectory(env, runId));
+  if (basename(canonical) !== runId) {
+    throw new CliError(`run directory for ${runId} resolves to ${canonical}, whose name is not the run id`);
+  }
+  return { ...env, HEADLESS_RUN_DIR: canonical };
+}
+
+/** Everything Headless trusts on the host; a Docker work dir must overlap none of it. */
 function headlessStateRoots(env: Env): string[] {
   const roots: Array<string | undefined> = [
     env.HOME ? join(env.HOME, ".headless") : undefined,
@@ -4891,9 +4904,18 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       allow, fast, reasoningEffort: configuredDefaults.reasoningEffort,
       timeoutSeconds: parsed.modal ? modalTimeoutSeconds : commandTimeoutSeconds,
     }, commandSessionPlan);
-    // A Docker run node reaches its run only through its own mailbox.
-    const runMailbox = parsed.docker && parsed.runId && parsed.role && nodeId
-      ? (parsed.printCommand ? previewMailboxPaths(env, parsed.runId, nodeId) : prepareMailbox(env, parsed.runId, nodeId))
+    // A Docker run node reaches its run only through its own mailbox. The run
+    // directory is resolved once to its canonical path and pinned for the
+    // mailbox service and any nodes it starts, so nothing re-resolves a
+    // configured path through a link the container could repoint later.
+    const isDockerRunNode = Boolean(parsed.docker && parsed.runId && parsed.role && nodeId);
+    const pinnedRunEnv = isDockerRunNode && !parsed.printCommand
+      ? pinRunDirectoryEnv(env, parsed.runId!)
+      : env;
+    const runMailbox = isDockerRunNode
+      ? (parsed.printCommand
+          ? previewMailboxPaths(env, parsed.runId!, nodeId!)
+          : prepareMailbox(pinnedRunEnv, parsed.runId!, nodeId!))
       : undefined;
     const buildAttemptCommand = (attemptEnv: Env, options: BuildOptions): BuiltCommand => {
       let built = withRunEnvironment(buildAgentCommand(parsed.agent!, options, attemptEnv), parsed.runId, nodeId);
@@ -4984,7 +5006,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       stderr(text);
     };
     const runMailboxService = runMailbox && parsed.runId && nodeId
-      ? createRunMailboxService(env, parsed, parsed.runId, nodeId, runMailbox, displayStderr)
+      ? createRunMailboxService(pinnedRunEnv, parsed, parsed.runId, nodeId, runMailbox, displayStderr)
       : undefined;
     statusReporter?.start();
     runMailboxService?.start();

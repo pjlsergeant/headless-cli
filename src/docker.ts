@@ -124,21 +124,32 @@ export function validateDockerSessionRootWorkDir(sessionHome: string, workDir: s
 }
 
 /**
- * The work dir is mounted read-write, so it must not contain Headless's own
- * trusted state (run store, cron, session stores): a container could then
- * rewrite what the host later acts on.
+ * The work dir is mounted read-write, so it must not overlap Headless's own
+ * trusted state (run store, cron, session stores) in either direction: a
+ * container could rewrite state inside it, or a work dir inside a state root
+ * would mount that state. Both the configured (lexical) and the canonical
+ * paths are compared, so a state path that reaches through a symlink under
+ * the work dir -- which the container could repoint later -- is refused too.
  */
 export function validateDockerWorkDirExcludesState(workDir: string, stateRoots: string[]): void {
-  const canonicalWorkDir = realpathSync(workDir);
+  const workDirs = unique([resolve(workDir), realpathSync(workDir)]);
   for (const root of stateRoots) {
-    const canonicalRoot = canonicalProspectivePath(root);
-    if (isSameOrContained(canonicalWorkDir, canonicalRoot)) {
-      throw new Error(
-        `Docker work dir ${canonicalWorkDir} contains Headless state (${canonicalRoot}); `
-        + "choose a work dir that does not include it",
-      );
+    const roots = unique([resolve(root), canonicalProspectivePath(root)]);
+    for (const candidateWorkDir of workDirs) {
+      for (const candidateRoot of roots) {
+        if (pathsOverlap(candidateWorkDir, candidateRoot)) {
+          throw new Error(
+            `Docker work dir ${candidateWorkDir} overlaps Headless state (${candidateRoot}); `
+            + "choose a work dir that neither contains nor is inside it",
+          );
+        }
+      }
     }
   }
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 export function dockerSessionRootPath(env: Env): string | undefined {

@@ -212,7 +212,7 @@ test("a Docker run refuses a work dir that contains Headless state", async () =>
         { env: { ...process.env, HOME: home, ...extra }, stdout: () => undefined, stderr: (text) => stderr.push(text) },
       );
       assert.equal(code, 2, workDir);
-      assert.match(stderr.join(""), /contains Headless state/, workDir);
+      assert.match(stderr.join(""), /overlaps Headless state/, workDir);
     }
     // A sibling project dir is fine.
     const project = join(dir, "project");
@@ -222,6 +222,55 @@ test("a Docker run refuses a work dir that contains Headless state", async () =>
       { env: { ...process.env, HOME: home }, stdout: () => undefined, stderr: () => undefined },
     );
     assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a Docker run refuses a work dir inside Headless state", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-run-trust-"));
+  try {
+    const home = join(dir, "home");
+    const runDir = join(home, ".headless", "runs", "auth");
+    const cronDir = join(home, ".headless", "cron");
+    mkdirSync(runDir, { recursive: true });
+    mkdirSync(cronDir, { recursive: true });
+    for (const workDir of [runDir, cronDir]) {
+      const stderr: string[] = [];
+      const code = await runCli(
+        ["codex", "--role", "worker", "--run", "auth", "--node", "w1", "--docker", "--work-dir", workDir, "--prompt", "hi", "--print-command"],
+        { env: { ...process.env, HOME: home }, stdout: () => undefined, stderr: (text) => stderr.push(text) },
+      );
+      assert.equal(code, 2, workDir);
+      assert.match(stderr.join(""), /overlaps Headless state/, workDir);
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a Docker run refuses a configured run dir that reaches outside through a link under the work dir", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-run-trust-"));
+  try {
+    const home = join(dir, "home");
+    const project = join(dir, "project");
+    const outside = join(dir, "outside");
+    mkdirSync(home);
+    mkdirSync(project);
+    mkdirSync(join(outside, "auth"), { recursive: true });
+    // The container could repoint project/state later; its canonical target is outside.
+    symlinkSync(outside, join(project, "state"));
+    const stderr: string[] = [];
+    const code = await runCli(
+      ["codex", "--role", "worker", "--run", "auth", "--node", "w1", "--docker", "--work-dir", project, "--prompt", "hi", "--print-command"],
+      {
+        env: { ...process.env, HOME: home, HEADLESS_RUN_DIR: join(project, "state", "auth") },
+        stdout: () => undefined,
+        stderr: (text) => stderr.push(text),
+      },
+    );
+    assert.equal(code, 2);
+    assert.match(stderr.join(""), /overlaps Headless state/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
