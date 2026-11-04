@@ -362,6 +362,133 @@ test("--keep-background does not protect the tree from --timeout", posixOnly, as
   assert.ok(result.grandchildGone, "--timeout left the grandchild running");
 });
 
+/**
+ * Fake codex that prints HEADLESS_TEST_LINES trace rows. "background-writer":
+ * the agent exits at once and a background child holding its stdout writes
+ * them; "agent-writes": the agent writes them itself (honouring backpressure),
+ * leaves an idle background child, records its exit time, then exits.
+ */
+function writeSdkAgent(binDir: string, mode: "background-writer" | "agent-writes"): void {
+  mkdirSync(binDir, { recursive: true });
+  const writer = [
+    "const pad = 'x'.repeat(150);",
+    "let i = 0;",
+    "const total = Number(process.env.HEADLESS_TEST_LINES);",
+    "const next = () => {",
+    "  while (i < total) {",
+    "    const row = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: `line ${i} ${pad}` } }) + '\\n';",
+    "    i++;",
+    "    if (!process.stdout.write(row)) { process.stdout.once('drain', next); return; }",
+    "  }",
+    "};",
+    "next();",
+  ].join("\n");
+  writeFileSync(join(binDir, "codex"), [
+    `#!${process.execPath}`,
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    "process.on('exit', () => writeFileSync(process.env.HEADLESS_TEST_AGENT_EXIT, String(Date.now())));",
+    mode === "background-writer"
+      ? `const child = spawn(process.execPath, ['-e', ${JSON.stringify(writer)}], { stdio: ['ignore', 'inherit', 'ignore'] });`
+      : "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio: 'ignore' });",
+    "writeFileSync(process.env.HEADLESS_TEST_GRANDCHILD_PID, String(child.pid));",
+    "child.unref();",
+    mode === "agent-writes" ? writer : "",
+    "",
+  ].join("\n"));
+  chmodSync(join(binDir, "codex"), 0o755);
+}
+
+/** A downstream sink with a 64KB window that a consumer empties at `bytesPerTick` every 100ms. */
+function slowSink(bytesPerTick: number) {
+  let unread = 0;
+  let text = "";
+  const waiters = new Set<() => void>();
+  const timer = bytesPerTick > 0
+    ? setInterval(() => {
+      unread = Math.max(0, unread - bytesPerTick);
+      if (unread < 16 * 1024) for (const wake of waiters) wake();
+    }, 100)
+    : undefined;
+  return {
+    stdout: (chunk: string) => {
+      text += chunk;
+      unread += Buffer.byteLength(chunk);
+      return unread < 64 * 1024;
+    },
+    waitForStdoutDrain: (signal: AbortSignal) => new Promise<void>((resolve) => {
+      const wake = () => {
+        waiters.delete(wake);
+        resolve();
+      };
+      waiters.add(wake);
+      signal.addEventListener("abort", wake, { once: true });
+    }),
+    text: () => text,
+    stop: () => clearInterval(timer),
+  };
+}
+
+async function runSdkAgent(mode: "background-writer" | "agent-writes", lines: number, bytesPerTick: number, args: string[] = []) {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-sdk-test-"));
+  const binDir = join(dir, "bin");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const agentExitFile = join(dir, "agent-exit");
+  writeSdkAgent(binDir, mode);
+  const sink = slowSink(bytesPerTick);
+  try {
+    const code = await runCli(["codex", "--prompt", "hello", "--sdk-format", "ndjson", ...args], {
+      env: {
+        ...process.env,
+        HEADLESS_KILL_GRACE_MS: "500",
+        HEADLESS_TEST_AGENT_EXIT: agentExitFile,
+        HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+        HEADLESS_TEST_LINES: String(lines),
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+      stdout: sink.stdout,
+      waitForStdoutDrain: sink.waitForStdoutDrain,
+      stderr: () => {},
+    });
+    const resolvedAt = Date.now();
+    const grandchildPid = readPid(grandchildPidFile)!;
+    return {
+      code,
+      text: sink.text(),
+      afterAgentExitMs: resolvedAt - Number(readFileSync(agentExitFile, "utf8")),
+      grandchildGone: processGone(grandchildPid),
+    };
+  } finally {
+    sink.stop();
+    killQuietly(readPid(grandchildPidFile));
+    rmSync(dir, { force: true, recursive: true });
+  }
+}
+
+test("a downstream that never drains SDK output cannot stall post-exit cleanup forever", posixOnly, async () => {
+  // The agent exits at once; its background writer holds stdout and blocks
+  // once headless stops reading because the sink never drains.
+  const result = await runSdkAgent("background-writer", 50_000, 0);
+  assert.equal(result.code, 0);
+  assert.ok(result.grandchildGone, "the blocked background writer outlived the run");
+  // One grace of no drain progress after the agent exit, then cleanup.
+  assert.ok(result.afterAgentExitMs >= 450, `gave up after ${result.afterAgentExitMs}ms, before the stall deadline`);
+});
+
+test("a slow but steadily draining downstream receives all SDK output, even with --keep-background", posixOnly, async () => {
+  const lines = 3_000;
+  // The agent exits at once and its background writer keeps producing; the
+  // sink drains 32KB per 100ms, so every drain lands well within the 500ms
+  // grace while the whole delivery takes several graces after the agent
+  // exit. If the stall deadline fired, --keep-background would drop the rest.
+  const result = await runSdkAgent("background-writer", lines, 32 * 1024, ["--keep-background"]);
+  assert.equal(result.code, 0);
+  const rows = result.text.trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+  assert.equal(rows.filter((row) => row.type === "trace").length, lines);
+  assert.equal(rows.at(-1)?.type, "result");
+  assert.ok(result.afterAgentExitMs > 1500, `delivery took ${result.afterAgentExitMs}ms; too fast to test the stall deadline`);
+});
+
 interface CronAgentExecution {
   dir: string;
   env: NodeJS.ProcessEnv;

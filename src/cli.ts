@@ -250,7 +250,10 @@ interface CliDeps {
   stdin?: string;
   stdinIsTTY?: boolean;
   stderrIsTTY?: boolean;
-  stdout?: (text: string) => void;
+  /** Output sink; returning false signals backpressure (with waitForStdoutDrain). */
+  stdout?: (text: string) => unknown;
+  /** Resolves when the sink can take more output again (--sdk-format ndjson). */
+  waitForStdoutDrain?: (signal: AbortSignal) => Promise<void>;
   stderr?: (text: string) => void;
   capacityRetrySleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   capacityRetryRandom?: () => number;
@@ -1916,6 +1919,7 @@ async function executeCommand(
           clearTimeout(forceDrain);
         }
         stdoutDrainController.abort();
+        clearTimeout(drainStall);
         // Always detach before resolving so runCli leaves no listeners behind.
         removeParentSignalHandlers();
         flushTraceBuffer();
@@ -2112,15 +2116,49 @@ async function executeCommand(
         forceDrain = setTimeout(() => {
           forceDrain = undefined;
           if (settled || termination || treeShutdown || stdoutDrainPending) return;
-          if (keepBackground) {
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            finish(exitResult());
+          postExitCleanup();
+        }, terminationGraceMs);
+      };
+      const postExitCleanup = () => {
+        if (keepBackground) {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          finish(exitResult());
+          return;
+        }
+        // The result comes from "close" once the holders are dead, or from
+        // exitResult() at the bounded shutdown deadline.
+        beginTreeShutdown("SIGTERM");
+      };
+
+      // SDK stdout backpressure after the agent exited: a downstream that
+      // keeps draining, however slowly, is waited for; one that makes no
+      // drain progress for a whole kill grace is given up on (a STALL
+      // deadline, not an absolute one), and post-exit cleanup proceeds.
+      let drainStall: NodeJS.Timeout | undefined;
+      let drainProgress = 0;
+      let drainStalled = false;
+      const clearDrainStall = () => {
+        clearTimeout(drainStall);
+        drainStall = undefined;
+      };
+      const armDrainStall = () => {
+        if (drainStall || settled || termination || treeShutdown || !stdoutDrainPending || exitedBeforeClose === undefined) {
+          return;
+        }
+        const progressAtArm = drainProgress;
+        drainStall = setTimeout(() => {
+          drainStall = undefined;
+          if (settled || termination || treeShutdown || !stdoutDrainPending) return;
+          if (drainProgress !== progressAtArm) {
+            armDrainStall();
             return;
           }
-          // The result comes from "close" once the holders are dead, or from
-          // exitResult() at the bounded shutdown deadline.
-          beginTreeShutdown("SIGTERM");
+          drainStalled = true;
+          stdoutDrainPending = false;
+          stdoutDrainController.abort();
+          child.stdout?.resume();
+          postExitCleanup();
         }, terminationGraceMs);
       };
 
@@ -2228,13 +2266,18 @@ async function executeCommand(
           if (
             writable === false &&
             !stdoutDrainPending &&
+            !drainStalled &&
             options.waitForStdoutDrain
           ) {
             clearForceDrain();
             stdoutDrainPending = true;
             child.stdout?.pause();
+            armDrainStall();
             void options.waitForStdoutDrain(stdoutDrainController.signal).then(
               () => {
+                if (drainStalled) return;
+                drainProgress += 1;
+                clearDrainStall();
                 stdoutDrainPending = false;
                 if (!settled) {
                   child.stdout?.resume();
@@ -2242,6 +2285,8 @@ async function executeCommand(
                 }
               },
               () => {
+                if (drainStalled) return;
+                clearDrainStall();
                 stdoutDrainPending = false;
                 if (!settled) {
                   const message = "headless: SDK output stream failed\n";
@@ -2275,6 +2320,7 @@ async function executeCommand(
         }
         exitedBeforeClose = { code, signal };
         armForceDrain();
+        armDrainStall();
       });
       child.on("close", (code, signal) => {
         clearForceDrain();
@@ -3545,7 +3591,7 @@ async function executeStoredNode(
 
 export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number> {
   const stdout = deps.stdout ?? ((text: string) => process.stdout.write(text));
-  const waitForSdkStdoutDrain = deps.stdout
+  const waitForSdkStdoutDrain = deps.waitForStdoutDrain ?? (deps.stdout
     ? undefined
     : (signal: AbortSignal) =>
         new Promise<void>((resolve, reject) => {
@@ -3579,7 +3625,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           process.stdout.once("error", handleError);
           process.stdout.once("close", handleClose);
           signal.addEventListener("abort", handleAbort, { once: true });
-        });
+        }));
   const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
   const stderrIsTTY = deps.stderrIsTTY ?? Boolean(process.stderr.isTTY);
   const env: Env = { ...(deps.env ?? process.env) };
