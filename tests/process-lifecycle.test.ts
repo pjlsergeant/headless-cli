@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { runAcpClient } from "../src/acp.ts";
 import { runCli } from "../src/cli.ts";
 import { cronRoot, parseCronSchedule, readCronJob, recordCronJob, runDueCronJobsOnce } from "../src/cron.ts";
 
@@ -202,4 +203,80 @@ test("cron kill terminates the agent's grandchild, not just the headless process
     killQuietly(readPid(grandchildPidFile));
     rmSync(dir, { force: true, recursive: true });
   }
+});
+
+test("ACP shutdown is bounded when the server ignores SIGTERM", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-acp-test-"));
+  const serverPidFile = join(dir, "server.pid");
+  const server = join(dir, "acp-server.js");
+  // Minimal ACP server that ignores SIGTERM and stdin EOF, so only SIGKILL
+  // can end it once the prompt is answered.
+  writeFileSync(
+    server,
+    [
+      "const { writeFileSync } = require('node:fs');",
+      "writeFileSync(process.env.HEADLESS_TEST_SERVER_PID, String(process.pid));",
+      "process.on('SIGTERM', () => {});",
+      "setInterval(() => {}, 1000);",
+      "const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\\n');",
+      "let buffer = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => {",
+      "  buffer += chunk;",
+      "  let newline;",
+      "  while ((newline = buffer.indexOf('\\n')) >= 0) {",
+      "    const line = buffer.slice(0, newline);",
+      "    buffer = buffer.slice(newline + 1);",
+      "    if (!line.trim()) continue;",
+      "    const request = JSON.parse(line);",
+      "    if (request.method === 'initialize') {",
+      "      send({ id: request.id, result: { protocolVersion: request.params.protocolVersion, agentCapabilities: {} } });",
+      "    } else if (request.method === 'session/new') {",
+      "      send({ id: request.id, result: { sessionId: 'stubborn' } });",
+      "    } else if (request.method === 'session/prompt') {",
+      "      send({ method: 'session/update', params: { sessionId: 'stubborn', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } } } });",
+      "      send({ id: request.id, result: { stopReason: 'end_turn' } });",
+      "    } else if (request.id !== undefined) {",
+      "      send({ id: request.id, error: { code: -32601, message: 'unsupported' } });",
+      "    }",
+      "  }",
+      "});",
+      "",
+    ].join("\n"),
+  );
+  let serverPid: number | undefined;
+  try {
+    const stdout: string[] = [];
+    const started = Date.now();
+    const code = await runAcpClient({
+      agentCommand: { command: process.execPath, args: [server] },
+      prompt: "hello",
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", HEADLESS_TEST_SERVER_PID: serverPidFile },
+      stdout: (text) => stdout.push(text),
+      stderr: () => {},
+    });
+    const elapsedMs = Date.now() - started;
+    serverPid = readPid(serverPidFile);
+    assert.equal(code, 0);
+    assert.match(stdout.join(""), /done/);
+    assert.ok(serverPid);
+    assert.ok(processGone(serverPid), "ACP server survived shutdown");
+    assert.ok(elapsedMs < 3000, `ACP shutdown took ${elapsedMs}ms`);
+  } finally {
+    killQuietly(serverPid);
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("ACP client reports a server that cannot be spawned instead of crashing", async () => {
+  const stderr: string[] = [];
+  const code = await runAcpClient({
+    agentCommand: { command: join(tmpdir(), "headless-missing-acp-server"), args: [] },
+    prompt: "hello",
+    env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300" },
+    stdout: () => {},
+    stderr: (text) => stderr.push(text),
+  });
+  assert.notEqual(code, 0);
+  assert.match(stderr.join(""), /ENOENT/);
 });

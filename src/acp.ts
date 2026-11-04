@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
+import { killGraceMs, terminateProcessGroup } from "./process-tree.js";
 import type { AllowMode, BuiltCommand, Env } from "./types.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -237,9 +238,49 @@ class HeadlessAcpClient {
 
 function childExit(child: ReturnType<typeof spawn>): Promise<number> {
   return new Promise((resolve) => {
-    child.on("error", () => resolve(127));
-    child.on("close", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
+    child.once("error", () => resolve(127));
+    child.once("close", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
   });
+}
+
+/**
+ * Bounded shutdown of the ACP server: close its stdin, SIGTERM it, SIGKILL it
+ * after the grace period, and give up waiting for `close` (a descendant may
+ * hold its stdio) one grace period later.
+ *
+ * The server is deliberately not spawned detached: `acp-client` normally runs
+ * as the agent of an outer headless that put it at the head of its own
+ * process group, so leaving the server in that group means the outer
+ * headless's group SIGTERM/SIGKILL reaches it even if this process is killed
+ * first. Signals here therefore target the server directly (the group helper
+ * falls back to the direct child when it is not a group leader).
+ */
+async function shutdownAcpServer(
+  child: ReturnType<typeof spawn>,
+  exit: Promise<number>,
+  graceMs: number,
+): Promise<number> {
+  const exited = () => child.exitCode !== null || child.signalCode !== null || !child.pid;
+  if (!exited()) {
+    child.stdin?.end();
+    await terminateProcessGroup(child, {
+      graceMs,
+      isAlive: () => !exited(),
+    });
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<number>((resolve) => {
+    timer = setTimeout(() => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(1);
+    }, graceMs);
+  });
+  try {
+    return await Promise.race([exit, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function runAcpClient(options: RunAcpClientOptions): Promise<number> {
@@ -248,11 +289,28 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
     env: { ...options.env, ...(options.agentCommand.env ?? {}) } as NodeJS.ProcessEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // Attach lifecycle listeners before anything can fail: a spawn error (e.g.
+  // ENOENT) is emitted asynchronously and would otherwise be unhandled.
+  const exit = childExit(child);
+  let spawnError: Error | undefined;
+  child.once("error", (error) => {
+    spawnError = error;
+    options.stderr(`${error.message}\n`);
+  });
+  const graceMs = killGraceMs(options.env);
+  // Rejects when the server goes away mid-protocol so a pending request can't hang.
+  const serverGone = exit.then((code) => {
+    throw new Error(spawnError ? spawnError.message : `ACP server exited with code ${code}`);
+  });
+  serverGone.catch(() => undefined);
+  const untilServerGone = <T>(promise: Promise<T>) => Promise.race([promise, serverGone]);
+
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", (chunk: string) => options.stderr(chunk));
+  child.stdin?.on("error", () => undefined);
 
   if (!child.stdin || !child.stdout) {
-    child.kill();
+    await shutdownAcpServer(child, exit, graceMs);
     return 1;
   }
 
@@ -264,22 +322,20 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
   const connection = new acp.ClientSideConnection(() => client, stream);
 
   try {
-    await connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: acpClientCapabilities });
-    const session = await connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] });
+    await untilServerGone(connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: acpClientCapabilities }));
+    const session = await untilServerGone(connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] }));
     options.stdout(acpOutputRecord("session", { sessionId: session.sessionId }));
-    const result = await connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: options.prompt }] });
+    const result = await untilServerGone(connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: options.prompt }] }));
     const finalText = client.finalAssistantText();
     if (finalText) {
       options.stdout(acpOutputRecord("message", { role: "assistant", content: [{ type: "text", text: finalText }] }));
     }
     options.stdout(acpOutputRecord("result", { stopReason: result.stopReason }));
-    child.kill();
-    await childExit(child);
+    await shutdownAcpServer(child, exit, graceMs);
     return 0;
   } catch (error) {
     options.stdout(acpOutputRecord("error", { message: error instanceof Error ? error.message : String(error) }));
-    child.kill();
-    const code = await childExit(child);
+    const code = await shutdownAcpServer(child, exit, graceMs);
     return code === 0 ? 1 : code;
   }
 }
