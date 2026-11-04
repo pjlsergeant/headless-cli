@@ -341,5 +341,6 @@ See [orchestration.md](orchestration.md) for `--role`, `--run`, `--node`, `--tea
 - `HEADLESS_CLI_BIN`: binary path the cron daemon uses to start scheduled Headless invocations.
 - `HEADLESS_BIN`: fallback binary path for detached Headless child invocations.
 - `HEADLESS_RUN_DIR`: concrete directory for the active run store, mainly used by Docker run coordination.
+- `HEADLESS_KILL_GRACE_MS`: how long a signalled agent process tree gets to exit before it is `SIGKILL`ed (parent signals, `--timeout`, cron kill/stop/rm, ACP shutdown, async workers). Defaults to `5000`.
 
 Docker and Modal modes also pass common agent/provider credential variables when present, including `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `SAKANA_API_KEY`, Cursor/Pi credential variables, common AWS variables, and OpenAI-compatible endpoint variables. Use `--docker-env` or `--modal-env` for anything else. Modal mode additionally supports named Modal Secrets with `--modal-secret`.
