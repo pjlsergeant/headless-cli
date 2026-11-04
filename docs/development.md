@@ -16,6 +16,8 @@ npm run hooks:install
 
 The package exports one binary, `headless`, from `dist/cli.js`.
 
+Known non-show-stopper process-lifecycle issues are tracked in [one-day.md](one-day.md).
+
 ## Python SDK
 
 The Python package lives in `python/` and calls the built Headless CLI. Install
