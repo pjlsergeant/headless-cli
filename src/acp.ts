@@ -318,7 +318,8 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
   const tree = childProcessTree(child);
 
   // Forward exit signals to the server tree (it is outside our group), then
-  // re-raise once it is gone; a second signal SIGKILLs it at once.
+  // re-raise once it is gone; a second signal SIGKILLs it at once but still
+  // waits for it to die.
   const handlers = new Map<NodeJS.Signals, () => void>();
   const removeHandlers = () => {
     for (const [signal, handler] of handlers) process.off(signal, handler);
@@ -332,8 +333,9 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
         if (reraise) process.kill(process.pid, signal);
       };
       if (forwarding) {
+        // SIGKILL at once; the in-flight termination below keeps waiting
+        // (bounded) for the tree to die and then re-raises.
         tree.signal("SIGKILL");
-        finishSignal();
         return;
       }
       forwarding = signal;
