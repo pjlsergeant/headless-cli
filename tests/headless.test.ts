@@ -26,7 +26,7 @@ import {
   listAgents,
   waitTierForAgent,
 } from "../src/agents.ts";
-import { acpClientCapabilities } from "../src/acp.ts";
+import { acpClientCapabilities, runAcpClient } from "../src/acp.ts";
 import { runCli } from "../src/cli.ts";
 import { parseHeadlessConfig } from "../src/config.ts";
 import { DEFAULT_DOCKER_IMAGE, dockerSessionHomePath } from "../src/docker.ts";
@@ -239,6 +239,78 @@ test("ACP client advertises read-only filesystem capability", () => {
   assert.deepEqual(acpClientCapabilities, {
     fs: { readTextFile: true, writeTextFile: false },
   });
+});
+
+test("ACP client confines file reads to the work dir, including through symlinks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-acp-read-"));
+  try {
+    const work = join(dir, "work");
+    mkdirSync(join(work, "src"), { recursive: true });
+    writeFileSync(join(work, "src", "inside.txt"), "inside content");
+    writeFileSync(join(dir, "outside.txt"), "outside content");
+    symlinkSync(join(dir, "outside.txt"), join(work, "escape.txt"));
+    symlinkSync("src/inside.txt", join(work, "alias.txt"));
+    const sdk = pathToFileURL(join(repoRoot, "node_modules", "@agentclientprotocol", "sdk", "dist", "acp.js")).href;
+    const server = join(dir, "server.mjs");
+    writeFileSync(
+      server,
+      [
+        `import * as acp from ${JSON.stringify(sdk)};`,
+        "import { Readable, Writable } from 'node:stream';",
+        "const paths = JSON.parse(process.env.HEADLESS_TEST_READ_PATHS);",
+        "const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));",
+        "const connection = new acp.AgentSideConnection(() => ({",
+        "  async initialize(params) { return { protocolVersion: params.protocolVersion, agentCapabilities: {} }; },",
+        "  async authenticate() { return {}; },",
+        "  async newSession() { return { sessionId: 's' }; },",
+        "  async prompt(params) {",
+        "    const results = [];",
+        "    for (const path of paths) {",
+        "      try { results.push('OK:' + (await connection.readTextFile({ sessionId: 's', path })).content); }",
+        "      catch (error) { results.push('ERR:' + error.message); }",
+        "    }",
+        "    await connection.sessionUpdate({ sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(results) } } });",
+        "    return { stopReason: 'end_turn' };",
+        "  },",
+        "  async cancel() {},",
+        "}), stream);",
+        "await connection.closed;",
+        "",
+      ].join("\n"),
+    );
+    const paths = [
+      join(work, "src", "inside.txt"),
+      join(work, "alias.txt"),
+      "src/inside.txt",
+      join(dir, "outside.txt"),
+      join(work, "..", "outside.txt"),
+      join(work, "escape.txt"),
+      join(work, "missing.txt"),
+    ];
+    const stdout: string[] = [];
+    const code = await runAcpClient({
+      agentCommand: { command: process.execPath, args: [server] },
+      prompt: "read",
+      cwd: work,
+      allow: "read-only",
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", HEADLESS_TEST_READ_PATHS: JSON.stringify(paths) },
+      stdout: (text) => stdout.push(text),
+      stderr: () => {},
+    });
+    assert.equal(code, 0, stdout.join(""));
+    const message = stdout
+      .map((line) => JSON.parse(line))
+      .find((record) => record.type === "message");
+    const results = JSON.parse(message.content[0].text) as string[];
+    assert.deepEqual(results.slice(0, 3), ["OK:inside content", "OK:inside content", "OK:inside content"]);
+    for (const result of results.slice(3, 6)) {
+      assert.match(result, /^ERR:.*file reads are limited to the work dir/);
+    }
+    assert.match(results[6], /^ERR:Resource not found/);
+    assert.ok(!stdout.join("").includes("outside content"));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
 });
 
 test("builds ACP adapter command from registry npx distribution", () => {

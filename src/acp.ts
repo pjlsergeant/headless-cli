@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
@@ -186,6 +187,11 @@ function contentText(value: unknown): string {
   return asString(record.text);
 }
 
+function isWithinDir(root: string, path: string): boolean {
+  const relPath = relative(root, path);
+  return relPath === "" || (relPath.split(sep)[0] !== ".." && !isAbsolute(relPath));
+}
+
 export const acpClientCapabilities = {
   fs: { readTextFile: true, writeTextFile: false },
 };
@@ -196,6 +202,7 @@ class HeadlessAcpClient {
   constructor(
     private readonly stdout: (text: string) => void,
     private readonly allow: AllowMode | undefined,
+    private readonly workDir: string,
   ) {}
 
   finalAssistantText(): string {
@@ -228,7 +235,26 @@ class HeadlessAcpClient {
   }
 
   async readTextFile(params: acp.ReadTextFileRequest): Promise<acp.ReadTextFileResponse> {
-    return { content: readFileSync(params.path, "utf8") };
+    // Reads are confined to the invocation work dir, through symlinks too.
+    const refused = () =>
+      acp.RequestError.invalidParams({ path: params.path }, "file reads are limited to the work dir");
+    let root: string;
+    try {
+      root = realpathSync(this.workDir);
+    } catch {
+      throw refused();
+    }
+    const requested = resolve(root, params.path);
+    let target: string;
+    try {
+      target = realpathSync(requested);
+    } catch {
+      throw isWithinDir(root, requested) ? acp.RequestError.resourceNotFound(params.path) : refused();
+    }
+    if (!isWithinDir(root, target)) {
+      throw refused();
+    }
+    return { content: readFileSync(target, "utf8") };
   }
 
   async writeTextFile(): Promise<acp.WriteTextFileResponse> {
@@ -359,7 +385,7 @@ export async function runAcpClient(options: RunAcpClientOptions): Promise<number
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    const client = new HeadlessAcpClient(options.stdout, options.allow);
+    const client = new HeadlessAcpClient(options.stdout, options.allow, options.cwd ?? process.cwd());
     const connection = new acp.ClientSideConnection(() => client, stream);
 
     try {
