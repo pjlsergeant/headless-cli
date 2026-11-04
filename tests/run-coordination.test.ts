@@ -1606,8 +1606,8 @@ test("Docker run coordination mounts only the node mailbox, never the run direct
       0,
     );
     const output = stdout.join("");
-    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/requests:\/headless-mailbox\/requests /);
-    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/replies:\/headless-mailbox\/replies:ro /);
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/[0-9a-f-]+\/requests:\/headless-mailbox\/requests /);
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/[0-9a-f-]+\/replies:\/headless-mailbox\/replies:ro /);
     assert.match(output, /--env HEADLESS_RUN_MAILBOX=\/headless-mailbox /);
     assert.doesNotMatch(output, /HEADLESS_RUN_DIR|\/\.headless\/runs\/auth:/);
   } finally {

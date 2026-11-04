@@ -4,11 +4,12 @@ import {
   constants,
   fchmodSync,
   fstatSync,
-  lstatSync,
+  opendirSync,
   openSync,
   readFileSync,
-  readdirSync,
+  readSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -53,10 +54,17 @@ export const mailboxLimits = {
   promptChars: 100_000,
   /** Requests applied per poll; the rest wait for the next poll. */
   requestsPerPoll: 16,
+  /** Directory entries scanned per poll (dotfiles and junk included). */
+  entriesPerPoll: 512,
   /** Requests one container may submit over its lifetime. */
   requestsPerMailbox: 500,
+  /** Total request bytes the host reads over one launch. */
+  bytesPerLaunch: 8 * 1024 * 1024,
   /** Reply files kept before the oldest are removed. */
   replies: 64,
+  /** Old launch dirs cleaned, and entries unlinked, per new launch. */
+  cleanupDirs: 64,
+  cleanupEntries: 4096,
 };
 
 const requestFilePattern = /^([A-Za-z0-9-]{1,64})\.json$/;
@@ -64,6 +72,8 @@ const requestIdPattern = /^[A-Za-z0-9-]{1,64}$/;
 const privateFileMode = 0o600;
 
 export interface MailboxPaths {
+  /** mailboxes/<node>/<launch nonce>; one fresh directory per container. */
+  root: string;
   requests: string;
   replies: string;
 }
@@ -81,19 +91,28 @@ export interface MailboxReply {
   error?: string;
 }
 
-export function mailboxPaths(env: Env, runId: string, nodeId: string): MailboxPaths {
-  const root = join(runDirectory(env, runId), "mailboxes", nodeId);
-  return { requests: join(root, "requests"), replies: join(root, "replies") };
+function mailboxPathsFor(env: Env, runId: string, nodeId: string, nonce: string): MailboxPaths {
+  const root = join(runDirectory(env, runId), "mailboxes", nodeId, nonce);
+  return { root, requests: join(root, "requests"), replies: join(root, "replies") };
 }
 
-/** Creates the node's mailbox and discards anything a previous container left in it. */
+/** A representative (not created) mailbox path, for --print-command only. */
+export function previewMailboxPaths(env: Env, runId: string, nodeId: string): MailboxPaths {
+  return mailboxPathsFor(env, runId, nodeId, randomUUID());
+}
+
+/**
+ * Creates a fresh per-launch mailbox under a random nonce, so the host never
+ * reuses or has to clear a directory a previous container filled, and makes a
+ * bounded best-effort sweep of earlier launches' directories.
+ */
 export function prepareMailbox(env: Env, runId: string, nodeId: string): MailboxPaths {
-  const requests = ensureRunSubdirectory(env, runId, "mailboxes", nodeId, "requests");
-  const replies = ensureRunSubdirectory(env, runId, "mailboxes", nodeId, "replies");
-  for (const dir of [requests, replies]) {
-    for (const entry of readdirSync(dir)) removeEntry(join(dir, entry));
-  }
-  return { requests, replies };
+  const nodeRoot = ensureRunSubdirectory(env, runId, "mailboxes", nodeId);
+  cleanupOldLaunchDirs(nodeRoot);
+  const nonce = randomUUID();
+  const requests = ensureRunSubdirectory(env, runId, "mailboxes", nodeId, nonce, "requests");
+  const replies = ensureRunSubdirectory(env, runId, "mailboxes", nodeId, nonce, "replies");
+  return { root: join(nodeRoot, nonce), requests, replies };
 }
 
 export function dockerMailboxArgs(paths: MailboxPaths): string[] {
@@ -122,6 +141,8 @@ export class RunMailboxService {
   private timer: NodeJS.Timeout | undefined;
   private polling: Promise<void> | undefined;
   private processed = 0;
+  private acceptedBytes = 0;
+  private stopped = false;
   private lastSnapshot = "";
   private readonly replyNames: string[] = [];
 
@@ -151,36 +172,76 @@ export class RunMailboxService {
   }
 
   private async pollOnce(): Promise<void> {
+    if (this.stopped) return;
     try {
-      let names: string[];
-      try {
-        names = readdirSync(this.options.paths.requests);
-      } catch {
-        return;
+      const scan = this.scanRequests();
+      for (const name of scan.strays) {
+        removeEntry(join(this.options.paths.requests, name));
+        this.reject(name, undefined, "not a request file name");
       }
-      const requests: string[] = [];
-      for (const name of names) {
-        if (requestFilePattern.test(name)) {
-          requests.push(name);
-        } else if (!name.startsWith(".")) {
-          // Not a request; dot files are a client's in-progress writes.
-          removeEntry(join(this.options.paths.requests, name));
-          this.reject(name, undefined, "not a request file name");
-        }
-      }
-      requests.sort();
-      for (const name of requests.slice(0, mailboxLimits.requestsPerPoll)) {
+      for (const name of scan.matched) {
+        if (this.stopped) break;
         await this.processRequest(name);
       }
+      if (scan.overflow) this.halt("too many entries in the request directory");
     } catch (error) {
       this.logLine(`run mailbox error: ${errorMessage(error)}`);
     } finally {
-      try {
-        this.writeSnapshot();
-      } catch (error) {
-        this.logLine(`run mailbox snapshot error: ${errorMessage(error)}`);
+      if (!this.stopped) {
+        try {
+          this.writeSnapshot();
+        } catch (error) {
+          this.logLine(`run mailbox snapshot error: ${errorMessage(error)}`);
+        }
       }
     }
+  }
+
+  /**
+   * Reads at most entriesPerPoll directory entries with opendir, never
+   * recursing into subdirectories, so the work per poll is bounded no matter
+   * how many files a container plants. Returns request files to process (up
+   * to requestsPerPoll), stray names to discard, and whether the entry budget
+   * was hit.
+   */
+  private scanRequests(): { matched: string[]; strays: string[]; overflow: boolean } {
+    const matched: string[] = [];
+    const strays: string[] = [];
+    let overflow = false;
+    let dir;
+    try {
+      dir = opendirSync(this.options.paths.requests);
+    } catch {
+      return { matched, strays, overflow };
+    }
+    try {
+      let scanned = 0;
+      let entry = dir.readSync();
+      while (entry !== null) {
+        scanned += 1;
+        if (scanned > mailboxLimits.entriesPerPoll) {
+          overflow = true;
+          break;
+        }
+        const name = entry.name;
+        if (requestFilePattern.test(name)) {
+          if (matched.length < mailboxLimits.requestsPerPoll) matched.push(name);
+        } else if (!name.startsWith(".")) {
+          // Dot files are a client's in-progress writes; leave them.
+          if (strays.length < mailboxLimits.requestsPerPoll) strays.push(name);
+        }
+        entry = dir.readSync();
+      }
+    } finally {
+      dir.closeSync();
+    }
+    return { matched, strays, overflow };
+  }
+
+  private halt(reason: string): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.logLine(`run mailbox stopped for node ${this.options.nodeId}: ${reason}`);
   }
 
   private async processRequest(name: string): Promise<void> {
@@ -196,8 +257,15 @@ export class RunMailboxService {
       removeEntry(path);
     }
     this.processed += 1;
+    this.acceptedBytes += Buffer.byteLength(text);
     if (this.processed > mailboxLimits.requestsPerMailbox) {
       this.reject(name, id, `request limit reached (${mailboxLimits.requestsPerMailbox} per container)`);
+      this.halt("per-container request limit reached");
+      return;
+    }
+    if (this.acceptedBytes > mailboxLimits.bytesPerLaunch) {
+      this.reject(name, id, "request byte budget reached");
+      this.halt("per-container request byte budget reached");
       return;
     }
     const request = parseMailboxRequest(text, id);
@@ -343,23 +411,87 @@ function readRequestFile(path: string): string {
   try {
     const stats = fstatSync(descriptor);
     if (!stats.isFile()) throw new Error("request is not a regular file");
-    if (stats.size > mailboxLimits.requestBytes) throw new Error(`request exceeds ${mailboxLimits.requestBytes} bytes`);
-    const text = readFileSync(descriptor, "utf8");
-    if (Buffer.byteLength(text) > mailboxLimits.requestBytes) throw new Error(`request exceeds ${mailboxLimits.requestBytes} bytes`);
-    return text;
+    // A hard link lets the container keep or swap the inode behind our back.
+    if (stats.nlink !== 1) throw new Error("request has multiple hard links");
+    // Read straight from the fd into a fixed buffer rather than readFileSync,
+    // which would follow the inode to EOF even if the container grows it after
+    // the fstat (a TOCTOU that could exhaust host memory). One byte over the
+    // cap fills the buffer and the request is rejected.
+    const buffer = Buffer.allocUnsafe(mailboxLimits.requestBytes + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const read = readSync(descriptor, buffer, total, buffer.length - total, null);
+      if (read === 0) break;
+      total += read;
+    }
+    if (total > mailboxLimits.requestBytes) throw new Error(`request exceeds ${mailboxLimits.requestBytes} bytes`);
+    return buffer.toString("utf8", 0, total);
   } finally {
     closeSync(descriptor);
   }
 }
 
+/** Unlinks one entry without ever following a link or recursing into a directory. */
 function removeEntry(path: string): void {
   try {
-    const stats = lstatSync(path);
-    // rmSync never follows symlinks, so a planted link is removed, not its target.
-    rmSync(path, { force: true, recursive: stats.isDirectory() });
+    rmSync(path, { force: true });
   } catch {
-    // Already gone.
+    // A directory (rmSync without recursive refuses it) or already gone: leave it.
   }
+}
+
+/**
+ * Best-effort, bounded removal of earlier launches' mailbox directories once
+ * their containers are gone. Never recurses: it unlinks the files it finds in
+ * each launch's requests/ and replies/ up to a budget, then removes the empty
+ * directories. A launch dir an attacker nested deeper simply lingers.
+ */
+function cleanupOldLaunchDirs(nodeRoot: string): void {
+  let budget = mailboxLimits.cleanupEntries;
+  for (const name of listBounded(nodeRoot, mailboxLimits.cleanupDirs)) {
+    if (budget <= 0) break;
+    const launchDir = join(nodeRoot, name);
+    for (const sub of ["requests", "replies"]) {
+      const dir = join(launchDir, sub);
+      for (const entry of listBounded(dir, budget)) {
+        if (budget <= 0) break;
+        budget -= 1;
+        removeEntry(join(dir, entry));
+      }
+      removeDirIfEmpty(dir);
+    }
+    removeDirIfEmpty(launchDir);
+  }
+}
+
+/** rmdir of an empty directory; a non-empty one (deeper nesting) is left. */
+function removeDirIfEmpty(path: string): void {
+  try {
+    rmdirSync(path);
+  } catch {
+    // Not empty, not a directory, or already gone.
+  }
+}
+
+/** Up to `max` entry names from a directory, read with opendir; [] if absent. */
+function listBounded(dir: string, max: number): string[] {
+  const names: string[] = [];
+  let handle;
+  try {
+    handle = opendirSync(dir);
+  } catch {
+    return names;
+  }
+  try {
+    let entry = handle.readSync();
+    while (entry !== null && names.length < max) {
+      names.push(entry.name);
+      entry = handle.readSync();
+    }
+  } finally {
+    handle.closeSync();
+  }
+  return names;
 }
 
 function writeFileAtomic(path: string, text: string): void {

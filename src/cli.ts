@@ -113,7 +113,7 @@ import {
 import { compactOversizedTraceLine } from "./relevant-trace.js";
 import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl, startSandboxedNodeMessage } from "./run-commands.js";
-import { containerMailboxRoot, mailboxPaths, prepareMailbox, RunMailboxService, type MailboxPaths } from "./run-mailbox.js";
+import { containerMailboxRoot, previewMailboxPaths, prepareMailbox, RunMailboxService, type MailboxPaths } from "./run-mailbox.js";
 import { handleCronCommand as handleCronCommandImpl, type CronCommand } from "./cron-commands.js";
 import { cronRoot, runCronDaemon } from "./cron.js";
 import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
@@ -4893,7 +4893,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }, commandSessionPlan);
     // A Docker run node reaches its run only through its own mailbox.
     const runMailbox = parsed.docker && parsed.runId && parsed.role && nodeId
-      ? (parsed.printCommand ? mailboxPaths(env, parsed.runId, nodeId) : prepareMailbox(env, parsed.runId, nodeId))
+      ? (parsed.printCommand ? previewMailboxPaths(env, parsed.runId, nodeId) : prepareMailbox(env, parsed.runId, nodeId))
       : undefined;
     const buildAttemptCommand = (attemptEnv: Env, options: BuildOptions): BuiltCommand => {
       let built = withRunEnvironment(buildAgentCommand(parsed.agent!, options, attemptEnv), parsed.runId, nodeId);

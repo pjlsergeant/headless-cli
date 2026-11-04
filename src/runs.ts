@@ -28,6 +28,18 @@ import type { AgentName, AllowMode, Env, ReasoningEffort } from "./types.js";
 const privateDirMode = 0o700;
 const privateFileMode = 0o600;
 
+/**
+ * Message text is attacker-influenced (a container can send up to its prompt
+ * cap) and is stored in lastMessage and in every event, both of which are
+ * rewritten whole on each update. Keep only a short preview on the record;
+ * the full prompt still reaches the launched target through its command.
+ */
+export const messagePreviewChars = 4096;
+
+export function previewMessage(message: string): string {
+  return message.length <= messagePreviewChars ? message : `${message.slice(0, messagePreviewChars)}...[truncated]`;
+}
+
 export interface RunNode {
   runId: string;
   nodeId: string;
@@ -434,16 +446,17 @@ export function recordMessage(
     if (!run.nodes[targetNodeId]) {
       throw new Error(`unknown node in run ${runId}: ${targetNodeId}`);
     }
+    const preview = previewMessage(message);
     const sourceNode = run.nodes[fromNodeId];
     const messageOwner = sourceNode ?? run.nodes[targetNodeId];
-    messageOwner.lastMessage = message;
+    messageOwner.lastMessage = preview;
     messageOwner.updatedAt = now;
     addEvent(run, {
       type: "message_sent",
       runId,
       nodeId: fromNodeId,
       targetNodeId,
-      message,
+      message: preview,
       createdAt: now,
     });
     writeRun(env, run);

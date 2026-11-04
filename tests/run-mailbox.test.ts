@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -83,7 +83,9 @@ test("hostile mailbox requests are rejected, logged, and never applied", posixOn
     assert.match(String(reply(paths, "a1")?.error), /unexpected field: workDir/);
     assert.equal(reply(paths, "b3")?.error, "request is a symbolic link");
     assert.deepEqual(delivered, []);
-    assert.deepEqual(readdirSync(paths.requests), []);
+    // The planted subdirectory is never recursed into or rm -r'd; it lingers.
+    assert.deepEqual(readdirSync(paths.requests), ["b5.json"]);
+    assert.equal(statSync(join(paths.requests, "b5.json")).isDirectory(), true);
     assert.equal(readFileSync(canary, "utf8"), "original\n");
     const run = readRun(env, "auth");
     assert.equal(run?.nodes["worker-1"].status, "idle");
@@ -126,15 +128,20 @@ test("mailbox messages start Docker nodes from host state and only record the re
 });
 
 test("a mailbox stops accepting requests past its lifetime cap", posixOnly, async () => {
-  const { dir, paths, service } = fixture();
+  const { dir, paths, service, logs } = fixture();
   try {
-    for (let index = 0; index <= mailboxLimits.requestsPerMailbox; index += 1) {
-      submit(paths, `r${String(index).padStart(4, "0")}.json`, { version: 1, id: `r${String(index).padStart(4, "0")}`, op: "mark", status: "busy" });
-      if (index % mailboxLimits.requestsPerPoll === 0) await service.poll();
+    for (let index = 0; index <= mailboxLimits.requestsPerMailbox + 4; index += 1) {
+      const id = `r${String(index).padStart(4, "0")}`;
+      submit(paths, `${id}.json`, { version: 1, id, op: "mark", status: "busy" });
     }
-    while (readdirSync(paths.requests).length > 0) await service.poll();
-    const last = `r${String(mailboxLimits.requestsPerMailbox).padStart(4, "0")}`;
-    assert.match(String(reply(paths, last)?.error), /request limit reached/);
+    for (let pass = 0; pass < 200 && !logs.some((line) => /request limit reached/.test(line)); pass += 1) {
+      await service.poll();
+    }
+    assert.equal(logs.some((line) => /run mailbox stopped.*request limit reached/.test(line)), true);
+    assert.equal(readdirSync(paths.replies).some((name) => {
+      if (name === "run.json") return false;
+      return /request limit reached/.test(String(JSON.parse(readFileSync(join(paths.replies, name), "utf8")).error ?? ""));
+    }), true);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -230,11 +237,125 @@ test("a Docker orchestrator messages a Docker worker through its mailbox, and ca
     const orchestratorErr = readFileSync(nodeLogPath(env, "auth", "orchestrator", "stderr"), "utf8");
     assert.match(orchestratorErr, /rejected request "evil.json".*unexpected field/);
     assert.match(orchestratorErr, /rejected request "link.json"/);
-    assert.equal(existsSync(join(runDirectory(env, "auth"), "mailboxes", "worker-1", "requests")), true);
+    assert.equal(readdirSync(join(runDirectory(env, "auth"), "mailboxes", "worker-1")).length >= 1, true);
     // Let the detached worker that ran worker-1 release its node lock.
     const lock = join(runDirectory(env, "auth"), "nodes", "worker-1", "session.lock");
     const deadline = Date.now() + 10_000;
     while (existsSync(lock) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("an oversized request grown after its header is rejected without reading to EOF (TOCTOU)", posixOnly, async () => {
+  const { dir, paths, service } = fixture();
+  try {
+    // A file far larger than the cap, written in one go: readSync stops at the
+    // cap + 1 bytes and rejects, instead of reading the whole inode.
+    const huge = Buffer.alloc(mailboxLimits.requestBytes * 8, 0x20);
+    writeFileSync(join(paths.requests, "big.json"), huge);
+    await service.poll();
+    assert.match(String(reply(paths, "big")?.error), /exceeds .* bytes/);
+    assert.deepEqual(readdirSync(paths.requests), []);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a hard-linked request is rejected", posixOnly, async () => {
+  const { dir, paths, service } = fixture();
+  try {
+    const original = join(dir, "original.json");
+    writeFileSync(original, JSON.stringify({ version: 1, id: "h1", op: "mark", status: "busy" }));
+    execFileSync("ln", [original, join(paths.requests, "h1.json")]);
+    await service.poll();
+    assert.match(String(reply(paths, "h1")?.error), /multiple hard links/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a flood of files stops the mailbox within one bounded poll", posixOnly, async () => {
+  const { dir, paths, service, logs } = fixture();
+  try {
+    for (let index = 0; index < mailboxLimits.entriesPerPoll + 200; index += 1) {
+      writeFileSync(join(paths.requests, `junk-${index}.txt`), "x");
+    }
+    writeFileSync(join(paths.requests, "ok.json"), JSON.stringify({ version: 1, id: "ok", op: "mark", status: "busy" }));
+    await service.poll();
+    assert.equal(logs.some((line) => /run mailbox stopped/.test(line)), true);
+    // Further requests are ignored once stopped.
+    writeFileSync(join(paths.requests, "later.json"), JSON.stringify({ version: 1, id: "later", op: "mark", status: "idle" }));
+    await service.poll();
+    assert.equal(reply(paths, "later"), undefined);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("subdirectories planted in the request dir are never recursed into or removed", posixOnly, async () => {
+  const { dir, paths, service } = fixture();
+  try {
+    const nested = join(paths.requests, "evil.json");
+    mkdirSync(nested);
+    writeFileSync(join(nested, "deep.json"), "x");
+    await service.poll();
+    // Named like a request: opened without following, found not a regular file.
+    assert.match(String(reply(paths, "evil")?.error), /not a regular file/);
+    assert.equal(existsSync(join(nested, "deep.json")), true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("the per-launch request byte budget stops the mailbox", posixOnly, async () => {
+  const { dir, paths, service, logs } = fixture();
+  try {
+    const body = "y".repeat(mailboxLimits.requestBytes - 200);
+    const count = Math.ceil(mailboxLimits.bytesPerLaunch / body.length) + 2;
+    for (let index = 0; index < count; index += 1) {
+      const id = `b${String(index).padStart(4, "0")}`;
+      writeFileSync(join(paths.requests, `${id}.json`), JSON.stringify({ version: 1, id, op: "message", target: "worker-1", prompt: body, async: true }));
+    }
+    while (readdirSync(paths.requests).length > 0 && !logs.some((line) => /byte budget/.test(line))) {
+      await service.poll();
+    }
+    assert.equal(logs.some((line) => /byte budget/.test(line)), true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("a fresh launch sweeps an earlier launch's mailbox directory", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-mailbox-test-"));
+  try {
+    const env = { HOME: join(dir, "home") };
+    registerNode(env, node("worker-1", "docker"));
+    const first = prepareMailbox(env, "auth", "worker-1");
+    writeFileSync(join(first.requests, "leftover.json"), "x");
+    const second = prepareMailbox(env, "auth", "worker-1");
+    assert.notEqual(first.root, second.root);
+    assert.equal(existsSync(first.root), false, "old launch dir should be swept");
+    assert.equal(existsSync(second.requests), true);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("message text is stored only as a bounded preview in run state", posixOnly, async () => {
+  const { dir, env, paths, service } = fixture();
+  try {
+    const prompt = "Z".repeat(mailboxLimits.promptChars);
+    submit(paths, "p1.json", { version: 1, id: "p1", op: "message", target: "host-node", prompt, async: true });
+    await service.poll();
+    const run = readRun(env, "auth");
+    const stored = run?.nodes.orchestrator.lastMessage ?? "";
+    assert.equal(stored.length < 5000, true, `stored ${stored.length} chars`);
+    assert.match(stored, /\[truncated\]$/);
+    const event = run?.events.find((candidate) => candidate.type === "message_sent");
+    assert.equal((event?.message?.length ?? 0) < 5000, true);
+    const runJsonBytes = readFileSync(join(runDirectory(env, "auth"), "run.json"));
+    assert.equal(runJsonBytes.length < 50_000, true, `run.json ${runJsonBytes.length} bytes`);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

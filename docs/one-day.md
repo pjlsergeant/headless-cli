@@ -26,7 +26,8 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - Docker launch options (`--docker-image`, `--docker-arg`, `--docker-env`) are not persisted per node, so a host-side `run message` to a Docker or Modal node is refused instead of relaunching it in its sandbox; only a running Docker node's mailbox can start one (with its own flags).
 - Nodes a container starts through its mailbox are detached and outlive the requesting container, like host `run message --async`; nothing stops them when the orchestrator exits without `run wait`.
 - Explicit `--docker-env NAME=value` entries are handed to nodes started from a mailbox on the detached child's argv (visible in `ps`), as they already were for the original invocation.
-- A container can leave dot-prefixed files in its mailbox `requests/` (treated as in-progress writes and never removed until the node's next launch), using disk in the run dir.
-- Two concurrent launches of the same Docker run node share one mailbox; the second launch clears requests and replies the first had pending.
+- A container can leave dot-prefixed files in its mailbox `requests/` (treated as in-progress writes), using disk in the run dir until that launch directory is swept.
+- Two concurrent launches of the same Docker run node get separate mailbox directories; a later launch may sweep the other's directory while it is still polling. (Concurrent launches of one node are already unsupported.)
 - User-supplied `--docker-arg` volume mounts are not checked for overlap with Headless state.
 - Flaky under full-suite load: "cron daemon keeps its signal handlers until active executions are killed" (tests/cron.test.ts) failed once in a full run, passes alone; timing-sensitive.
+- Attacker-filled old mailbox launch directories can linger: the bounded best-effort sweep on the next launch does not recurse into subdirectories a container nested inside its mailbox.

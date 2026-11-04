@@ -96,8 +96,8 @@ A Docker run node never sees the host run directory. Each one gets a private mai
 
 | Host path | Container path | Access |
 | --- | --- | --- |
-| `~/.headless/runs/<run>/mailboxes/<node>/requests` | `/headless-mailbox/requests` | read-write |
-| `~/.headless/runs/<run>/mailboxes/<node>/replies` | `/headless-mailbox/replies` | read-only |
+| `~/.headless/runs/<run>/mailboxes/<node>/<launch>/requests` | `/headless-mailbox/requests` | read-write |
+| `~/.headless/runs/<run>/mailboxes/<node>/<launch>/replies` | `/headless-mailbox/replies` | read-only |
 
 `HEADLESS_RUN_MAILBOX=/headless-mailbox` tells the `headless` inside the container to use it. There, the run commands work against the node's own run only:
 
@@ -106,7 +106,7 @@ A Docker run node never sees the host run directory. Each one gets a private mai
 - `run mark <run> <own-node> --status ...` can change only the container's own node.
 - Launching a new run node from inside the container (`headless <agent> --run ...`) is refused.
 
-The host process that launched the container reads each request file, validates it strictly (a regular file of at most 256 KiB, a known operation with exactly its fields, a valid known target node id, a prompt of at most 100,000 characters, at most 16 requests per poll and 500 per container), and applies it under the run lock. Rejected requests are logged to the node's `latest.stderr.log` and answered with an error reply. Nothing a container writes is used as a host path, command, work dir, permission mode, or environment variable.
+Each container gets a fresh mailbox under a random `<launch>` directory, so the host never reuses or has to clear a directory a container filled; earlier launches' directories are swept on a bounded best-effort pass. The host process that launched the container reads each request file, validates it strictly (a single-hard-link regular file read into a fixed 256 KiB buffer, a known operation with exactly its fields, a valid known target node id, a prompt of at most 100,000 characters), and applies it under the run lock. It scans at most a few hundred directory entries and processes at most 16 requests per poll, and stops servicing a mailbox for the rest of the launch if a container floods it with entries, exceeds 500 requests, or exceeds an 8 MiB request-byte budget. Only a short preview of message text is stored in run state; the full prompt reaches the launched target through its command. Rejected requests are logged to the node's `latest.stderr.log` and answered with an error reply. Nothing a container writes is used as a host path, command, work dir, permission mode, or environment variable.
 
 Containerized run nodes currently support `oneshot` coordination only; explicit `--docker --coordination session` and `--docker --session` run-node combinations are rejected because follow-up `run message` invocations do not persist Docker launch options.
 
