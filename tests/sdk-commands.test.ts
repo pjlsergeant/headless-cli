@@ -30,6 +30,7 @@ test("SDK run list and view return persisted run records", async () => {
     const env = { ...process.env, HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",

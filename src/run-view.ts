@@ -28,7 +28,7 @@ export function renderRunList(runs: RunRecord[]): string {
   });
 }
 
-export function renderRunView(run: RunRecord): string {
+export function renderRunView(run: RunRecord, stdoutLogPath?: (nodeId: string) => string): string {
   const nodes = Object.values(run.nodes).sort((left, right) => left.nodeId.localeCompare(right.nodeId));
   const mode = nodes.find((node) => node.nodeId === "orchestrator")?.coordination ?? nodes[0]?.coordination ?? "unknown";
   const now = Date.now();
@@ -88,7 +88,7 @@ export function renderRunView(run: RunRecord): string {
   lines.push(
     renderTable({
       columns: ["NODE", "COMMAND"],
-      rows: commandRows(run.runId, nodes),
+      rows: commandRows(run.runId, nodes, stdoutLogPath),
     }).trimEnd(),
   );
   return `${lines.join("\n")}\n`;
@@ -134,15 +134,15 @@ function renderMessageRow(event: RunEvent): string[] {
   ];
 }
 
-function commandRows(runId: string, nodes: RunNode[]): string[][] {
+function commandRows(runId: string, nodes: RunNode[], stdoutLogPath?: (nodeId: string) => string): string[][] {
   const rows: string[][] = [];
   for (const node of nodes) {
     rows.push([node.nodeId, `headless run message ${runId} ${node.nodeId} --prompt "..."`]);
     if (node.tmuxSessionName) {
       rows.push([node.nodeId, tmuxAttachCommand(node.tmuxSessionName)]);
     }
-    if (node.logs) {
-      rows.push([node.nodeId, `tail -f ${node.logs.stdout}`]);
+    if (stdoutLogPath) {
+      rows.push([node.nodeId, `tail -f ${stdoutLogPath(node.nodeId)}`]);
     }
   }
   return rows;

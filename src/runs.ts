@@ -1,9 +1,11 @@
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
+  constants,
   existsSync,
   fchmodSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -26,6 +28,18 @@ import type { AgentName, AllowMode, Env, ReasoningEffort } from "./types.js";
 const privateDirMode = 0o700;
 const privateFileMode = 0o600;
 
+/**
+ * Message text is attacker-influenced (a container can send up to its prompt
+ * cap) and is stored in lastMessage and in every event, both of which are
+ * rewritten whole on each update. Keep only a short preview on the record;
+ * the full prompt still reaches the launched target through its command.
+ */
+export const messagePreviewChars = 4096;
+
+export function previewMessage(message: string): string {
+  return message.length <= messagePreviewChars ? message : `${message.slice(0, messagePreviewChars)}...[truncated]`;
+}
+
 export interface RunNode {
   runId: string;
   nodeId: string;
@@ -47,13 +61,22 @@ export interface RunNode {
   workDir?: string;
   sessionAlias?: string;
   tmuxSessionName?: string;
-  logs?: {
-    stdout: string;
-    stderr: string;
-  };
+  /**
+   * Where the host launched this node: recorded at registration from the
+   * host's own invocation. A sandboxed node is never relaunched on the host.
+   */
+  sandbox: SandboxKind;
   metrics?: RunNodeMetrics;
   createdAt: string;
   updatedAt: string;
+}
+
+export type SandboxKind = "none" | "docker" | "modal";
+
+const sandboxKinds: readonly SandboxKind[] = ["none", "docker", "modal"];
+
+export function isSandboxKind(value: unknown): value is SandboxKind {
+  return typeof value === "string" && (sandboxKinds as readonly string[]).includes(value);
 }
 
 export interface RunNodeMetrics {
@@ -130,6 +153,7 @@ export interface RegisterNodeInput {
   workDir?: string;
   sessionAlias?: string;
   tmuxSessionName?: string;
+  sandbox: SandboxKind;
 }
 
 export function validateRunId(value: string | undefined, label: string): string {
@@ -139,10 +163,22 @@ export function validateRunId(value: string | undefined, label: string): string 
   return value;
 }
 
+export function isValidRunId(value: unknown): value is string {
+  return typeof value === "string" && value !== "." && value !== ".." && /^[A-Za-z0-9_.-]+$/.test(value);
+}
+
+export function validateNodeId(value: string | undefined): string {
+  return validateRunId(value, "node");
+}
+
 export function runDirectory(env: Env, runId: string): string {
+  validateRunId(runId, "run");
   const override = env.HEADLESS_RUN_DIR;
   if (override) {
-    return basename(override) === runId ? override : override;
+    if (basename(override) !== runId) {
+      throw new Error(`HEADLESS_RUN_DIR is for run ${basename(override)}, not ${runId}`);
+    }
+    return override;
   }
   if (!env.HOME) {
     throw new Error("HOME is required for --run");
@@ -161,15 +197,16 @@ export function runStoreRoot(env: Env): string {
 }
 
 export function nodeDirectory(env: Env, runId: string, nodeId: string): string {
-  return join(runDirectory(env, runId), "nodes", nodeId);
+  return join(runDirectory(env, runId), "nodes", validateNodeId(nodeId));
 }
 
 export function nodeLockPath(env: Env, runId: string, nodeId: string): string {
   return join(nodeDirectory(env, runId, nodeId), "session.lock");
 }
 
+/** Derived from the ids alone; never read from run state. */
 export function nodeLogPath(env: Env, runId: string, nodeId: string, stream: "stdout" | "stderr"): string {
-  return readRun(env, runId)?.nodes[nodeId]?.logs?.[stream] ?? logPaths(env, runId, nodeId)[stream];
+  return join(nodeDirectory(env, runId, nodeId), `latest.${stream}.log`);
 }
 
 export function appendNodeLog(
@@ -183,27 +220,57 @@ export function appendNodeLog(
     return;
   }
   const path = nodeLogPath(env, runId, nodeId, stream);
-  ensurePrivateDir(dirname(path));
+  ensureNodeDir(env, runId, nodeId);
   appendPrivateFile(path, text);
 }
 
+/** Opens the node's log for appending (no symlink following); caller closes it. */
+export function openNodeLog(env: Env, runId: string, nodeId: string, stream: "stdout" | "stderr"): number {
+  ensureNodeDir(env, runId, nodeId);
+  return openPrivateAppend(nodeLogPath(env, runId, nodeId, stream));
+}
+
 export function readRun(env: Env, runId: string): RunRecord | undefined {
+  const state = readRunState(env, runId);
+  return state.kind === "ok" ? state.run : undefined;
+}
+
+type RunState = { kind: "missing" } | { kind: "invalid" } | { kind: "ok"; run: RunRecord };
+
+function readRunState(env: Env, runId: string): RunState {
   const path = join(runDirectory(env, runId), "run.json");
   if (!existsSync(path)) {
-    return undefined;
+    return { kind: "missing" };
   }
+  let text: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Omit<RunRecord, "version">> & { version?: number };
-    if ((parsed.version !== 1 && parsed.version !== 2) || parsed.runId !== runId || !parsed.nodes || !parsed.events) {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return { kind: "invalid" };
+  }
+  const run = parseRunRecord(text, runId);
+  return run ? { kind: "ok", run } : { kind: "invalid" };
+}
+
+/** Parses run state text for runId; undefined when it is not valid run state. */
+export function parseRunRecord(text: string, runId: string): RunRecord | undefined {
+  try {
+    const parsed = JSON.parse(text) as Partial<Omit<RunRecord, "version">> & { version?: number };
+    if (
+      !isPlainObject(parsed) || parsed.version !== 2 || parsed.runId !== runId
+      || !isPlainObject(parsed.nodes) || !Array.isArray(parsed.events)
+    ) {
       return undefined;
     }
-    const nodes = parsed.version === 1
-      ? Object.fromEntries(Object.entries(parsed.nodes).map(([nodeId, node]) => {
-          const migrated = { ...node };
-          if (migrated.fast === false) delete migrated.fast;
-          return [nodeId, migrated];
-        }))
-      : parsed.nodes;
+    // Node ids name directories under the run dir: drop any entry whose key
+    // is not a valid id or does not match the node it holds.
+    const nodes: Record<string, RunNode> = {};
+    for (const [nodeId, node] of Object.entries(parsed.nodes as Record<string, unknown>)) {
+      if (!isValidRunId(nodeId) || !isPlainObject(node)) continue;
+      const candidate = node as unknown as RunNode;
+      if (candidate.nodeId !== nodeId || candidate.runId !== runId || !isSandboxKind(candidate.sandbox)) continue;
+      nodes[nodeId] = candidate;
+    }
     return {
       version: 2,
       runId,
@@ -217,12 +284,17 @@ export function readRun(env: Env, runId: string): RunRecord | undefined {
   }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function listRuns(env: Env): RunRecord[] {
   const root = runStoreRoot(env);
   if (!existsSync(root)) {
     return [];
   }
   return readdirSync(root)
+    .filter(isValidRunId)
     .map((entry) => readRun({ ...env, HEADLESS_RUN_DIR: join(root, entry) }, entry))
     .filter((run): run is RunRecord => Boolean(run))
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
@@ -231,10 +303,25 @@ export function listRuns(env: Env): RunRecord[] {
 export function registerNode(env: Env, input: RegisterNodeInput): RunNode {
   validateRunId(input.runId, "run");
   validateRunId(input.nodeId, "node");
+  if (!isSandboxKind(input.sandbox)) {
+    throw new Error(`invalid sandbox kind for node ${input.nodeId}`);
+  }
   return withRunLock(env, input.runId, () => {
-    const run = readRun(env, input.runId) ?? emptyRun(input.runId);
+    const state = readRunState(env, input.runId);
+    if (state.kind === "invalid") {
+      // Never replace state we could not read: that would silently discard
+      // the run's roster and history.
+      throw new Error(`run state is unreadable: ${input.runId}`);
+    }
+    const run = state.kind === "ok" ? state.run : emptyRun(input.runId);
     const now = new Date().toISOString();
     const existing = run.nodes[input.nodeId];
+    if (existing && existing.sandbox !== input.sandbox) {
+      throw new Error(
+        `node ${input.nodeId} in run ${input.runId} was launched with sandbox ${existing.sandbox}; `
+        + `relaunch it with the same sandbox (${sandboxFlag(existing.sandbox)}), not ${sandboxFlag(input.sandbox)}`,
+      );
+    }
     const status =
       existing?.status === "busy" && input.status === "starting"
         ? "busy"
@@ -259,7 +346,7 @@ export function registerNode(env: Env, input: RegisterNodeInput): RunNode {
       workDir: input.workDir ?? existing?.workDir,
       sessionAlias: input.sessionAlias ?? existing?.sessionAlias,
       tmuxSessionName: input.tmuxSessionName ?? existing?.tmuxSessionName,
-      logs: existing?.logs ?? logPaths(env, input.runId, input.nodeId),
+      sandbox: input.sandbox,
       metrics: existing?.metrics,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -290,6 +377,7 @@ export function updateNodeStatus(
   metrics?: RunNodeMetrics,
 ): RunNode {
   validateRunId(runId, "run");
+  validateNodeId(nodeId);
   return withRunLock(env, runId, () => {
     const run = requireRun(env, runId);
     const node = requireNode(run, nodeId);
@@ -351,22 +439,24 @@ export function recordMessage(
   message: string,
 ): void {
   validateRunId(runId, "run");
+  validateNodeId(targetNodeId);
   withRunLock(env, runId, () => {
     const run = requireRun(env, runId);
     const now = new Date().toISOString();
     if (!run.nodes[targetNodeId]) {
       throw new Error(`unknown node in run ${runId}: ${targetNodeId}`);
     }
+    const preview = previewMessage(message);
     const sourceNode = run.nodes[fromNodeId];
     const messageOwner = sourceNode ?? run.nodes[targetNodeId];
-    messageOwner.lastMessage = message;
+    messageOwner.lastMessage = preview;
     messageOwner.updatedAt = now;
     addEvent(run, {
       type: "message_sent",
       runId,
       nodeId: fromNodeId,
       targetNodeId,
-      message,
+      message: preview,
       createdAt: now,
     });
     writeRun(env, run);
@@ -375,15 +465,15 @@ export function recordMessage(
 
 export function acquireNodeLock(env: Env, runId: string, nodeId: string, owner?: NodeStoreLockOwner): () => void {
   const lockPath = nodeLockPath(env, runId, nodeId);
-  ensurePrivateDir(dirname(lockPath));
+  ensureNodeDir(env, runId, nodeId);
   return acquireNodeStoreLock(lockPath, nodeId, owner);
 }
 
 export function writeRun(env: Env, run: RunRecord): void {
   const dir = runDirectory(env, run.runId);
   ensurePrivateDir(dir);
-  for (const node of Object.values(run.nodes)) {
-    ensurePrivateDir(nodeDirectory(env, run.runId, node.nodeId));
+  for (const nodeId of Object.keys(run.nodes)) {
+    ensureNodeDir(env, run.runId, nodeId);
   }
   run.updatedAt = new Date().toISOString();
   const path = join(dir, "run.json");
@@ -401,10 +491,11 @@ export function writeRun(env: Env, run: RunRecord): void {
     rmSync(tmpPath, { force: true });
   }
   chmodSync(path, privateFileMode);
-  const eventsPath = join(dir, "events.jsonl");
-  const event = run.events.at(-1);
-  if (event) {
-    appendPrivateFile(eventsPath, `${JSON.stringify(event)}\n`);
+  // Every event the transaction added, not just the last one.
+  const events = pendingEvents.get(run) ?? [];
+  pendingEvents.delete(run);
+  if (events.length > 0) {
+    appendPrivateFile(join(dir, "events.jsonl"), events.map((event) => `${JSON.stringify(event)}\n`).join(""));
   }
 }
 
@@ -442,29 +533,25 @@ function requireNode(run: RunRecord, nodeId: string): RunNode {
 
 function emptyRun(runId: string): RunRecord {
   const now = new Date().toISOString();
-  return {
-    version: 2,
-    runId,
-    createdAt: now,
-    updatedAt: now,
-    nodes: {},
-    events: [{ type: "run_started", runId, createdAt: now }],
-  };
+  const run: RunRecord = { version: 2, runId, createdAt: now, updatedAt: now, nodes: {}, events: [] };
+  addEvent(run, { type: "run_started", runId, createdAt: now });
+  return run;
 }
 
+const pendingEvents = new WeakMap<RunRecord, RunEvent[]>();
+
 function addEvent(run: RunRecord, event: RunEvent): void {
+  const pending = pendingEvents.get(run) ?? [];
+  pending.push(event);
+  pendingEvents.set(run, pending);
   run.events.push(event);
   if (run.events.length > 200) {
     run.events = run.events.slice(-200);
   }
 }
 
-function logPaths(env: Env, runId: string, nodeId: string): { stdout: string; stderr: string } {
-  const dir = nodeDirectory(env, runId, nodeId);
-  return {
-    stdout: join(dir, "latest.stdout.log"),
-    stderr: join(dir, "latest.stderr.log"),
-  };
+function sandboxFlag(sandbox: SandboxKind): string {
+  return sandbox === "none" ? "no sandbox" : `--${sandbox}`;
 }
 
 function ensurePrivateDir(path: string): void {
@@ -472,9 +559,70 @@ function ensurePrivateDir(path: string): void {
   chmodSync(path, privateDirMode);
 }
 
+/**
+ * Creates <runDir>/nodes/<nodeId> without following a symbolic link at
+ * either level, so a planted link cannot redirect the chmod or later writes.
+ */
+function ensureNodeDir(env: Env, runId: string, nodeId: string): void {
+  const runDir = runDirectory(env, runId);
+  ensurePrivateDir(runDir);
+  ensureRealPrivateDir(join(runDir, "nodes"));
+  ensureRealPrivateDir(nodeDirectory(env, runId, nodeId));
+}
+
+/**
+ * Creates <runDir>/<segments...> one private directory at a time, refusing
+ * any level that is a symbolic link or not a directory. Returns the path.
+ */
+export function ensureRunSubdirectory(env: Env, runId: string, ...segments: string[]): string {
+  let path = runDirectory(env, runId);
+  ensurePrivateDir(path);
+  for (const segment of segments) {
+    validateRunId(segment, "run store path segment");
+    path = join(path, segment);
+    ensureRealPrivateDir(path);
+  }
+  return path;
+}
+
+function ensureRealPrivateDir(path: string): void {
+  try {
+    mkdirSync(path, { mode: privateDirMode });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const stats = lstatSync(path);
+  if (!stats.isDirectory()) {
+    throw new Error(`run store path is not a directory: ${path}`);
+  }
+  chmodSync(path, privateDirMode);
+}
+
+function openPrivateAppend(path: string): number {
+  const descriptor = openSync(
+    path,
+    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0),
+    privateFileMode,
+  );
+  try {
+    if (!fstatSync(descriptor).isFile()) {
+      throw new Error(`run store path is not a regular file: ${path}`);
+    }
+    fchmodSync(descriptor, privateFileMode);
+    return descriptor;
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
 function appendPrivateFile(path: string, text: string): void {
-  appendFileSync(path, text, { mode: privateFileMode });
-  chmodSync(path, privateFileMode);
+  const descriptor = openPrivateAppend(path);
+  try {
+    writeFileSync(descriptor, text);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function unique(values: string[]): string[] {

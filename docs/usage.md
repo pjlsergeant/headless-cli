@@ -200,7 +200,7 @@ headless codex --docker --session bughunt --prompt "Continue the investigation a
 The workdir is always persisted through its normal host bind mount. A durable Docker session additionally persists the agent home; seed files are copied only when they do not already exist, so later turns cannot overwrite native conversation state. Delete the corresponding directory to reset the Docker session. Set `HEADLESS_DOCKER_SESSION_ROOT` to use a different absolute root directory.
 
 Durable Docker sessions currently require POSIX filesystem permissions and are rejected on Windows hosts. An existing custom root must be owned by the current user, must not be group- or world-writable, must not overlap the workdir, and must not grant access through a permissive macOS ACL; Headless preserves its existing mode. Its parent chain must also be owned by the current user or root and must not be writable by other users unless the directory has the sticky bit, as with `/tmp`.
-In all Docker modes, the workdir must remain separate from the reserved `/headless-home` container path.
+In all Docker modes, the workdir must remain separate from the reserved `/headless-home` container path. The workdir also must not overlap Headless state in either direction (contain it or be inside it): `~/.headless`, the run store, `HEADLESS_CRON_DIR`, or `HEADLESS_DOCKER_SESSION_ROOT`, compared both as configured and after resolving symlinks (so `--work-dir ~`, `--work-dir ~/.headless/runs/<run>`, or a `HEADLESS_RUN_DIR` that reaches through a link under the work dir are refused). Mounts you add with `--docker-arg` are not checked.
 
 Docker mode cannot be combined with `--tmux`, `send`, `rename`, or `--list`.
 
@@ -341,7 +341,9 @@ See [orchestration.md](orchestration.md) for `--role`, `--run`, `--node`, `--tea
 - `HEADLESS_DOCKER_SESSION_ROOT`: root for durable Docker session homes. Defaults to `~/.headless/docker-sessions`.
 - `HEADLESS_CLI_BIN`: binary path the cron daemon uses to start scheduled Headless invocations.
 - `HEADLESS_BIN`: fallback binary path for detached Headless child invocations.
-- `HEADLESS_RUN_DIR`: concrete directory for the active run store, mainly used by Docker run coordination.
+- `HEADLESS_RUN_DIR`: concrete directory for one run; its final path component must be that run id, and other run ids are refused.
+- `HEADLESS_RUN_MAILBOX`: set inside Docker run-node containers to the node's mailbox (`/headless-mailbox`); run commands there go through it instead of a run directory. See [orchestration](orchestration.md#docker-run-coordination).
+- `HEADLESS_RUN_MAILBOX_INTERVAL_MS`: how often the host polls a Docker run node's mailbox. Defaults to `200`.
 - `HEADLESS_KILL_GRACE_MS`: how long a signalled agent process tree gets to exit before it is `SIGKILL`ed (parent signals, `--timeout`, cron kill/stop/rm, ACP shutdown, async workers). Defaults to `5000`.
 
 On POSIX, Headless terminates the agent's whole process tree: its process group plus, at signal time, every descendant found by parent PID (so a descendant that called `setsid` is still killed). This includes the cleanup after an agent exits on its own, which reaches only processes that remain in the agent's process group or are still descendants when Headless looks. Some agent CLIs start their shell commands in a separate session (verified for Claude Code: a `sleep &` run by its Bash tool gets its own session and is reparented to init within milliseconds), so background processes those agents start are not cleaned up. The same applies to programs that daemonize (`setsid`, `tmux new-session -d`, pm2, and similar) and to any descendant that double-forks and is reparented away before Headless looks. Agents started with `--tmux` belong to the tmux server by design and are not killed when Headless exits. Cron executions report their agent's process group to the daemon, so `cron kill`/`stop`/`rm --force` reach the agent even if the Headless process itself has died.

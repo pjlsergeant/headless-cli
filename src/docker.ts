@@ -19,6 +19,7 @@ import { getAgentConfig } from "./agents.js";
 import { readCodexBaseFiles, readCodexProfileFiles } from "./codex-profile.js";
 import { IN_CONTAINER_ENV } from "./container.js";
 import { collectForwardedEnvEntries, type ForwardedEnvEntry } from "./env.js";
+import { dockerMailboxArgs, type MailboxPaths } from "./run-mailbox.js";
 import { quoteArg } from "./shell.js";
 import type { AgentName, BuiltCommand, Env } from "./types.js";
 
@@ -53,8 +54,8 @@ export interface DockerAgentCommandOptions {
   persistentHome?: string;
   persistentVolume?: string;
   profile?: string;
-  runDirHost?: string;
-  runId?: string;
+  /** A run node's mailbox; the run directory itself is never mounted. */
+  runMailbox?: MailboxPaths;
   sessionBootstrap?: DockerSessionBootstrap;
   workDir: string;
 }
@@ -120,6 +121,41 @@ export function validateDockerSessionRootWorkDir(sessionHome: string, workDir: s
   if (pathsOverlap(sessionRoot, canonicalWorkDir)) {
     throw new Error("Docker session root must not overlap the work dir");
   }
+}
+
+/**
+ * The work dir is mounted read-write, so it must not overlap Headless's own
+ * trusted state (run store, cron, session stores) in either direction: a
+ * container could rewrite state inside it, or a work dir inside a state root
+ * would mount that state. Both the configured (lexical) and the canonical
+ * paths are compared, so a state path that reaches through a symlink under
+ * the work dir -- which the container could repoint later -- is refused too.
+ */
+export function validateDockerWorkDirExcludesState(workDir: string, stateRoots: string[]): void {
+  const workDirs = unique([resolve(workDir), realpathSync(workDir)]);
+  for (const root of stateRoots) {
+    const roots = unique([resolve(root), canonicalProspectivePath(root)]);
+    for (const candidateWorkDir of workDirs) {
+      for (const candidateRoot of roots) {
+        if (pathsOverlap(candidateWorkDir, candidateRoot)) {
+          throw new Error(
+            `Docker work dir ${candidateWorkDir} overlaps Headless state (${candidateRoot}); `
+            + "choose a work dir that neither contains nor is inside it",
+          );
+        }
+      }
+    }
+  }
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+export function dockerSessionRootPath(env: Env): string | undefined {
+  const configuredRoot = env[DOCKER_SESSION_ROOT_ENV]?.trim();
+  if (configuredRoot) return configuredRoot;
+  return env.HOME ? join(env.HOME, ".headless", "docker-sessions") : undefined;
 }
 
 export function validateDockerWorkDir(workDir: string): void {
@@ -342,16 +378,14 @@ export function buildDockerAgentCommand(options: DockerAgentCommandOptions): Bui
   const workDir = realpathSync(options.workDir);
   const dockerEnvEntries = collectDockerEnvEntries(options.env, options.command.env, options.dockerEnv);
   args.push("--workdir", workDir, "--volume", `${workDir}:${workDir}`);
-  if (options.runDirHost && options.runId) {
-    const containerRunDir = `/headless-runs/${options.runId}`;
-    args.push("--volume", `${options.runDirHost}:${containerRunDir}`, "--env", `HEADLESS_RUN_DIR=${containerRunDir}`);
-  }
   args.push(...agentConfigMountArgs(options.agent, options.env, options.profile));
   args.push(...credentialMountArgs(options.env, dockerEnvEntries, workDir));
   args.push(...dockerEnvArgs(dockerEnvEntries));
   args.push(...options.dockerArgs);
   // Always last before the image, so no forwarded or user-supplied value
-  // overrides it: inside, headless refuses the cron daemon and nested --docker.
+  // overrides them: inside, headless refuses the cron daemon and nested
+  // --docker, and reaches its run only through the mailbox.
+  if (options.runMailbox) args.push(...dockerMailboxArgs(options.runMailbox));
   args.push("--env", `${IN_CONTAINER_ENV}=1`);
   const maskedEnvNames = Object.entries(options.command.env ?? {})
     .filter(([, value]) => value === undefined).map(([name]) => name);

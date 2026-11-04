@@ -16,7 +16,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { runAcpClient, runAcpStdioAgent } from "./acp.js";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { constants as osConstants, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { PiCompletionObserver } from "./pi-completion.js";
@@ -66,6 +66,8 @@ import {
   readDockerCursorSessionId,
   validateDockerSessionRootWorkDir,
   validateDockerWorkDir,
+  validateDockerWorkDirExcludesState,
+  dockerSessionRootPath,
 } from "./docker.js";
 import {
   buildModalRunSummary,
@@ -110,9 +112,10 @@ import {
 } from "./process-tree.js";
 import { compactOversizedTraceLine } from "./relevant-trace.js";
 import { OpencodeUsageAccumulator } from "./opencode-usage.js";
-import { handleRunCommand as handleRunCommandImpl } from "./run-commands.js";
+import { handleRunCommand as handleRunCommandImpl, startSandboxedNodeMessage } from "./run-commands.js";
+import { containerMailboxRoot, previewMailboxPaths, prepareMailbox, RunMailboxService, type MailboxPaths } from "./run-mailbox.js";
 import { handleCronCommand as handleCronCommandImpl, type CronCommand } from "./cron-commands.js";
-import { runCronDaemon } from "./cron.js";
+import { cronRoot, runCronDaemon } from "./cron.js";
 import { hostOnlyError, runningInHeadlessContainer } from "./container.js";
 import { extractRunNodeMetrics } from "./run-metrics.js";
 import { createRunStatusReporter, parseRunStatusIntervalMs } from "./run-status.js";
@@ -125,7 +128,9 @@ import {
   readRun,
   registerNode,
   runDirectory,
+  runStoreRoot,
   updateNodeStatus,
+  type SandboxKind,
   validateRunId,
   type RunNode,
 } from "./runs.js";
@@ -3578,6 +3583,56 @@ function validateCronAddCliOptions(parsed: ParsedArgs): void {
   }
 }
 
+/**
+ * Returns env with HEADLESS_RUN_DIR set to the run directory's canonical
+ * path, resolved now. Detached workers inherit it, so they never re-resolve.
+ */
+function pinRunDirectoryEnv(env: Env, runId: string): Env {
+  const canonical = realpathSync(runDirectory(env, runId));
+  if (basename(canonical) !== runId) {
+    throw new CliError(`run directory for ${runId} resolves to ${canonical}, whose name is not the run id`);
+  }
+  return { ...env, HEADLESS_RUN_DIR: canonical };
+}
+
+/** Everything Headless trusts on the host; a Docker work dir must overlap none of it. */
+function headlessStateRoots(env: Env): string[] {
+  const roots: Array<string | undefined> = [
+    env.HOME ? join(env.HOME, ".headless") : undefined,
+    env.HOME || env.HEADLESS_RUN_DIR ? runStoreRoot(env) : undefined,
+    env.HOME || env.HEADLESS_CRON_DIR ? cronRoot(env) : undefined,
+    sessionStorePath(env) ? dirname(sessionStorePath(env) as string) : undefined,
+    dockerSessionRootPath(env),
+  ];
+  return roots.filter((root): root is string => Boolean(root)).map((root) => resolve(root));
+}
+
+function createRunMailboxService(
+  env: Env,
+  parsed: ParsedArgs,
+  runId: string,
+  nodeId: string,
+  paths: MailboxPaths,
+  log: (text: string) => void,
+): RunMailboxService {
+  // The host's own Docker flags for this node: nodes started from its
+  // mailbox run in the same kind of sandbox, configured the same way.
+  const sandboxArgs = [
+    "--docker",
+    "--docker-image", parsed.dockerImage ?? DEFAULT_DOCKER_IMAGE,
+    ...parsed.dockerArgs.flatMap((value) => ["--docker-arg", value]),
+    ...parsed.dockerEnv.flatMap((value) => ["--docker-env", value]),
+  ];
+  return new RunMailboxService({
+    env,
+    runId,
+    nodeId,
+    paths,
+    log,
+    deliver: (target, prompt, fromNodeId) => startSandboxedNodeMessage(env, runId, target, prompt, fromNodeId, sandboxArgs),
+  });
+}
+
 function withRunEnvironment(command: BuiltCommand, runId: string | undefined, nodeId: string | undefined): BuiltCommand {
   if (!runId && !nodeId) {
     return command;
@@ -4398,6 +4453,12 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     if (parsed.runId !== undefined && parsed.role === undefined) {
       throw new CliError("--run requires --role");
     }
+    if (parsed.runId !== undefined && containerMailboxRoot(env)) {
+      throw new CliError(
+        "inside a headless Docker run node, reach other run nodes with headless run message; "
+        + "launching run nodes from a container is not supported",
+      );
+    }
     if (parsed.nodeId !== undefined && parsed.runId === undefined) {
       throw new CliError("--node requires --run");
     }
@@ -4447,6 +4508,11 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     const cwd = validateWorkDir(parsed.workDir);
     if (parsed.docker) {
       validateDockerWorkDir(cwd ?? process.cwd());
+      try {
+        validateDockerWorkDirExcludesState(cwd ?? process.cwd(), headlessStateRoots(env));
+      } catch (error) {
+        throw toCliError(error);
+      }
     }
     const existingTmuxSession = parsed.tmux && parsed.sessionAlias
       ? await headlessTmuxSessionExists(buildHeadlessTmuxSessionName(parsed.agent, parsed.sessionAlias), env)
@@ -4474,6 +4540,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       throw new CliError("--role orchestrator with --run cannot use --allow read-only; it must be able to launch child nodes and update run state");
     }
     const team = parsed.teamSpecs.length > 0 ? expandTeamSpecs(parsed.agent, parsed.teamSpecs) : [];
+    // From this invocation, never from run state: team nodes share the
+    // orchestrator's sandbox, and a sandboxed node is never run on the host.
+    const runSandbox: SandboxKind = parsed.docker ? "docker" : parsed.modal ? "modal" : "none";
     if (!parsed.printCommand && parsed.runId && parsed.role && nodeId) {
       for (const teamNode of team) {
         const teamDefaults = resolveInvocationDefaults(teamNode.agent, teamNode.role, {}, env, config);
@@ -4493,6 +4562,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           reasoningEffort: teamDefaults.reasoningEffort,
           workDir: cwd ?? process.cwd(),
           sessionAlias: teamNode.nodeId,
+          sandbox: runSandbox,
         });
       }
       registerNode(env, {
@@ -4512,6 +4582,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         reasoningEffort: configuredDefaults.reasoningEffort,
         workDir: cwd ?? process.cwd(),
         sessionAlias: coordination === "session" ? (parsed.sessionAlias ?? nodeId) : parsed.sessionAlias,
+        sandbox: runSandbox,
       });
       registeredRunNode = { runId: parsed.runId, nodeId };
     }
@@ -4583,6 +4654,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                   workDir: cwd ?? process.cwd(),
                   sessionAlias: parsed.sessionAlias ?? nodeId,
                   tmuxSessionName: sessionName,
+                  sandbox: "none",
                 });
               } else {
                 updateNodeStatus(env, parsed.runId, nodeId, "failed", `tmux command exited with code ${code}`);
@@ -4730,6 +4802,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                 workDir: cwd ?? process.cwd(),
                 sessionAlias: parsed.sessionAlias ?? parsed.tmuxName ?? nodeId,
                 tmuxSessionName: tmuxCommands.sessionName,
+                sandbox: "none",
               });
             } else {
               updateNodeStatus(env, parsed.runId, nodeId, "failed", `tmux command exited with code ${code}`);
@@ -4831,6 +4904,19 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       allow, fast, reasoningEffort: configuredDefaults.reasoningEffort,
       timeoutSeconds: parsed.modal ? modalTimeoutSeconds : commandTimeoutSeconds,
     }, commandSessionPlan);
+    // A Docker run node reaches its run only through its own mailbox. The run
+    // directory is resolved once to its canonical path and pinned for the
+    // mailbox service and any nodes it starts, so nothing re-resolves a
+    // configured path through a link the container could repoint later.
+    const isDockerRunNode = Boolean(parsed.docker && parsed.runId && parsed.role && nodeId);
+    const pinnedRunEnv = isDockerRunNode && !parsed.printCommand
+      ? pinRunDirectoryEnv(env, parsed.runId!)
+      : env;
+    const runMailbox = isDockerRunNode
+      ? (parsed.printCommand
+          ? previewMailboxPaths(env, parsed.runId!, nodeId!)
+          : prepareMailbox(pinnedRunEnv, parsed.runId!, nodeId!))
+      : undefined;
     const buildAttemptCommand = (attemptEnv: Env, options: BuildOptions): BuiltCommand => {
       let built = withRunEnvironment(buildAgentCommand(parsed.agent!, options, attemptEnv), parsed.runId, nodeId);
       const masks = Object.fromEntries(Object.entries(attemptEnv).filter(([, value]) => value === undefined));
@@ -4844,7 +4930,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           }),
           env: attemptEnv, hostUser: detectDockerHostUser(), image: parsed.dockerImage ?? DEFAULT_DOCKER_IMAGE,
           persistentHome: dockerSessionHome, persistentVolume: temporaryBillingVolume, profile: effectiveProfile,
-          runDirHost: parsed.runId ? runDirectory(env, parsed.runId) : undefined, runId: parsed.runId,
+          runMailbox,
           sessionBootstrap: parsed.agent === "cursor" && sessionPlan?.mode === "new" && dockerSessionHome ? "initialize-cursor" : undefined,
           workDir: cwd ?? process.cwd(),
         });
@@ -4919,7 +5005,11 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       waitingSpinner?.clear();
       stderr(text);
     };
+    const runMailboxService = runMailbox && parsed.runId && nodeId
+      ? createRunMailboxService(pinnedRunEnv, parsed, parsed.runId, nodeId, runMailbox, displayStderr)
+      : undefined;
     statusReporter?.start();
+    runMailboxService?.start();
     waitingSpinner?.start();
     let result: ExecuteResult | undefined;
     let billingResult: BillingRunResult | undefined;
@@ -5204,6 +5294,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       }
       return result.code;
     } finally {
+      await runMailboxService?.stop();
       statusReporter?.stop();
     }
   } catch (error) {

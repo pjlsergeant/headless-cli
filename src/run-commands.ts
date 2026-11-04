@@ -1,6 +1,5 @@
-import { closeSync, openSync } from "node:fs";
+import { closeSync } from "node:fs";
 import { fork, type ChildProcess } from "node:child_process";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { extractFinalMessage } from "./output.js";
@@ -11,13 +10,23 @@ import {
   acquireNodeLock,
   appendNodeLog,
   listRuns,
+  nodeLogPath,
+  openNodeLog,
   readRun,
   recordMessage,
-  runDirectory,
   updateNodeStatus,
   type RunNode,
   type RunRecord,
 } from "./runs.js";
+import {
+  containerMailboxRoot,
+  newRequestId,
+  readMailboxSnapshot,
+  submitMailboxRequest,
+  waitForMailboxReply,
+  type MailboxReply,
+  type MailboxRequest,
+} from "./run-mailbox.js";
 import { quoteCommand } from "./shell.js";
 import { renderSdkResult, type SdkFormat } from "./sdk.js";
 import type { AgentName, Env } from "./types.js";
@@ -49,6 +58,10 @@ export interface RunCommandHandlers {
 }
 
 export async function handleRunCommand(input: RunCommandInput, handlers: RunCommandHandlers): Promise<number> {
+  const mailboxRoot = containerMailboxRoot(handlers.env);
+  if (mailboxRoot) {
+    return await handleMailboxRunCommand(input, handlers, mailboxRoot);
+  }
   if (input.command === "list") {
     const runs = listRuns(handlers.env);
     handlers.stdout(
@@ -68,7 +81,7 @@ export async function handleRunCommand(input: RunCommandInput, handlers: RunComm
     handlers.stdout(
       input.sdkFormat
         ? renderSdkResult("runs.view", { run: sdkRunView(run) })
-        : renderRunView(run),
+        : renderRunView(run, (nodeId) => nodeLogPath(handlers.env, runId, nodeId, "stdout")),
     );
     return 0;
   }
@@ -90,6 +103,98 @@ export async function handleRunCommand(input: RunCommandInput, handlers: RunComm
     return await handleRunMessage(input, handlers, runId);
   }
   throw new Error("unsupported run command");
+}
+
+/**
+ * Inside a Docker run node: there is no run directory, only the node's
+ * mailbox. Reads come from the host's read-only snapshot; changes are
+ * requests the host validates and applies.
+ */
+async function handleMailboxRunCommand(
+  input: RunCommandInput,
+  handlers: RunCommandHandlers,
+  root: string,
+): Promise<number> {
+  const ownRunId = handlers.env.HEADLESS_RUN_ID;
+  const ownNodeId = handlers.env.HEADLESS_RUN_NODE;
+  if (!ownRunId || !ownNodeId) {
+    throw new Error("run mailbox requires HEADLESS_RUN_ID and HEADLESS_RUN_NODE");
+  }
+  const snapshot = (): RunRecord => {
+    const run = readMailboxSnapshot(root, ownRunId);
+    if (!run) throw new Error(`run state for ${ownRunId} is not available in this container yet`);
+    return run;
+  };
+  if (input.command === "list") {
+    const runs = [snapshot()];
+    handlers.stdout(input.sdkFormat ? renderSdkResult("runs.list", { runs: runs.map(sdkRunSummary) }) : renderRunList(runs));
+    return 0;
+  }
+  const runId = requireValue(input.runId, "run");
+  if (runId !== ownRunId) {
+    throw new Error(`this container can only reach its own run (${ownRunId}), not ${runId}`);
+  }
+  if (input.command === "view") {
+    const run = snapshot();
+    handlers.stdout(input.sdkFormat ? renderSdkResult("runs.view", { run: sdkRunView(run) }) : renderRunView(run));
+    return 0;
+  }
+  if (input.command === "wait") {
+    const intervalMs = parseDelayMs(handlers.env.HEADLESS_RUN_WAIT_INTERVAL_MS, 1000);
+    while (Object.values(snapshot().nodes).some((node) => node.nodeId !== ownNodeId && isActive(node.status))) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    handlers.stdout(`run idle: ${runId}\n`);
+    return 0;
+  }
+  const nodeId = requireValue(input.nodeId, "node");
+  if (input.command === "mark") {
+    if (!input.status) throw new Error("run mark requires --status");
+    if (nodeId !== ownNodeId) {
+      throw new Error(`a container can only mark its own node (${ownNodeId})`);
+    }
+    const reply = await sendMailboxRequest(handlers.env, root, { version: 1, id: newRequestId(), op: "mark", status: input.status });
+    if (!reply.ok) throw new Error(reply.error ?? "run mailbox rejected the request");
+    handlers.stdout(`marked: ${runId}/${nodeId} ${input.status}\n`);
+    return 0;
+  }
+  if (input.command !== "message") throw new Error("unsupported run command");
+  const prompt = await handlers.resolvePrompt();
+  const request = {
+    version: 1 as const, id: newRequestId(), op: "message" as const, target: nodeId, prompt: prompt.prompt, async: input.async,
+  };
+  if (input.printCommand) {
+    handlers.stdout(`${JSON.stringify(request)}\n`);
+    return 0;
+  }
+  const reply = await sendMailboxRequest(handlers.env, root, request);
+  if (!reply.ok) throw new Error(reply.error ?? "run mailbox rejected the request");
+  if (!reply.delivered) {
+    handlers.stderr(`headless: message recorded in run ${runId} but not delivered: ${reply.error ?? "unknown reason"}\n`);
+    return 1;
+  }
+  if (input.async) {
+    handlers.stdout(`started: ${runId}/${nodeId}\n`);
+    return 0;
+  }
+  const intervalMs = parseDelayMs(handlers.env.HEADLESS_RUN_WAIT_INTERVAL_MS, 1000);
+  while (true) {
+    const target = snapshot().nodes[nodeId];
+    if (!target || !isActive(target.status)) {
+      if (target?.lastMessage) handlers.stdout(`${target.lastMessage}\n`);
+      return target?.status === "idle" || target?.status === "done" ? 0 : 1;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+async function sendMailboxRequest(env: Env, root: string, request: MailboxRequest): Promise<MailboxReply> {
+  submitMailboxRequest(root, request);
+  return await waitForMailboxReply(root, request.id, parseDelayMs(env.HEADLESS_RUN_MAILBOX_TIMEOUT_MS, 60_000));
+}
+
+function isActive(status: RunStatus): boolean {
+  return status === "busy" || status === "starting";
 }
 
 function sdkRunSummary(run: RunRecord): Record<string, unknown> {
@@ -180,6 +285,14 @@ async function handleRunMessage(
   const node = run.nodes[nodeId];
   if (!node) {
     throw new Error(`unknown node in run ${runId}: ${nodeId}`);
+  }
+  if (node.sandbox !== "none") {
+    // The host never runs a sandboxed node outside its sandbox: its stored
+    // settings (work dir, permissions) were chosen for that sandbox.
+    throw new Error(
+      `node ${nodeId} in run ${runId} runs in ${node.sandbox}; headless cannot relaunch it on the host. `
+      + `Run it again with headless ${node.agent} --role ${node.role} --run ${runId} --node ${nodeId} --${node.sandbox} --prompt "..."`,
+    );
   }
   const prompt = await handlers.resolvePrompt();
 
@@ -309,12 +422,44 @@ async function startAsyncRunMessage(
   node: RunNode,
   prompt: string,
 ): Promise<number> {
-  const stderrLog = node.logs?.stderr ?? join(runDirectory(handlers.env, runId), "nodes", nodeId, "latest.stderr.log");
-  const errFd = openSync(stderrLog, "a");
+  await startDetachedNodeMessage(handlers.env, runId, nodeId, node, prompt, handlers.env.HEADLESS_RUN_NODE || "cli", []);
+  handlers.stdout(`started: ${runId}/${nodeId}\n`);
+  return 0;
+}
+
+/**
+ * Starts a node from a container's mailbox request, in the same sandbox as
+ * the requesting node: sandboxArgs are the host's own launch flags for it.
+ * Everything else comes from the host's run state.
+ */
+export async function startSandboxedNodeMessage(
+  env: Env,
+  runId: string,
+  node: RunNode,
+  prompt: string,
+  fromNodeId: string,
+  sandboxArgs: string[],
+): Promise<void> {
+  if (node.sandbox !== "docker" || !sandboxArgs.includes("--docker")) {
+    throw new Error(`node ${node.nodeId} cannot be started in this sandbox`);
+  }
+  await startDetachedNodeMessage(env, runId, node.nodeId, node, prompt, fromNodeId, sandboxArgs);
+}
+
+async function startDetachedNodeMessage(
+  env: Env,
+  runId: string,
+  nodeId: string,
+  node: RunNode,
+  prompt: string,
+  fromNodeId: string,
+  sandboxArgs: string[],
+): Promise<void> {
+  const errFd = openNodeLog(env, runId, nodeId, "stderr");
   let worker: ChildProcess;
   try {
     worker = fork(asyncRunMessageWorkerPath(), [], {
-      env: handlers.env as NodeJS.ProcessEnv,
+      env: env as NodeJS.ProcessEnv,
       detached: true,
       stdio: ["ignore", "ignore", errFd, "ipc"],
     });
@@ -323,23 +468,23 @@ async function startAsyncRunMessage(
   }
 
   const task: AsyncRunMessageTask = {
-    command: buildNodeInvocationCommand(handlers.env, runId, nodeId, node, prompt),
+    command: withExtraArgs(buildNodeInvocationCommand(env, runId, nodeId, node, prompt), sandboxArgs),
     cwd: node.workDir,
     runId,
     nodeId,
   };
   await prepareAsyncWorker(worker, task);
   try {
-    recordMessage(handlers.env, runId, handlers.env.HEADLESS_RUN_NODE || "cli", nodeId, prompt);
-    updateNodeStatus(handlers.env, runId, nodeId, "busy");
+    recordMessage(env, runId, fromNodeId, nodeId, prompt);
+    updateNodeStatus(env, runId, nodeId, "busy");
     const timestamp = new Date().toISOString();
-    appendNodeLog(handlers.env, runId, nodeId, "stdout", `\n===== async message ${timestamp} =====\n`);
-    appendNodeLog(handlers.env, runId, nodeId, "stderr", `\n===== async message ${timestamp} =====\n`);
+    appendNodeLog(env, runId, nodeId, "stdout", `\n===== async message ${timestamp} =====\n`);
+    appendNodeLog(env, runId, nodeId, "stderr", `\n===== async message ${timestamp} =====\n`);
     await startPreparedAsyncWorker(worker);
   } catch (error) {
     try {
       updateNodeStatus(
-        handlers.env,
+        env,
         runId,
         nodeId,
         "failed",
@@ -353,8 +498,10 @@ async function startAsyncRunMessage(
   }
   if (worker.connected) worker.disconnect();
   worker.unref();
-  handlers.stdout(`started: ${runId}/${nodeId}\n`);
-  return 0;
+}
+
+function withExtraArgs(command: { command: string; args: string[] }, extra: string[]): { command: string; args: string[] } {
+  return { command: command.command, args: [...command.args, ...extra] };
 }
 
 function prepareAsyncWorker(worker: ChildProcess, task: AsyncRunMessageTask): Promise<void> {

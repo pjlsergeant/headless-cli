@@ -13,6 +13,7 @@ test("run status reporter emits initial summary and status transitions once", ()
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -22,6 +23,7 @@ test("run status reporter emits initial summary and status transitions once", ()
     });
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -58,6 +60,7 @@ test("run status reporter emits message routes without prompt text", () => {
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -67,6 +70,7 @@ test("run status reporter emits message routes without prompt text", () => {
     });
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -101,6 +105,7 @@ test("run status reporter emits final idle summary on stop", () => {
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -110,6 +115,7 @@ test("run status reporter emits final idle summary on stop", () => {
     });
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -143,6 +149,7 @@ test("run status reporter colors log levels and statuses when enabled", () => {
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -178,6 +185,7 @@ test("NO_COLOR disables run status colors", () => {
     const env = { HOME: join(dir, "home"), NO_COLOR: "1" };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -218,6 +226,7 @@ test("run status reporter truncates long log lines within configured columns", (
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "very-long-authentication-orchestration-run",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",

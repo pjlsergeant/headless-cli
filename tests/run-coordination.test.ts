@@ -10,6 +10,7 @@ import {
   acquireNodeLock,
   appendNodeLog,
   nodeLockPath,
+  nodeLogPath,
   readRun,
   registerNode,
   runDirectory,
@@ -86,6 +87,7 @@ test("run store registers nodes, records dependencies, and rejects concurrent lo
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -98,10 +100,11 @@ test("run store registers nodes, records dependencies, and rejects concurrent lo
     const run = readRun(env, "auth");
     assert.equal(run?.nodes["worker-1"].dependsOn[0], "explorer");
     assert.equal(run?.nodes["worker-1"].fast, undefined);
-    assert.equal(run?.nodes["worker-1"].logs?.stdout.endsWith("latest.stdout.log"), true);
+    assert.equal("logs" in (run?.nodes["worker-1"] ?? {}), false);
     assert.equal(existsSync(join(env.HOME, ".headless", "runs", "auth", "run.json")), true);
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -111,6 +114,7 @@ test("run store registers nodes, records dependencies, and rejects concurrent lo
     });
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -129,45 +133,6 @@ test("run store registers nodes, records dependencies, and rejects concurrent lo
   }
 });
 
-test("run store migrates legacy implicit standard mode to ambient", () => {
-  const dir = mkdtempSync(join(tmpdir(), "headless-run-test-"));
-  try {
-    const env = { HOME: join(dir, "home") };
-    const runDir = join(env.HOME, ".headless", "runs", "legacy");
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(join(runDir, "run.json"), JSON.stringify({
-      version: 1,
-      runId: "legacy",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
-      nodes: {
-        worker: {
-          runId: "legacy",
-          nodeId: "worker",
-          role: "worker",
-          agent: "codex",
-          coordination: "session",
-          status: "idle",
-          dependsOn: [],
-          planned: true,
-          unplanned: false,
-          fast: false,
-          createdAt: "2026-01-01T00:00:00.000Z",
-          updatedAt: "2026-01-01T00:00:00.000Z",
-        },
-      },
-      events: [],
-    }));
-
-    const migrated = readRun(env, "legacy");
-
-    assert.equal(migrated?.version, 2);
-    assert.equal(migrated?.nodes.worker.fast, undefined);
-  } finally {
-    rmSync(dir, { force: true, recursive: true });
-  }
-});
-
 test("run store writes private run files, logs, and locks", () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-run-test-"));
   const previousUmask = process.umask(0);
@@ -175,6 +140,7 @@ test("run store writes private run files, logs, and locks", () => {
     const env = { HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -210,6 +176,7 @@ test("run store removes its temporary state file after replacement fails", () =>
     const env = { ...process.env, HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -240,6 +207,7 @@ test("run store rejects dot segment run and node names", () => {
       coordination: "session" as const,
       status: "planned" as const,
       planned: true,
+      sandbox: "none" as const,
     };
 
     assert.throws(
@@ -273,6 +241,7 @@ test("run store preserves concurrent status updates from async children", async 
     for (let index = 0; index < nodeCount; index += 1) {
       registerNode(env, {
         runId,
+        sandbox: "none",
         nodeId: `worker-${index}`,
         role: "worker",
         agent: "codex",
@@ -401,7 +370,7 @@ test("orchestrator run registers declared team and injects run context", async (
     assert.equal(run?.nodes["worker-2"].fast, true);
     assert.equal(run?.nodes.reviewer.fast, undefined);
     assert.equal(run?.nodes.reviewer.role, "reviewer");
-    const orchestratorLog = readFileSync(run?.nodes.orchestrator.logs?.stdout ?? "", "utf8");
+    const orchestratorLog = readFileSync(nodeLogPath(env, "auth", "orchestrator", "stdout"), "utf8");
     assert.match(orchestratorLog, /node invocation/);
     assert.match(orchestratorLog, /orchestrator final/);
     const prompt = readFileSync(stdinCapture, "utf8");
@@ -484,6 +453,7 @@ test("direct run-node launches preserve stored fast mode", async () => {
     };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -529,6 +499,7 @@ test("direct run-node launches do not inherit fast mode across agents", async ()
     const env = { ...process.env, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -572,6 +543,7 @@ test("existing tmux run-node sends preserve stored fast mode", async () => {
     const env = { ...process.env, HOME: join(dir, "home"), PATH: `${binDir}:${process.env.PATH ?? ""}` };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -819,6 +791,7 @@ test("run list, view, mark, and wait operate on local run state", async () => {
     const env = { ...process.env, HOME: join(dir, "home"), HEADLESS_RUN_WAIT_INTERVAL_MS: "1" };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -828,6 +801,7 @@ test("run list, view, mark, and wait operate on local run state", async () => {
     });
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -889,6 +863,7 @@ test("run list, view, mark, and wait operate on local run state", async () => {
 
     registerNode(env, {
       runId: "self-wait",
+      sandbox: "none",
       nodeId: "orchestrator",
       role: "orchestrator",
       agent: "codex",
@@ -953,7 +928,7 @@ test("run message resumes stored session nodes", async () => {
     );
     assert.equal(stdout.join(""), "resumed final\n");
     const run = readRun(env, "auth");
-    const workerLog = readFileSync(run?.nodes["worker-1"].logs?.stdout ?? "", "utf8");
+    const workerLog = readFileSync(nodeLogPath(env, "auth", "worker-1", "stdout"), "utf8");
     assert.match(workerLog, /started final/);
     assert.match(workerLog, /resumed final/);
     const calls = readFileSync(captureFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -992,6 +967,7 @@ test("run message applies a planned session node profile on its first turn", asy
     };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1033,6 +1009,7 @@ test("run message routes tmux nodes through tmux buffers", async () => {
     const env = { ...process.env, HEADLESS_TMUX_CAPTURE: captureFile, HOME: join(dir, "home"), PATH: `${binDir}:${process.env.PATH ?? ""}` };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1069,6 +1046,7 @@ test("run wait reconciles completed tmux nodes from native transcripts", async (
     const env = { ...process.env, HOME: home };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1124,6 +1102,7 @@ test("run view assigns same-workdir native transcripts to one tmux node each", a
     for (const nodeId of ["worker-1", "worker-2"]) {
       registerNode(env, {
         runId: "auth",
+        sandbox: "none",
         nodeId,
         role: "worker",
         agent: "codex",
@@ -1203,6 +1182,7 @@ test("run message marks tmux nodes busy after sending input", async () => {
     const env = { ...process.env, HEADLESS_TMUX_CAPTURE: captureFile, HOME: join(dir, "home"), PATH: `${binDir}:${process.env.PATH ?? ""}` };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1285,6 +1265,7 @@ test("run message --print-command does not execute or mutate session nodes", asy
     };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1321,6 +1302,7 @@ test("run message does not record delivery when a session node is locked", async
     const env = { ...process.env, HOME: join(dir, "home") };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1399,6 +1381,7 @@ test("run message --async records busy status, logs output, and marks completion
     };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "pi",
@@ -1406,7 +1389,7 @@ test("run message --async records busy status, logs output, and marks completion
       status: "idle",
       planned: true,
     });
-    const initialStdoutLog = readRun(env, "auth")?.nodes["worker-1"].logs?.stdout ?? "";
+    const initialStdoutLog = nodeLogPath(env, "auth", "worker-1", "stdout");
     writeFileSync(initialStdoutLog, "previous output\\n");
 
     assert.equal(
@@ -1429,7 +1412,7 @@ test("run message --async records busy status, logs output, and marks completion
     );
     assert.match(lockedStderr.join(""), /node is locked: worker-1/);
     await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "idle");
-    const stdoutLog = readRun(env, "auth")?.nodes["worker-1"].logs?.stdout ?? "";
+    const stdoutLog = nodeLogPath(env, "auth", "worker-1", "stdout");
     await waitFor(() => existsSync(stdoutLog) && readFileSync(stdoutLog, "utf8").includes("async child output"));
     const stdoutText = readFileSync(stdoutLog, "utf8");
     assert.match(stdoutText, /previous output/);
@@ -1475,6 +1458,7 @@ test("run message --async logs child stderr before marking failure", async () =>
     const env = { ...process.env, HEADLESS_CLI_BIN: fakeHeadless, HOME: home };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "pi",
@@ -1491,7 +1475,7 @@ test("run message --async logs child stderr before marking failure", async () =>
       0,
     );
     await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
-    const stderrLog = readRun(env, "auth")?.nodes["worker-1"].logs?.stderr ?? "";
+    const stderrLog = nodeLogPath(env, "auth", "worker-1", "stderr");
     const stderrText = readFileSync(stderrLog, "utf8");
     assert.match(stderrText, /child boom before logging/);
     assert.match(stderrText, /async child exited with code 9/);
@@ -1536,6 +1520,7 @@ test("run message --async uses HEADLESS_BIN for detached child invocations", asy
     };
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1569,6 +1554,7 @@ test("run message --async print-command renders an executable async invocation w
     const stdout: string[] = [];
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "explorer-1",
       role: "explorer",
       agent: "claude",
@@ -1595,7 +1581,7 @@ test("run message --async print-command renders an executable async invocation w
   }
 });
 
-test("Docker run coordination mounts the host run directory", async () => {
+test("Docker run coordination mounts only the node mailbox, never the run directory", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-run-test-"));
   try {
     const env = { ...process.env, HOME: join(dir, "home") };
@@ -1619,8 +1605,11 @@ test("Docker run coordination mounts the host run directory", async () => {
       ),
       0,
     );
-    assert.match(stdout.join(""), /--volume .*\/\.headless\/runs\/auth:\/headless-runs\/auth/);
-    assert.match(stdout.join(""), /--env HEADLESS_RUN_DIR=\/headless-runs\/auth/);
+    const output = stdout.join("");
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/[0-9a-f-]+\/requests:\/headless-mailbox\/requests /);
+    assert.match(output, /--volume [^ ]*\/\.headless\/runs\/auth\/mailboxes\/orchestrator\/[0-9a-f-]+\/replies:\/headless-mailbox\/replies:ro /);
+    assert.match(output, /--env HEADLESS_RUN_MAILBOX=\/headless-mailbox /);
+    assert.doesNotMatch(output, /HEADLESS_RUN_DIR|\/\.headless\/runs\/auth:/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -1689,6 +1678,7 @@ test("run nodes keep --keep-background for later invocations", async () => {
     mkdirSync(env.HOME);
     registerNode(env, {
       runId: "auth",
+      sandbox: "none",
       nodeId: "worker-1",
       role: "worker",
       agent: "codex",
@@ -1698,7 +1688,7 @@ test("run nodes keep --keep-background for later invocations", async () => {
       keepBackground: true,
     });
     // A later registration without the flag (e.g. a status refresh) keeps it.
-    registerNode(env, { runId: "auth", nodeId: "worker-1", role: "worker", agent: "codex", coordination: "oneshot" });
+    registerNode(env, { sandbox: "none", runId: "auth", nodeId: "worker-1", role: "worker", agent: "codex", coordination: "oneshot" });
     assert.equal(readRun(env, "auth")?.nodes["worker-1"].keepBackground, true);
     const stdout: string[] = [];
     assert.equal(
