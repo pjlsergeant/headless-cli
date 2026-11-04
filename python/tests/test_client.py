@@ -37,6 +37,7 @@ def test_run_builds_structured_one_shot_command(
         docker_args=["--network=none"],
         docker_env=["TOKEN"],
         timeout_seconds=30,
+        keep_background=True,
         usage=True,
     )
 
@@ -78,6 +79,7 @@ def test_run_builds_structured_one_shot_command(
         "TOKEN",
         "--timeout",
         "30",
+        "--keep-background",
         "--usage",
         "--sdk-format",
         "json",
@@ -341,6 +343,7 @@ def test_cron_add_exposes_scheduled_run_options(
         docker_args=["--net=host"],
         docker_env=["TOKEN"],
         timeout_seconds=60,
+        keep_background=True,
         json=True,
         debug=True,
         usage=True,
@@ -374,6 +377,7 @@ def test_cron_add_exposes_scheduled_run_options(
         "TOKEN",
         "--timeout",
         "60",
+        "--keep-background",
         "--json",
         "--debug",
         "--usage",

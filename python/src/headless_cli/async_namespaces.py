@@ -166,6 +166,7 @@ class AsyncCron:
         modal_secrets: Sequence[str] | None = None,
         modal_timeout: int | None = None,
         timeout_seconds: int | None = None,
+        keep_background: bool = False,
         json: bool = False,
         debug: bool = False,
         usage: bool = False,
@@ -201,6 +202,8 @@ class AsyncCron:
         append_many(args, "--modal-secret", modal_secrets)
         append_value(args, "--modal-timeout", modal_timeout)
         append_value(args, "--timeout", timeout_seconds)
+        if keep_background:
+            args.append("--keep-background")
         for enabled, flag in (
             (json, "--json"),
             (debug, "--debug"),

@@ -50,6 +50,7 @@ def build_run_args(
     modal_env: Sequence[str] | None = None,
     modal_include_git: bool = False,
     timeout_seconds: int | None = None,
+    keep_background: bool = False,
     session: str | None = None,
     json: bool = False,
     debug: bool = False,
@@ -101,6 +102,8 @@ def build_run_args(
     if modal_include_git:
         args.append("--modal-include-git")
     append_value(args, "--timeout", timeout_seconds)
+    if keep_background:
+        args.append("--keep-background")
     append_value(args, "--session", session)
     for enabled, flag in (
         (json, "--json"),
