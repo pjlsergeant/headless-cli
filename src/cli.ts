@@ -103,7 +103,12 @@ import {
   acquireLaunchLock,
   isDockerSessionLockSignalListener,
 } from "./launch-lock.js";
-import { forceKillWindowsProcessTree } from "./process-tree.js";
+import {
+  childProcessTree,
+  forceKillWindowsProcessTree,
+  killGraceMs,
+  ProcessTree,
+} from "./process-tree.js";
 import { compactOversizedTraceLine } from "./relevant-trace.js";
 import { OpencodeUsageAccumulator } from "./opencode-usage.js";
 import { handleRunCommand as handleRunCommandImpl } from "./run-commands.js";
@@ -212,6 +217,7 @@ interface ParsedArgs {
   modalSecrets: string[];
   modalTimeoutSeconds?: number;
   timeoutSeconds?: number;
+  keepBackground: boolean;
   json: boolean;
   sdkFormat?: SdkFormat;
   debug: boolean;
@@ -244,8 +250,13 @@ interface CliDeps {
   stdin?: string;
   stdinIsTTY?: boolean;
   stderrIsTTY?: boolean;
-  stdout?: (text: string) => void;
+  /** Output sink; returning false signals backpressure (with waitForStdoutDrain). */
+  stdout?: (text: string) => unknown;
+  /** Resolves when the sink can take more output again (--sdk-format ndjson). */
+  waitForStdoutDrain?: (signal: AbortSignal) => Promise<void>;
   stderr?: (text: string) => void;
+  /** Test seam: awaited right after the agent has exited, before wrap-up. */
+  afterAgentExit?: () => Promise<void>;
   capacityRetrySleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   capacityRetryRandom?: () => number;
 }
@@ -327,6 +338,7 @@ function usage(): string {
     "  --modal-env <env>    Pass env into Modal as NAME or NAME=value. Repeatable.",
     "  --modal-include-git Include .git metadata in Modal uploads.",
     "  --timeout <s>        One-shot command timeout in seconds.",
+    "  --keep-background    Leave processes the agent started running after it exits.",
     "  --json               Stream raw agent JSON trace output.",
     "  --sdk-format <fmt>   Versioned SDK output: json or ndjson.",
     "  --debug              Stream raw trace and print extracted final message.",
@@ -385,6 +397,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     modalEnv: [],
     modalIncludeGit: false,
     modalSecrets: [],
+    keepBackground: false,
     json: false,
     debug: false,
     usage: false,
@@ -568,6 +581,9 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--timeout":
         parsed.timeoutSeconds = parsePositiveInteger(takeValue(args, arg), arg);
+        break;
+      case "--keep-background":
+        parsed.keepBackground = true;
         break;
       case "--name":
         if (parsed.cronCommand) {
@@ -1283,6 +1299,8 @@ interface ExecuteCommandOptions {
   captureRelevantTrace?: boolean;
   maxFinalMessageTraceBytes?: number;
   cleanupBeforeParentSignalExit?: () => void;
+  /** Leave descendants of a normally exited agent running (--keep-background). */
+  keepBackground?: boolean;
   inheritedSignalListeners?: ReadonlyMap<NodeJS.Signals, ReadonlySet<NodeJS.SignalsListener>>;
 }
 
@@ -1321,6 +1339,98 @@ const waitingSpinnerVerbs = [
   "path tracing",
   "output polishing",
 ];
+
+/**
+ * Re-sends `signal` to this process. While other listeners remain (the
+ * wrap-up guard, proper-lockfile's signal-exit) it is delivered to them
+ * asynchronously and they normally end the process; keep the event loop
+ * alive until then so headless cannot exit early with an unsettled run, and
+ * fall back to the conventional status if nothing ends it.
+ */
+function reraiseSignal(signal: NodeJS.Signals): void {
+  process.kill(process.pid, signal);
+  if (process.listenerCount(signal) > 0) {
+    setTimeout(() => {
+      process.exitCode = 128 + osConstants.signals[signal];
+    }, 100);
+  }
+}
+
+/**
+ * Number of headless-internal handlers (executeCommand, capacity backoff)
+ * currently owning exit signals; while one is active the wrap-up guard below
+ * stays passive and lets it act.
+ */
+let activeSignalOwners = 0;
+
+function claimParentSignals(): () => void {
+  activeSignalOwners += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeSignalOwners -= 1;
+  };
+}
+
+interface WrapUpGuard {
+  /** The agent has exited: from now on signals are deferred, not acted on. */
+  arm(): void;
+  /** runCli is done: remove the guard and re-raise a deferred signal. */
+  release(): void;
+}
+
+/**
+ * Keeps an exit signal from killing headless while it wraps up after the
+ * agent has exited (session persistence, run status, lock release, temp-dir
+ * removal). Once armed, the signal is recorded and re-raised when runCli is
+ * done, unless an embedding host listens for it; a second signal re-raises at
+ * once. Before arming it behaves like no listener at all (the default fatal
+ * action) whenever no headless handler owns the signal. It never touches
+ * processes: anything --keep-background left running stays running.
+ */
+function installWrapUpGuard(
+  inherited: ReadonlyMap<NodeJS.Signals, ReadonlySet<NodeJS.SignalsListener>>,
+): WrapUpGuard {
+  if (process.platform === "win32") return { arm: () => undefined, release: () => undefined };
+  let armed = false;
+  let received: NodeJS.Signals | undefined;
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  const remove = () => {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    handlers.clear();
+  };
+  const hostListens = (signal: NodeJS.Signals) => {
+    const host = inherited.get(signal);
+    return Boolean(host && process.listeners(signal).some((listener) => host.has(listener)));
+  };
+  const reraise = (signal: NodeJS.Signals) => {
+    remove();
+    if (hostListens(signal)) return;
+    reraiseSignal(signal);
+  };
+  for (const signal of parentExitSignals()) {
+    const handler = () => {
+      if (activeSignalOwners > 0) return; // The agent or a backoff is handling it.
+      if (!armed || received) {
+        reraise(signal);
+        return;
+      }
+      received = signal;
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  return {
+    arm: () => {
+      armed = true;
+    },
+    release: () => {
+      if (received) reraise(received);
+      else remove();
+    },
+  };
+}
 
 function parentExitSignals(): NodeJS.Signals[] {
   return process.platform === "win32"
@@ -1803,7 +1913,7 @@ async function executeCommand(
       let exitedBeforeClose: { code: number | null; signal: NodeJS.Signals | null } | undefined;
       const stdoutDrainController = new AbortController();
       let removeParentSignalHandlers = () => {};
-      const terminationGraceMs = 1000;
+      const terminationGraceMs = killGraceMs(env);
       const maxRelevantTraceBytes = 256 * 1024;
       const maxFinalMessageTraceBytes = options.maxFinalMessageTraceBytes ?? 64 * 1024;
       const maxCapturedTraceRowBytes = 4 * 1024 * 1024;
@@ -1884,11 +1994,12 @@ async function executeCommand(
           ? `${pinnedIdentityTrace}${rollingTrace}`
           : rollingTrace;
       };
-      const finish = (result: ExecuteResult) => {
+      const finalize = (result: ExecuteResult) => {
         if (settled) {
           return;
         }
         settled = true;
+        stopTreeShutdown();
         if (timeout) {
           clearTimeout(timeout);
         }
@@ -1902,6 +2013,8 @@ async function executeCommand(
           clearTimeout(forceDrain);
         }
         stdoutDrainController.abort();
+        clearTimeout(drainStall);
+        // Always detach before resolving so runCli leaves no listeners behind.
         removeParentSignalHandlers();
         flushTraceBuffer();
         result.finalMessageTrace = finalMessageTrace.join("") || undefined;
@@ -1911,21 +2024,45 @@ async function executeCommand(
         result.terminationSignal ??= parentTerminationSignal;
         resolve(result);
       };
+      // Once the tree is being shut down (timeout or parent signal), results
+      // are held back until the whole tree is dead or the final deadline
+      // passes, so no caller can exit and orphan a still-dying tree.
+      const finish = (result: ExecuteResult) => {
+        if (settled) return;
+        if (treeShutdown && !treeShutdown.completed) {
+          treeShutdown.pendingResult ??= result;
+          if (!tree.alive()) completeTreeShutdown(false);
+          return;
+        }
+        finalize(result);
+      };
       const asyncMessageWorker = env.HEADLESS_ASYNC_MESSAGE_WORKER === "1";
-      const ownsChildProcessGroup = !asyncMessageWorker && process.platform !== "win32" && (
-        options.timeoutSeconds !== undefined
-        || options.cleanupBeforeParentSignalExit !== undefined
-      );
-      const handlesParentSignals = asyncMessageWorker
-        || ownsChildProcessGroup
+      // POSIX: the agent always leads its own process group (detached =>
+      // setsid) so every termination path can signal the whole agent tree.
+      // The one exception is the async message worker: it already spawned
+      // this headless as the leader of a dedicated group, records that group
+      // as the node lock's process tree, and signals/escalates on the group
+      // itself. Keeping the agent inside it means the lock stays held while
+      // any agent process is alive and the worker's SIGKILL reaches the agent
+      // even if headless dies first.
+      // The agent's stdio is never a TTY here (stdin is ignore/pipe/file,
+      // stdout/stderr are pipes), so leaving the terminal's session cannot
+      // cause SIGTTIN/SIGTTOU stops; terminal-generated signals (Ctrl-C,
+      // Ctrl-Z, Ctrl-\) now reach headless only and are forwarded below.
+      const ownsChildProcessGroup = process.platform !== "win32" && !asyncMessageWorker;
+      const handlesParentSignals = process.platform !== "win32"
+        || asyncMessageWorker
         || agent === "codex"
         || options.cleanupBeforeParentSignalExit !== undefined;
       waitForAsyncMessageOwnership(env, command);
       let childEnv = commandEnv(env, command);
-      if (asyncMessageWorker) {
+      if (asyncMessageWorker || childEnv.HEADLESS_AGENT_PGID_FILE !== undefined) {
         childEnv = { ...childEnv };
         delete childEnv.HEADLESS_ASYNC_MESSAGE_OWNER_PID;
         delete childEnv.HEADLESS_ASYNC_MESSAGE_WORKER;
+        // Only this headless reports to the supervisor: a nested headless run
+        // by the agent must not overwrite the outer execution's agent group.
+        delete childEnv.HEADLESS_AGENT_PGID_FILE;
       }
       const child = spawn(command.command, command.args, {
         cwd,
@@ -1933,17 +2070,111 @@ async function executeCommand(
         env: childEnv as NodeJS.ProcessEnv,
         stdio,
       });
+      // Report the agent's group to a supervisor (cron) synchronously, before
+      // anything else runs, so it can reach the agent directly even if this
+      // headless process is SIGKILLed before it can forward anything. The
+      // only remaining gap is a kill between fork() and this write.
+      const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
+      if (agentPgidFile && ownsChildProcessGroup && child.pid) {
+        try {
+          writeFileSync(agentPgidFile, `${child.pid}\n`, { mode: 0o600 });
+        } catch {
+          // Best effort: the supervisor still sweeps this process's own group.
+        }
+      }
 
+      // The tree to terminate. Async worker mode shares this process's group
+      // with the agent, so the group is signalled member by member with this
+      // process excluded (it must outlive the agent to escalate); descendants
+      // that leave the group via setsid are tracked by parent PID either way.
+      const tree = process.platform === "win32" || !asyncMessageWorker
+        ? childProcessTree(child)
+        : new ProcessTree({ groups: [process.pid], roots: child.pid ? [child.pid] : [], exclude: [process.pid], child });
       const signalChildTree = (signal: NodeJS.Signals) => {
-        if (ownsChildProcessGroup && child.pid) {
+        if (process.platform === "win32") {
+          child.kill(signal);
+          return;
+        }
+        tree.signal(signal);
+      };
+
+      // Unified bounded shutdown: signal now, SIGKILL after one grace, give up
+      // waiting after a second grace. All timers stay referenced so headless
+      // cannot exit (and orphan the tree) while it is still dying.
+      let treeShutdown: {
+        completed: boolean;
+        killed: boolean;
+        /** A parent signal is pending: run the parent-exit cleanup on completion. */
+        parentCleanup?: boolean;
+        reraise?: NodeJS.Signals;
+        pendingResult?: ExecuteResult;
+        timers: NodeJS.Timeout[];
+        poll?: NodeJS.Timeout;
+      } | undefined;
+      const stopTreeShutdown = () => {
+        if (!treeShutdown) return;
+        for (const timer of treeShutdown.timers) clearTimeout(timer);
+        clearInterval(treeShutdown.poll);
+      };
+      const completeTreeShutdown = (forced: boolean) => {
+        if (!treeShutdown || treeShutdown.completed) return;
+        if (!forced && !treeShutdown.reraise && !treeShutdown.pendingResult) {
+          // Tree is dead but the child's stdio has not closed yet: keep only
+          // the final deadline and let "close" deliver the result.
+          clearInterval(treeShutdown.poll);
+          return;
+        }
+        treeShutdown.completed = true;
+        stopTreeShutdown();
+        if (treeShutdown.parentCleanup) {
+          // Only now that the tree is dead (or the deadline passed): a
+          // gracefully exiting agent may still use what this removes (the
+          // Antigravity overlay HOME). A failure must not block the re-raise.
           try {
-            process.kill(-child.pid, signal);
-            return;
+            options.cleanupBeforeParentSignalExit?.();
           } catch {
-            // Fall back to the direct child when the process group has already exited.
+            // Best effort.
           }
         }
-        child.kill(signal);
+        if (treeShutdown.reraise) {
+          const signal = treeShutdown.reraise;
+          removeParentSignalHandlers();
+          reraiseSignal(signal);
+          return;
+        }
+        if (forced) {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
+        finalize(treeShutdown.pendingResult ?? exitResult());
+      };
+      // SIGKILL now and keep re-sending it on every poll (catching anything
+      // forked or regrouped since), still waiting for the tree to die.
+      const escalateTreeShutdown = () => {
+        if (!treeShutdown || treeShutdown.completed) return;
+        treeShutdown.killed = true;
+        signalChildTree("SIGKILL");
+      };
+      const beginTreeShutdown = (signal: NodeJS.Signals) => {
+        if (treeShutdown) {
+          if (signal === "SIGKILL") escalateTreeShutdown();
+          else signalChildTree(signal);
+          return;
+        }
+        signalChildTree(signal);
+        treeShutdown = { completed: false, killed: signal === "SIGKILL", timers: [] };
+        treeShutdown.timers.push(setTimeout(escalateTreeShutdown, terminationGraceMs));
+        treeShutdown.timers.push(setTimeout(() => {
+          signalChildTree("SIGKILL");
+          completeTreeShutdown(true);
+        }, 2 * terminationGraceMs));
+        treeShutdown.poll = setInterval(() => {
+          if (!tree.alive()) {
+            completeTreeShutdown(false);
+          } else if (treeShutdown?.killed) {
+            signalChildTree("SIGKILL");
+          }
+        }, 25);
       };
 
       const clearForceDrain = () => {
@@ -1953,61 +2184,133 @@ async function executeCommand(
         }
       };
 
+      // Result for a direct child that exited on its own, used when its stdio
+      // never closes (a descendant holds it) and the drain window ends.
+      const exitResult = (): ExecuteResult => {
+        const exited = exitedBeforeClose;
+        const code = termination?.code
+          ?? (exited ? (exited.signal ? 1 : (exited.code ?? 1)) : 1);
+        return {
+          code,
+          ...(exited?.signal && !termination ? { terminationSignal: exited.signal } : {}),
+          stdout: capturedStdout,
+          stdoutReceived,
+          stdoutEndsWithNewline,
+        };
+      };
+      // Descendants the direct child leaves behind when it exits on its own
+      // are terminated (SIGTERM, grace, SIGKILL) before the run resolves,
+      // unless --keep-background asks to leave them running. Antigravity
+      // always kills, with or without usage capture: its descendants may use
+      // the overlay home that the capture cleanup removes.
+      const keepBackground = options.keepBackground === true && agent !== "antigravity";
+
+      // After the direct child exits, give its stdio one grace period to
+      // drain. Then either terminate the remaining tree (whose death closes
+      // the pipes) or, with --keep-background, stop waiting and resolve.
       const armForceDrain = () => {
         if (
           forceDrain ||
           settled ||
           termination ||
+          treeShutdown ||
           stdoutDrainPending ||
-          options.cleanupBeforeParentSignalExit === undefined ||
           exitedBeforeClose === undefined
         ) {
           return;
         }
-        const { code, signal } = exitedBeforeClose;
         forceDrain = setTimeout(() => {
           forceDrain = undefined;
-          if (settled || termination || stdoutDrainPending) return;
-          signalChildTree("SIGKILL");
+          if (settled || termination || treeShutdown || stdoutDrainPending) return;
+          postExitCleanup();
+        }, terminationGraceMs);
+      };
+      const postExitCleanup = () => {
+        if (keepBackground) {
           child.stdout?.destroy();
           child.stderr?.destroy();
-          finish({
-            code: signal ? 1 : (code ?? 1),
-            ...(signal ? { terminationSignal: signal } : {}),
-            stdout: capturedStdout,
-            stdoutReceived,
-            stdoutEndsWithNewline,
-          });
+          finish(exitResult());
+          return;
+        }
+        // The result comes from "close" once the holders are dead, or from
+        // exitResult() at the bounded shutdown deadline.
+        beginTreeShutdown("SIGTERM");
+      };
+
+      // SDK stdout backpressure after the agent exited: a downstream that
+      // keeps draining, however slowly, is waited for; one that makes no
+      // drain progress for a whole kill grace is given up on (a STALL
+      // deadline, not an absolute one), and post-exit cleanup proceeds.
+      let drainStall: NodeJS.Timeout | undefined;
+      let drainProgress = 0;
+      let drainStalled = false;
+      const clearDrainStall = () => {
+        clearTimeout(drainStall);
+        drainStall = undefined;
+      };
+      const armDrainStall = () => {
+        if (drainStall || settled || termination || treeShutdown || !stdoutDrainPending || exitedBeforeClose === undefined) {
+          return;
+        }
+        const progressAtArm = drainProgress;
+        drainStall = setTimeout(() => {
+          drainStall = undefined;
+          if (settled || termination || treeShutdown || !stdoutDrainPending) return;
+          if (drainProgress !== progressAtArm) {
+            armDrainStall();
+            return;
+          }
+          drainStalled = true;
+          stdoutDrainPending = false;
+          stdoutDrainController.abort();
+          child.stdout?.resume();
+          postExitCleanup();
         }, terminationGraceMs);
-        forceDrain.unref();
       };
 
       if (handlesParentSignals) {
         const handlers = new Map<NodeJS.Signals, () => void>();
-        removeParentSignalHandlers = () => {
+        const releaseSignals = claimParentSignals();
+        const removeHandlers = () => {
           for (const [signal, handler] of handlers) {
             process.off(signal, handler);
           }
+          releaseSignals();
         };
+        removeParentSignalHandlers = removeHandlers;
         for (const signal of parentExitSignals()) {
           const handler = () => {
+            if (treeShutdown && parentTerminationSignal) {
+              // A second exit signal while the tree is draining: SIGKILL at
+              // once, but still wait (bounded) for the tree to die.
+              escalateTreeShutdown();
+              return;
+            }
             parentTerminationSignal = signal;
             const inheritedListeners = options.inheritedSignalListeners?.get(signal);
             const hasExternalListener = inheritedListeners
               ? process.listeners(signal).some((listener) => inheritedListeners.has(listener))
               : process.listeners(signal).some((listener) => listener !== handler);
-            signalChildTree(signal);
-            try {
-              options.cleanupBeforeParentSignalExit?.();
-            } finally {
-              removeParentSignalHandlers();
-              if (!hasExternalListener) {
-                process.kill(process.pid, signal);
+            if (process.platform === "win32") {
+              signalChildTree(signal);
+              try {
+                options.cleanupBeforeParentSignalExit?.();
+              } finally {
+                removeHandlers();
+                if (!hasExternalListener) {
+                  process.kill(process.pid, signal);
+                }
               }
+              return;
             }
+            // POSIX: forward to the whole tree, then hold the result (or the
+            // re-raise) until the tree is dead or the bounded deadline passes.
+            beginTreeShutdown(signal);
+            if (!hasExternalListener) treeShutdown!.reraise = signal;
+            treeShutdown!.parentCleanup = true;
           };
           handlers.set(signal, handler);
-          process.once(signal, handler);
+          process.on(signal, handler);
         }
         if (ownsChildProcessGroup) {
           const suspendHandler = () => {
@@ -2029,25 +2332,21 @@ async function executeCommand(
         termination = { code };
         if (process.platform === "win32") {
           forceKillWindowsProcessTree(child, terminationGraceMs);
-        } else {
-          signalChildTree("SIGTERM");
-        }
-        forceKill = setTimeout(() => {
-          if (settled) return;
-          if (process.platform === "win32") {
-            forceKillWindowsProcessTree(child, terminationGraceMs);
-          } else {
-            signalChildTree("SIGKILL");
-          }
-          forceFinish = setTimeout(() => {
+          forceKill = setTimeout(() => {
             if (settled) return;
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            finish({ code, stdout: capturedStdout });
+            forceKillWindowsProcessTree(child, terminationGraceMs);
+            forceFinish = setTimeout(() => {
+              if (settled) return;
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              finish({ code, stdout: capturedStdout });
+            }, terminationGraceMs);
+            forceFinish.unref();
           }, terminationGraceMs);
-          forceFinish.unref();
-        }, terminationGraceMs);
-        forceKill.unref();
+          forceKill.unref();
+          return;
+        }
+        beginTreeShutdown("SIGTERM");
       };
 
       if (options.timeoutSeconds !== undefined) {
@@ -2059,6 +2358,9 @@ async function executeCommand(
         }, options.timeoutSeconds * 1000);
       }
       if (command.stdinText !== undefined) {
+        // An agent may exit (or close stdin) before reading its prompt; the
+        // resulting EPIPE is the agent's outcome, not a headless crash.
+        child.stdin?.on("error", () => undefined);
         child.stdin?.end(command.stdinText);
       }
       child.stdout?.setEncoding("utf8");
@@ -2075,13 +2377,18 @@ async function executeCommand(
           if (
             writable === false &&
             !stdoutDrainPending &&
+            !drainStalled &&
             options.waitForStdoutDrain
           ) {
             clearForceDrain();
             stdoutDrainPending = true;
             child.stdout?.pause();
+            armDrainStall();
             void options.waitForStdoutDrain(stdoutDrainController.signal).then(
               () => {
+                if (drainStalled) return;
+                drainProgress += 1;
+                clearDrainStall();
                 stdoutDrainPending = false;
                 if (!settled) {
                   child.stdout?.resume();
@@ -2089,6 +2396,8 @@ async function executeCommand(
                 }
               },
               () => {
+                if (drainStalled) return;
+                clearDrainStall();
                 stdoutDrainPending = false;
                 if (!settled) {
                   const message = "headless: SDK output stream failed\n";
@@ -2117,19 +2426,27 @@ async function executeCommand(
         finish({ code: termination?.code ?? 127, stdout: capturedStdout, stdoutReceived, stdoutEndsWithNewline });
       });
       child.on("exit", (code, signal) => {
-        if (options.cleanupBeforeParentSignalExit === undefined || termination !== undefined || settled) {
+        if (termination !== undefined || treeShutdown || settled) {
           return;
         }
         exitedBeforeClose = { code, signal };
         armForceDrain();
+        armDrainStall();
       });
       child.on("close", (code, signal) => {
-        if (ownsChildProcessGroup && options.cleanupBeforeParentSignalExit !== undefined) {
-          signalChildTree("SIGKILL");
-        }
+        clearForceDrain();
         if (termination) {
-          signalChildTree("SIGKILL");
+          // Timed out: SIGKILL what the direct child left behind at once.
+          beginTreeShutdown("SIGKILL");
+        } else if (agent === "antigravity" && !treeShutdown && tree.alive()) {
+          // Antigravity always cleans up its descendants, with or without
+          // usage capture and regardless of --keep-background.
+          beginTreeShutdown("SIGKILL");
+        } else if (!keepBackground && !treeShutdown && tree.alive()) {
+          // Normal exit: terminate leftover descendants before resolving.
+          beginTreeShutdown("SIGTERM");
         }
+        // finish() holds the result while a shutdown is in progress.
         if (signal) {
           finish({ code: termination?.code ?? 1, terminationSignal: signal,
             stdout: capturedStdout, stdoutReceived, stdoutEndsWithNewline });
@@ -3214,6 +3531,7 @@ function validateCronCliOptions(parsed: ParsedArgs): void {
       parsed.modal ||
       hasModalOptions(parsed) ||
       parsed.timeoutSeconds !== undefined ||
+      parsed.keepBackground ||
       parsed.json ||
       parsed.debug ||
       parsed.usage;
@@ -3287,6 +3605,7 @@ async function executeStoredNode(
     allow?: AllowMode;
     coordination: CoordinationMode;
     fast?: boolean;
+    keepBackground?: boolean;
     model?: string;
     profile?: string;
     reasoningEffort?: ReasoningEffort;
@@ -3374,6 +3693,7 @@ async function executeStoredNode(
     stdoutLog: runStdoutLogger(env, node.runId, node.nodeId),
     stderr: runStderrLogger(env, node.runId, node.nodeId),
     timeoutSeconds: config.general.timeoutSeconds,
+    keepBackground: node.keepBackground,
   });
   if (result.code === 0 && sessionPlan) {
     await persistSessionPlan(node.agent, sessionPlan, result.stdout, node.workDir, env);
@@ -3383,7 +3703,7 @@ async function executeStoredNode(
 
 export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number> {
   const stdout = deps.stdout ?? ((text: string) => process.stdout.write(text));
-  const waitForSdkStdoutDrain = deps.stdout
+  const waitForSdkStdoutDrain = deps.waitForStdoutDrain ?? (deps.stdout
     ? undefined
     : (signal: AbortSignal) =>
         new Promise<void>((resolve, reject) => {
@@ -3417,7 +3737,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           process.stdout.once("error", handleError);
           process.stdout.once("close", handleClose);
           signal.addEventListener("abort", handleAbort, { once: true });
-        });
+        }));
   const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
   const stderrIsTTY = deps.stderrIsTTY ?? Boolean(process.stderr.isTTY);
   const env: Env = { ...(deps.env ?? process.env) };
@@ -3435,6 +3755,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   );
   let registeredRunNode: { runId: string; nodeId: string } | undefined;
   let dockerSessionLock: { release: () => Promise<Error | undefined> } | undefined;
+  let wrapUpGuard: WrapUpGuard | undefined;
   let temporaryBillingRoot: string | undefined;
   let temporaryBillingVolume: string | undefined;
   let billingVolumeInitialized = false;
@@ -3546,6 +3867,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             modalSecrets: parsed.modalSecrets,
             modalTimeoutSeconds: parsed.modalTimeoutSeconds,
             timeoutSeconds: parsed.timeoutSeconds,
+            keepBackground: parsed.keepBackground,
             json: parsed.json,
             debug: parsed.debug,
             usage: parsed.usage,
@@ -3565,6 +3887,12 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         }
         throw toCliError(error);
       }
+    }
+    if (
+      parsed.keepBackground &&
+      (parsed.attach || parsed.rename || parsed.send || parsed.check || parsed.list || parsed.showConfig || parsed.dockerCommand || parsed.runCommand || parsed.tmux)
+    ) {
+      throw new CliError("--keep-background can only be used with one-shot agent runs or cron add");
     }
     if (
       parsed.fast !== undefined &&
@@ -4114,6 +4442,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     const storedNode = parsed.runId && nodeId ? readRun(env, parsed.runId)?.nodes[nodeId] : undefined;
     const storedFastMode = storedNode?.agent === parsed.agent ? storedNode.fast : undefined;
     const fast = parsed.fast ?? storedFastMode;
+    // Like Fast mode, a node's stored --keep-background applies to direct launches.
+    const keepBackground = parsed.keepBackground || storedNode?.keepBackground === true;
     const storedProfile = storedNode?.agent === parsed.agent ? storedNode.profile : undefined;
     const profile = parsed.profile ?? storedProfile ?? (
       parsed.agent === "codex" && parsed.sessionAlias
@@ -4141,6 +4471,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           model: teamDefaults.model,
           profile: teamNode.agent === "codex" ? profile : undefined,
           fast: teamNode.agent === "claude" || teamNode.agent === "codex" ? fast : undefined,
+          ...(parsed.keepBackground ? { keepBackground: true } : {}),
           reasoningEffort: teamDefaults.reasoningEffort,
           workDir: cwd ?? process.cwd(),
           sessionAlias: teamNode.nodeId,
@@ -4159,6 +4490,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         model: configuredDefaults.model,
         profile,
         fast,
+        ...(keepBackground ? { keepBackground: true } : {}),
         reasoningEffort: configuredDefaults.reasoningEffort,
         workDir: cwd ?? process.cwd(),
         sessionAlias: coordination === "session" ? (parsed.sessionAlias ?? nodeId) : parsed.sessionAlias,
@@ -4590,6 +4922,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         displayStderr(`headless: could not prepare Antigravity usage capture: ${message}\n`);
       }
     }
+    // Installed for the whole run and removed only when runCli returns, so
+    // a signal after the agent exited cannot interrupt the wrap-up.
+    wrapUpGuard = installWrapUpGuard(inheritedSignalListeners);
     try {
       try {
         if (parsed.runId && parsed.role && nodeId) {
@@ -4606,6 +4941,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             signal: retryController.signal,
             random: deps.capacityRetryRandom,
             sleep: async (delayMs, signal) => {
+              const releaseSignals = claimParentSignals();
               const handlers = parentExitSignals().map((signalName) => {
                 const handler = () => retryController.abort(128 + osConstants.signals[signalName]);
                 process.on(signalName, handler);
@@ -4615,6 +4951,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
                 await (deps.capacityRetrySleep ?? waitForCapacityRetry)(delayMs, signal);
               } finally {
                 for (const [signalName, handler] of handlers) process.off(signalName, handler);
+                releaseSignals();
               }
             },
             reportUsage: parsed.usage && (parsed.agent === "claude" || parsed.agent === "codex") ? async (trace, route) => {
@@ -4686,7 +5023,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             parsed.agent!, parsed.agent === "codex" || parsed.agent === "claude"
               ? buildAttemptCommand(attempt.env, attempt.options) : command,
             cwd, attempt.env, displayStderr, {
-              stdout: commandStdout, stdoutHandling,
+              stdout: commandStdout, stdoutHandling, keepBackground,
               stdoutLog: (text) => {
                 piCompletion?.write(text);
                 attempt.observe(text);
@@ -4715,6 +5052,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       if (!result) {
         throw new CliError("agent execution did not produce a result");
       }
+      // The agent has exited: defer signals until the wrap-up below is done.
+      wrapUpGuard.arm();
+      await deps.afterAgentExit?.();
       const commandTrace = result.stdout || result.finalMessageTrace || result.usageTrace || "";
       const piOutcome = piCompletion?.outcome;
       const piError = piOutcome?.status === "error" ? `pi error: ${piOutcome.error}`
@@ -4894,6 +5234,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         (!billingHomeCompleted || !removeDockerBillingVolume(temporaryBillingVolume, env))) {
       stderr(`headless: retained native session volume for recovery: ${temporaryBillingVolume}\n`);
     }
+    // Last: re-raise a signal that arrived during wrap-up, now that it is done.
+    wrapUpGuard?.release();
   }
 }
 

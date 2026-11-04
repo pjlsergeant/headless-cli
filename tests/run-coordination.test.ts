@@ -1681,3 +1681,35 @@ test("Docker run nodes reject unsupported durable sessions", async () => {
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("run nodes keep --keep-background for later invocations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-run-test-"));
+  try {
+    const env = { ...process.env, HOME: join(dir, "home"), HEADLESS_CLI_BIN: "headless" };
+    mkdirSync(env.HOME);
+    registerNode(env, {
+      runId: "auth",
+      nodeId: "worker-1",
+      role: "worker",
+      agent: "codex",
+      coordination: "oneshot",
+      status: "planned",
+      planned: true,
+      keepBackground: true,
+    });
+    // A later registration without the flag (e.g. a status refresh) keeps it.
+    registerNode(env, { runId: "auth", nodeId: "worker-1", role: "worker", agent: "codex", coordination: "oneshot" });
+    assert.equal(readRun(env, "auth")?.nodes["worker-1"].keepBackground, true);
+    const stdout: string[] = [];
+    assert.equal(
+      await runCli(["run", "message", "auth", "worker-1", "--prompt", "continue", "--print-command"], {
+        env,
+        stdout: (text) => stdout.push(text),
+      }),
+      0,
+    );
+    assert.match(stdout.join(""), /--keep-background/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

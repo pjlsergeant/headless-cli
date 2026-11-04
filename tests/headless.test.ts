@@ -46,6 +46,19 @@ async function waitFor(assertion: () => boolean): Promise<void> {
   assert.equal(assertion(), true);
 }
 
+// For "dead at the moment X returned" checks: a just-killed orphan stays a
+// zombie until init reaps it, which is asynchronous on any host.
+function processTerminated(pid: number): boolean {
+  if (!processIsAlive(pid)) return true;
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -1423,6 +1436,8 @@ test("CLI bounds timeout drain when a descendant retains stdout", async () => {
     const code = await runCli(["codex", "--prompt", "hello", "--json", "--usage", "--timeout", "3"], {
       env: {
         ...process.env,
+        // Keep the kill grace below the grandchild's 4s natural exit.
+        HEADLESS_KILL_GRACE_MS: "1000",
         HEADLESS_TEST_GRANDCHILD_PID: pidFile,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
       },
@@ -1434,7 +1449,8 @@ test("CLI bounds timeout drain when a descendant retains stdout", async () => {
     grandchildPid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
     if (process.platform !== "win32") {
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while any part of the tree is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
       assert.equal(existsSync(naturalExitFile), false);
     }
   } finally {
@@ -1489,7 +1505,8 @@ test("CLI kills timeout descendants after the direct child closes", async () => 
     grandchildPid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
     if (process.platform !== "win32") {
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while any part of the tree is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     }
   } finally {
     if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
@@ -4130,6 +4147,98 @@ test("CLI cleans the Antigravity usage overlay when the parent receives SIGTERM"
   }
 });
 
+test("CLI keeps the Antigravity usage overlay until the agent finishes its SIGTERM handler", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const home = join(dir, "home");
+    const appDir = join(home, ".gemini", "antigravity-cli");
+    const binDir = join(dir, "bin");
+    const overlayPath = join(dir, "overlay-home.txt");
+    const seenPath = join(dir, "overlay-seen-in-handler.txt");
+    mkdirSync(appDir, { recursive: true });
+    mkdirSync(binDir);
+    writeFileSync(join(appDir, "settings.json"), `${JSON.stringify({ statusLine: { type: "", command: "", enabled: true } })}\n`);
+    const binary = join(binDir, "agy");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(overlayPath)}, process.env.HOME);`,
+        // A graceful shutdown that still uses its HOME 300ms after SIGTERM.
+        "process.on('SIGTERM', () => setTimeout(() => {",
+        `  fs.writeFileSync(${JSON.stringify(seenPath)}, fs.existsSync(process.env.HOME) ? 'present' : 'removed');`,
+        "  process.exit(0);",
+        "}, 300));",
+        "setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 100);",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const runner = join(dir, "runner.mjs");
+    writeFileSync(
+      runner,
+      [
+        `import { runCli } from ${JSON.stringify(pathToFileURL(join(repoRoot, "src", "cli.ts")).href)};`,
+        "const code = await runCli(['antigravity', '--prompt', 'hello', '--json', '--usage']);",
+        "process.exitCode = code;",
+        "",
+      ].join("\n"),
+    );
+
+    const child = spawnSync(process.execPath, ["--import", "tsx", runner], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+    });
+    assert.equal(child.signal, "SIGTERM", child.stderr);
+    assert.equal(readFileSync(seenPath, "utf8"), "present");
+    // ...and it is still removed once the agent is gone.
+    assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI cleans up Antigravity descendants even with --keep-background and no --usage", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  const grandchildPidPath = join(dir, "grandchild.pid");
+  let grandchildPid: number | undefined;
+  try {
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir);
+    const binary = join(binDir, "agy");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio: 'ignore' });",
+        `writeFileSync(${JSON.stringify(grandchildPidPath)}, String(child.pid));`,
+        "child.unref();",
+        "process.stdout.write('antigravity final\\n');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+
+    const code = await runCli(["antigravity", "--prompt", "hello", "--keep-background"], {
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "300", ANTIGRAVITY_CLI_BIN: binary, HOME: join(dir, "home"), PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: () => {},
+      stderr: () => {},
+    });
+
+    assert.equal(code, 0);
+    grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+    assert.equal(processTerminated(grandchildPid), true);
+  } finally {
+    if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("CLI skips the Antigravity usage overlay on Windows", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
   try {
@@ -4259,14 +4368,16 @@ test("CLI bounds Antigravity stdout drain after the direct child exits", async (
     chmodSync(binary, 0o755);
 
     const code = await runCli(["antigravity", "--prompt", "hello", "--json", "--usage", "--timeout", "60"], {
-      env: { ...process.env, ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      // Keep the drain bound (one kill grace) below the grandchild's 4s natural exit.
+      env: { ...process.env, HEADLESS_KILL_GRACE_MS: "1000", ANTIGRAVITY_CLI_BIN: binary, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` },
       stdout: () => {},
     });
 
     assert.equal(code, 0);
     assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
     grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-    await waitFor(() => !processIsAlive(grandchildPid as number));
+    // runCli must not resolve while the drained descendant is still alive.
+    assert.equal(processTerminated(grandchildPid as number), true);
     assert.equal(existsSync(naturalExitPath), false);
   } finally {
     if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
@@ -4317,7 +4428,8 @@ test(
       assert.equal(code, 0);
       assert.equal(existsSync(readFileSync(overlayPath, "utf8")), false);
       grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while the descendant is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     } finally {
       if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
       rmSync(dir, { force: true, recursive: true });
@@ -4365,7 +4477,8 @@ test(
       assert.equal(code, 124);
       assert.match(stdout.join(""), /antigravity final/);
       grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-      await waitFor(() => !processIsAlive(grandchildPid as number));
+      // runCli must not resolve while the descendant is still alive.
+      assert.equal(processTerminated(grandchildPid as number), true);
     } finally {
       if (grandchildPid && processIsAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
       rmSync(dir, { force: true, recursive: true });

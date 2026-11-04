@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
+import { childProcessTree, killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import type { AllowMode, BuiltCommand, Env } from "./types.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -237,50 +238,153 @@ class HeadlessAcpClient {
 
 function childExit(child: ReturnType<typeof spawn>): Promise<number> {
   return new Promise((resolve) => {
-    child.on("error", () => resolve(127));
-    child.on("close", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
+    child.once("error", () => resolve(127));
+    child.once("close", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
   });
 }
 
+function parentExitSignals(): NodeJS.Signals[] {
+  return process.platform === "win32"
+    ? ["SIGINT", "SIGTERM", "SIGBREAK"]
+    : ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
+}
+
+/**
+ * Bounded shutdown of the ACP server tree: close its stdin, SIGTERM the
+ * tree, SIGKILL it after the grace period, then stop waiting for `close` (an
+ * escaped descendant may hold its stdio) one grace period later. Returns
+ * false when part of the tree survived SIGKILL.
+ */
+async function shutdownAcpServer(
+  child: ReturnType<typeof spawn>,
+  tree: ProcessTree,
+  exit: Promise<number>,
+  graceMs: number,
+): Promise<boolean> {
+  child.stdin?.end();
+  const { survived } = await terminateProcessTree(tree, { graceMs });
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve();
+    }, graceMs);
+  });
+  try {
+    await Promise.race([exit, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+  return !survived;
+}
+
+/**
+ * Runs one prompt against an ACP server.
+ *
+ * The server runs in its own process group (POSIX) supervised by this
+ * client: shutdown, and any exit signal this process receives, terminate the
+ * server and all of its descendants with SIGKILL escalation. An outer
+ * headless that SIGKILLs this process still reaches the server because it
+ * tracks descendants by parent PID at signal time.
+ */
 export async function runAcpClient(options: RunAcpClientOptions): Promise<number> {
   const child = spawn(options.agentCommand.command, options.agentCommand.args, {
     cwd: options.cwd,
+    detached: process.platform !== "win32",
     env: { ...options.env, ...(options.agentCommand.env ?? {}) } as NodeJS.ProcessEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.stderr?.setEncoding("utf8");
-  child.stderr?.on("data", (chunk: string) => options.stderr(chunk));
+  // Attach lifecycle listeners before anything can fail: a spawn error (e.g.
+  // ENOENT) is emitted asynchronously and would otherwise be unhandled.
+  const exit = childExit(child);
+  let spawnError: Error | undefined;
+  child.once("error", (error) => {
+    spawnError = error;
+    options.stderr(`${error.message}\n`);
+  });
+  // Rejects as soon as the server process exits (not on "close", which a
+  // descendant holding its stdout can delay forever), so a pending protocol
+  // request cannot hang.
+  const serverGone = new Promise<never>((_, reject) => {
+    child.once("error", (error) => reject(error));
+    child.once("exit", (code, signal) => {
+      reject(new Error(`ACP server exited ${signal ? `on ${signal}` : `with code ${code ?? 1}`}`));
+    });
+  });
+  serverGone.catch(() => undefined);
+  const untilServerGone = <T>(promise: Promise<T>) => Promise.race([promise, serverGone]);
+  const graceMs = killGraceMs(options.env);
+  const tree = childProcessTree(child);
 
-  if (!child.stdin || !child.stdout) {
-    child.kill();
-    return 1;
+  // Forward exit signals to the server tree (it is outside our group), then
+  // re-raise once it is gone; a second signal SIGKILLs it at once but still
+  // waits for it to die.
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  const removeHandlers = () => {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+  };
+  let forwarding: NodeJS.Signals | undefined;
+  for (const signal of parentExitSignals()) {
+    const handler = () => {
+      const reraise = !process.listeners(signal).some((listener) => listener !== handler);
+      const finishSignal = () => {
+        removeHandlers();
+        if (reraise) process.kill(process.pid, signal);
+      };
+      if (forwarding) {
+        // SIGKILL at once; the in-flight termination below keeps waiting
+        // (bounded) for the tree to die and then re-raises.
+        tree.signal("SIGKILL");
+        return;
+      }
+      forwarding = signal;
+      void terminateProcessTree(tree, { signal, graceMs }).then(finishSignal);
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
   }
 
-  const stream = acp.ndJsonStream(
-    Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
-  );
-  const client = new HeadlessAcpClient(options.stdout, options.allow);
-  const connection = new acp.ClientSideConnection(() => client, stream);
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => options.stderr(chunk));
+  child.stdin?.on("error", () => undefined);
 
   try {
-    await connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: acpClientCapabilities });
-    const session = await connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] });
-    options.stdout(acpOutputRecord("session", { sessionId: session.sessionId }));
-    const result = await connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: options.prompt }] });
-    const finalText = client.finalAssistantText();
-    if (finalText) {
-      options.stdout(acpOutputRecord("message", { role: "assistant", content: [{ type: "text", text: finalText }] }));
+    if (!child.stdin || !child.stdout) {
+      await shutdownAcpServer(child, tree, exit, graceMs);
+      return 1;
     }
-    options.stdout(acpOutputRecord("result", { stopReason: result.stopReason }));
-    child.kill();
-    await childExit(child);
+
+    const stream = acp.ndJsonStream(
+      Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+    );
+    const client = new HeadlessAcpClient(options.stdout, options.allow);
+    const connection = new acp.ClientSideConnection(() => client, stream);
+
+    try {
+      await untilServerGone(connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: acpClientCapabilities }));
+      const session = await untilServerGone(connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] }));
+      options.stdout(acpOutputRecord("session", { sessionId: session.sessionId }));
+      const result = await untilServerGone(connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: options.prompt }] }));
+      const finalText = client.finalAssistantText();
+      if (finalText) {
+        options.stdout(acpOutputRecord("message", { role: "assistant", content: [{ type: "text", text: finalText }] }));
+      }
+      options.stdout(acpOutputRecord("result", { stopReason: result.stopReason }));
+    } catch (error) {
+      const message = spawnError?.message ?? (error instanceof Error ? error.message : String(error));
+      options.stdout(acpOutputRecord("error", { message }));
+      await shutdownAcpServer(child, tree, exit, graceMs);
+      return spawnError ? 127 : 1;
+    }
+    if (!(await shutdownAcpServer(child, tree, exit, graceMs))) {
+      options.stderr("headless: ACP server processes survived SIGKILL\n");
+      return 1;
+    }
     return 0;
-  } catch (error) {
-    options.stdout(acpOutputRecord("error", { message: error instanceof Error ? error.message : String(error) }));
-    child.kill();
-    const code = await childExit(child);
-    return code === 0 ? 1 : code;
+  } finally {
+    removeHandlers();
   }
 }
 

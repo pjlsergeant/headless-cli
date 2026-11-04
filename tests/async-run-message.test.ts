@@ -48,6 +48,19 @@ function processAlive(pid: number): boolean {
   }
 }
 
+// A killed orphan is reparented to PID 1 and is a zombie until PID 1 reaps
+// it (never, in containers whose PID 1 does not reap). It has terminated.
+function processGone(pid: number): boolean {
+  if (!processAlive(pid)) return true;
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
 async function createFixture(agentSource?: string, extraEnv: Env = {}): Promise<AsyncMessageFixture> {
   const directory = mkdtempSync(join(tmpdir(), "headless-async-message-test-"));
   const home = join(directory, "home");
@@ -91,7 +104,7 @@ async function startAsyncMessage(env: Env): Promise<void> {
   );
 }
 
-test("async run message preserves ownership while a signaled agent remains alive", { skip: process.platform === "win32" }, async () => {
+test("async run message keeps ownership until a signaled agent that ignores SIGTERM is killed", { skip: process.platform === "win32" }, async () => {
   const processDirectory = mkdtempSync(join(tmpdir(), "headless-async-agent-test-"));
   const agentProcessFile = join(processDirectory, "agent-process.json");
   const signalFile = join(processDirectory, "agent-signal");
@@ -111,6 +124,7 @@ test("async run message preserves ownership while a signaled agent remains alive
   const { directory, env } = await createFixture(agentSource, {
     HEADLESS_AGENT_PROCESS: agentProcessFile,
     HEADLESS_AGENT_SIGNAL: signalFile,
+    HEADLESS_KILL_GRACE_MS: "1500",
   });
   let agentPid: number | undefined;
   let cliPid: number | undefined;
@@ -127,14 +141,24 @@ test("async run message preserves ownership while a signaled agent remains alive
 
     process.kill(cliPid!, "SIGTERM");
     await waitFor(() => existsSync(signalFile));
-    await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
+    // The agent ignores SIGTERM: while it lives the CLI stays up and the node
+    // stays locked; after the grace period it is SIGKILLed and ownership ends.
     assert.equal(processAlive(agentPid!), true);
+    assert.notEqual(readRun(env, "auth")?.nodes["worker-1"].status, "failed");
     assert.throws(() => acquireNodeLock(env, "auth", "worker-1"), /node is locked: worker-1/);
 
-    process.kill(agentPid!, "SIGKILL");
-    await waitFor(() => !processAlive(agentPid!));
+    await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
+    // Zombie-aware: the CLI may exit before reaping the agent it killed.
+    assert.equal(processGone(agentPid!), true);
     agentPid = undefined;
-    acquireNodeLock(env, "auth", "worker-1")();
+    await waitFor(() => {
+      try {
+        acquireNodeLock(env, "auth", "worker-1")();
+        return true;
+      } catch {
+        return false;
+      }
+    });
   } finally {
     if (agentPid && processAlive(agentPid)) process.kill(agentPid, "SIGKILL");
     if (cliPid && processAlive(cliPid)) process.kill(cliPid, "SIGKILL");
@@ -142,6 +166,61 @@ test("async run message preserves ownership while a signaled agent remains alive
     rmSync(processDirectory, { force: true, recursive: true });
   }
 });
+
+function grandchildAgentSource(): string {
+  const grandchild = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+  return [
+    `#!${process.execPath}`,
+    "const { spawn } = require('node:child_process');",
+    "const fs = require('node:fs');",
+    "process.on('SIGTERM', () => {});",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`,
+    "setTimeout(() => fs.writeFileSync(process.env.HEADLESS_AGENT_PROCESS, JSON.stringify({",
+    "  pid: process.pid, ppid: process.ppid, grandchildPid: child.pid,",
+    "})), 300);",
+    "setInterval(() => undefined, 1000);",
+    "",
+  ].join("\n");
+}
+
+for (const kill of ["SIGTERM", "SIGKILL"] as const) {
+  const label = kill === "SIGTERM"
+    ? "async run message CLI kills the agent's grandchild before it exits on SIGTERM"
+    : "async worker sweeps the agent's grandchild before releasing the lock when the CLI is SIGKILLed";
+  test(label, { skip: process.platform === "win32" }, async () => {
+    const processDirectory = mkdtempSync(join(tmpdir(), "headless-async-agent-test-"));
+    const agentProcessFile = join(processDirectory, "agent-process.json");
+    const { directory, env } = await createFixture(grandchildAgentSource(), {
+      HEADLESS_AGENT_PROCESS: agentProcessFile,
+      HEADLESS_KILL_GRACE_MS: "500",
+    });
+    let pids: { pid: number; ppid: number; grandchildPid: number } | undefined;
+    try {
+      await startAsyncMessage(env);
+      await waitFor(() => existsSync(agentProcessFile));
+      pids = JSON.parse(readFileSync(agentProcessFile, "utf8"));
+      const lockPath = nodeLockPath(env, "auth", "worker-1");
+      await waitFor(() => JSON.parse(readFileSync(`${lockPath}.owner`, "utf8")).processTreeRootPid === pids!.ppid);
+
+      process.kill(pids!.ppid, kill);
+      // Both the CLI and the worker hold the result (and the lock) until the
+      // whole tree is dead, so by the time the node fails nothing survives.
+      await waitFor(() => readRun(env, "auth")?.nodes["worker-1"].status === "failed");
+      assert.ok(processGone(pids!.pid), "agent survived");
+      assert.ok(processGone(pids!.grandchildPid), "agent's grandchild survived");
+      // The worker releases the lock only after its sweep. (Re-acquiring is
+      // not asserted: the lock's group probe still counts zombies, which
+      // linger where PID 1 never reaps; that probe is consolidated later.)
+      await waitFor(() => !existsSync(lockPath));
+    } finally {
+      for (const pid of [pids?.pid, pids?.grandchildPid, pids?.ppid]) {
+        if (pid && processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+      rmSync(directory, { force: true, recursive: true });
+      rmSync(processDirectory, { force: true, recursive: true });
+    }
+  });
+}
 
 test("async run message releases handed-off ownership after normal completion", async () => {
   const agentSource = [
