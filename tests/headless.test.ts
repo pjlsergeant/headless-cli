@@ -241,7 +241,7 @@ test("ACP client advertises read-only filesystem capability", () => {
   });
 });
 
-test("ACP client confines file reads to the work dir, including through symlinks", async () => {
+test("ACP client confines file reads to the work dir, including through symlinks", { skip: process.platform === "win32" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-acp-read-"));
   try {
     const work = join(dir, "work");
@@ -250,6 +250,8 @@ test("ACP client confines file reads to the work dir, including through symlinks
     writeFileSync(join(dir, "outside.txt"), "outside content");
     symlinkSync(join(dir, "outside.txt"), join(work, "escape.txt"));
     symlinkSync("src/inside.txt", join(work, "alias.txt"));
+    const fifo = join(work, "pipe");
+    assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
     const sdk = pathToFileURL(join(repoRoot, "node_modules", "@agentclientprotocol", "sdk", "dist", "acp.js")).href;
     const server = join(dir, "server.mjs");
     writeFileSync(
@@ -286,6 +288,7 @@ test("ACP client confines file reads to the work dir, including through symlinks
       join(work, "..", "outside.txt"),
       join(work, "escape.txt"),
       join(work, "missing.txt"),
+      fifo,
     ];
     const stdout: string[] = [];
     const code = await runAcpClient({
@@ -307,6 +310,8 @@ test("ACP client confines file reads to the work dir, including through symlinks
       assert.match(result, /^ERR:.*file reads are limited to the work dir/);
     }
     assert.match(results[6], /^ERR:Resource not found/);
+    // A FIFO inside the work dir is refused instead of blocking the read forever.
+    assert.match(results[7], /^ERR:.*only regular files can be read/);
     assert.ok(!stdout.join("").includes("outside content"));
   } finally {
     rmSync(dir, { force: true, recursive: true });
