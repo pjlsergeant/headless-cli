@@ -2250,6 +2250,9 @@ async function executeCommand(
         }, options.timeoutSeconds * 1000);
       }
       if (command.stdinText !== undefined) {
+        // An agent may exit (or close stdin) before reading its prompt; the
+        // resulting EPIPE is the agent's outcome, not a headless crash.
+        child.stdin?.on("error", () => undefined);
         child.stdin?.end(command.stdinText);
       }
       child.stdout?.setEncoding("utf8");

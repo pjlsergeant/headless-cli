@@ -489,6 +489,25 @@ test("a slow but steadily draining downstream receives all SDK output, even with
   assert.ok(result.afterAgentExitMs > 1500, `delivery took ${result.afterAgentExitMs}ms; too fast to test the stall deadline`);
 });
 
+test("an agent that exits without reading its stdin prompt does not crash headless", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-test-"));
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir);
+  // codex receives its prompt on stdin; this one exits at once without reading it.
+  writeFileSync(join(binDir, "codex"), "#!/bin/sh\nexit 3\n");
+  chmodSync(join(binDir, "codex"), 0o755);
+  try {
+    const code = await runCli(["codex", "--prompt", "x".repeat(1024 * 1024)], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    assert.equal(code, 3);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 interface CronAgentExecution {
   dir: string;
   env: NodeJS.ProcessEnv;
