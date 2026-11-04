@@ -18,3 +18,6 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - Cron reconcile can mark an execution `killed`/`stale` when the post-exit sweep of its agent group outlasts a daemon tick, though it had finished normally.
 - A daemon tick already in progress at shutdown can start an execution after the shutdown kill passed that job; the next daemon's reconcile cleans it up.
 - `cron stop` sends SIGTERM and returns without waiting for the daemon to exit.
+- Two containers sharing a volume with the same explicitly set hostname and overlapping PIDs can misjudge a live lock holder as stale (`src/owner-lock.ts` host check).
+- The Docker session lock is acquired before the wrap-up guard is installed (`src/cli.ts` `acquireDockerSessionLock` vs `installWrapUpGuard`), so a signal in that window skips its release; the holder is on the host, so the lock is reclaimable, not wedged.
+- Locks with a maximum hold (session store, cron jobs: 60s; launch: 10 min or `--timeout` + 1 min) can be taken over from a holder that is alive but slower than that. Sections check `held()` before each write, which leaves only the window between that check and the rename; a tmux claim with no `--timeout` that takes over 10 minutes can be overtaken and lose transcript attribution.
