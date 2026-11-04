@@ -4662,7 +4662,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       // appears, then releases before the long wait.
       const claimLock =
         waitPlan?.strategy.kind === "claim"
-          ? await acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir))
+          ? await acquireLaunchLock(env, parsed.agent, claimLockScope(parsed.agent, tmuxWaitWorkDir), {
+              claimTimeoutSeconds: commandTimeoutSeconds,
+            })
           : undefined;
       const waitSnapshot = waitPlan
         ? createTmuxWaitSnapshot(parsed.agent, tmuxWaitWorkDir, env, waitPlan.strategy)

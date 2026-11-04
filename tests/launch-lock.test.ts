@@ -11,6 +11,7 @@ import {
   acquireDockerSessionLock,
   acquireLaunchLock,
   dockerSessionLockPath,
+  launchLockMaxHoldMs,
   launchLockPath,
 } from "../src/launch-lock.ts";
 import { acquireOwnerLockSync, inspectOwnerLock, readOwnerLockHolder, tryAcquireOwnerLock } from "../src/owner-lock.ts";
@@ -412,4 +413,10 @@ test("a garbage lock record does not hold the lock", async () => {
     assert.ok(lock);
     lock.release();
   });
+});
+
+test("the launch lock's maximum hold outlasts the run's transcript-claim timeout", () => {
+  assert.equal(launchLockMaxHoldMs(), 10 * 60_000);
+  assert.equal(launchLockMaxHoldMs(30), 10 * 60_000);
+  assert.ok(launchLockMaxHoldMs(3600) > 3600 * 1000);
 });

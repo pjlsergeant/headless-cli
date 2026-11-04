@@ -15,7 +15,13 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
-import { readOwnerLockHolder, tryAcquireOwnerLock, withOwnerLockSync, type OwnerLockRecord } from "./owner-lock.js";
+import {
+  readOwnerLockHolder,
+  tryAcquireOwnerLock,
+  withOwnerLockSync,
+  type OwnerLock,
+  type OwnerLockRecord,
+} from "./owner-lock.js";
 import {
   isSameProcess,
   processAlive,
@@ -119,7 +125,35 @@ function cronJobLockPath(env: Env, id: string): string {
 function withCronJobLock<T>(env: Env, id: string, callback: () => T): T {
   validateCronJobId(id);
   ensurePrivateDir(dirname(cronJobLockPath(env, id)));
-  return withOwnerLockSync(cronJobLockPath(env, id), callback, { label: `cron job lock for ${id}` });
+  return withOwnerLockSync(cronJobLockPath(env, id), (lock) => {
+    const outer = heldJobLock;
+    heldJobLock = lock;
+    try {
+      return callback();
+    } finally {
+      heldJobLock = outer;
+    }
+  }, {
+    label: `cron job lock for ${id}`,
+    // Sections are short; one still held after this died, possibly on a host
+    // (or container) that cannot be probed.
+    maxHoldMs: cronJobLockMaxHoldMs,
+    timeoutMs: cronJobLockMaxHoldMs + 30_000,
+  });
+}
+
+const cronJobLockMaxHoldMs = 60_000;
+let heldJobLock: OwnerLock | undefined;
+
+/**
+ * Called before every job-state write: a section that outlived maxHoldMs has
+ * lost its lock and must not overwrite a newer holder's state. (Residual:
+ * losing it between this check and the rename.)
+ */
+function assertJobLockHeld(): void {
+  if (heldJobLock && !heldJobLock.held()) {
+    throw new Error(`cron job lock was lost before writing: ${heldJobLock.path}`);
+  }
 }
 
 export function cronLogPath(env: Env): string {
@@ -150,6 +184,7 @@ export function updateCronJob(
 
 function writeJob(env: Env, job: CronJobRecord): CronJobRecord {
   validateCronJobId(job.id);
+  assertJobLockHeld();
   ensurePrivateDir(jobsRoot(env));
   ensurePrivateDir(jobHistoryRoot(env, job.id));
   writeJsonPrivate(jobFilePath(env, job.id), job);
@@ -190,6 +225,7 @@ export function deleteCronJob(env: Env, id: string): void {
 }
 
 function removeJobFiles(env: Env, id: string): void {
+  assertJobLockHeld();
   rmSync(jobFilePath(env, id), { force: true });
   rmSync(jobHistoryRoot(env, id), { force: true, recursive: true });
 }
@@ -255,6 +291,8 @@ export async function runDueCronJobsOnce(env: Env, now = new Date()): Promise<vo
 
 export async function runCronDaemon(env: Env): Promise<void> {
   ensurePrivateDir(dirname(cronDaemonLockPath(env)));
+  // No maxHoldMs: the daemon holds this for its whole life, and only host
+  // processes run it, so a dead holder is always detectable.
   const lock = tryAcquireOwnerLock(cronDaemonLockPath(env));
   if (!lock) throw new Error("cron daemon already running");
   let stopped = false;
@@ -348,6 +386,7 @@ export function recentCronExecutions(env: Env, jobId: string, limit = 10): CronE
 
 /** Spawns job `job`'s next execution. Caller holds the job's lock. */
 function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProcess {
+  assertJobLockHeld();
   const executionId = generatedExecutionId(now);
   const executionDir = executionRoot(env, job.id, executionId);
   ensurePrivateDir(executionDir);
@@ -572,6 +611,7 @@ function readExecution(env: Env, jobId: string, executionId: string): CronExecut
 }
 
 function writeExecution(env: Env, jobId: string, execution: CronExecutionRecord): void {
+  assertJobLockHeld();
   ensurePrivateDir(executionRoot(env, jobId, execution.executionId));
   writeJsonPrivate(executionPath(env, jobId, execution.executionId), execution);
 }

@@ -6,9 +6,12 @@ import { acquireOwnerLock } from "./owner-lock.js";
 import type { AgentName, Env } from "./types.js";
 
 const privateDirMode = 0o700;
-// The holder keeps the lock until its brand-new transcript appears; a waiter
-// gives up (and the run fails) if a live holder takes longer than this.
-const defaultLaunchLockTimeoutMs = 5 * 60_000;
+// The holder keeps the lock until its brand-new transcript appears or its
+// tmux session ends; with --timeout that claim wait is bounded by it. The
+// holder may be a nested headless in a Docker container whose host cannot be
+// probed, so a holder older than this is stale on any host.
+const minimumLaunchLockHoldMs = 10 * 60_000;
+const launchLockHoldMarginMs = 60_000;
 
 export interface LaunchLock {
   release: () => void;
@@ -19,7 +22,16 @@ export interface DockerSessionLock {
 }
 
 interface LaunchLockOptions {
+  /** Wait for a held lock; defaults to just over the maximum hold. */
   timeoutMs?: number;
+  /** The run's --timeout, which bounds how long its transcript claim may hold the lock. */
+  claimTimeoutSeconds?: number;
+}
+
+/** How long a launch-lock holder may hold before any waiter treats it as stale. */
+export function launchLockMaxHoldMs(claimTimeoutSeconds?: number): number {
+  const claimMs = claimTimeoutSeconds === undefined ? 0 : claimTimeoutSeconds * 1000 + launchLockHoldMarginMs;
+  return Math.max(minimumLaunchLockHoldMs, claimMs);
 }
 
 // Serializes only the brief launch window of concurrent same-(agent, workspace)
@@ -36,9 +48,14 @@ export async function acquireLaunchLock(
   if (!lockPath) return { release: () => {} };
 
   ensurePrivateDir(dirname(lockPath));
+  const maxHoldMs = launchLockMaxHoldMs(options.claimTimeoutSeconds);
+  // Residual: a live claim that outlasts maxHoldMs (no --timeout and an agent
+  // that takes over ten minutes to write its transcript) can be overtaken,
+  // so two runs may then contend for the same new transcript.
   const lock = await acquireOwnerLock(lockPath, {
     label: "launch lock",
-    timeoutMs: options.timeoutMs ?? defaultLaunchLockTimeoutMs,
+    maxHoldMs,
+    timeoutMs: options.timeoutMs ?? maxHoldMs + launchLockHoldMarginMs,
   });
   return {
     release: () => {
@@ -59,7 +76,9 @@ export function launchLockPath(env: Env, agent: AgentName, workspace: string): s
 
 // Serializes every run of one durable Docker session home. A second run waits
 // for as long as the first one lives (runs can take hours); a holder that died
-// is reclaimed at once.
+// is reclaimed at once. No maxHoldMs: only host-side headless takes this lock
+// (its directory is outside the container-visible home), so the holder can
+// always be probed, and a hold time limit would cut off long legitimate runs.
 export async function acquireDockerSessionLock(persistentHome: string): Promise<DockerSessionLock> {
   const lockPath = dockerSessionLockPath(persistentHome);
   ensurePrivateDir(dirname(lockPath));

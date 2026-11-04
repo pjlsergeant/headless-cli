@@ -39,6 +39,7 @@ interface SessionStoreFile {
 }
 
 const maxSessionStoreBytes = 1024 * 1024;
+const sessionStoreLockMaxHoldMs = 60_000;
 
 export function sessionStorePath(env: Env): string | undefined {
   return env.HOME ? join(env.HOME, ".headless", "sessions.json") : undefined;
@@ -56,12 +57,22 @@ export function readStoredSession(env: Env, agent: AgentName, alias: string): St
  */
 function updateSessionStore(path: string, update: (store: SessionStoreFile) => StoredSession): StoredSession {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  return withOwnerLockSync(`${path}.lock`, () => {
+  return withOwnerLockSync(`${path}.lock`, (lock) => {
     const store = readSessionStore(path);
     const stored = update(store);
+    // A holder past maxHoldMs loses the lock; never publish over a newer
+    // writer. (Residual: losing it between this check and the rename.)
+    if (!lock.held()) throw new Error(`session store lock was lost before writing: ${path}`);
     writeSessionStore(path, store);
     return stored;
-  }, { label: "session store lock" });
+  }, {
+    label: "session store lock",
+    // The holder may be a nested headless in a Docker container sharing this
+    // home, whose liveness the host cannot probe: a section this short that
+    // is still held after a minute has died.
+    maxHoldMs: sessionStoreLockMaxHoldMs,
+    timeoutMs: sessionStoreLockMaxHoldMs + 30_000,
+  });
 }
 
 export function writeStoredSession(

@@ -200,3 +200,21 @@ test("session store keeps tmux wait strategies across unrelated writes", () => {
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("a session store lock left by a dead container holder is reclaimed after its maximum hold", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-sessions-test-"));
+  try {
+    const lockPath = join(dir, ".headless", "sessions.json.lock");
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, "000000000001"), JSON.stringify({
+      hostname: "container-that-died",
+      pid: 1,
+      token: "forged",
+      acquiredAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+    }));
+    writeStoredSession({ HOME: dir }, { agent: "codex", alias: "work", nativeId: "n", workDir: dir });
+    assert.equal(readStoredSession({ HOME: dir }, "codex", "work")?.nativeId, "n");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
