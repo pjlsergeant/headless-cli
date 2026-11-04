@@ -22,6 +22,7 @@ function testEnv(dir: string): NodeJS.ProcessEnv {
     HOME: join(dir, "home"),
     HEADLESS_CRON_DIR: join(dir, "cron"),
     HEADLESS_CLI_BIN: join(dir, "fake-headless.js"),
+    HEADLESS_KILL_GRACE_MS: "500",
     PATH: process.env.PATH,
   };
 }

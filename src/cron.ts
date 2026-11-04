@@ -15,6 +15,7 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { extractFinalMessage } from "./output.js";
+import { supervisorKillGraceMs, terminateProcessGroup } from "./process-tree.js";
 import { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedule.js";
 import type { AgentName, Env } from "./types.js";
 
@@ -23,7 +24,6 @@ export { nextCronRun, parseCronSchedule, type CronSchedule } from "./cron-schedu
 const privateDirMode = 0o700;
 const privateFileMode = 0o600;
 const daemonPollMs = 1000;
-const killGraceMs = 1000;
 
 export type CronJobStatus = "active" | "paused" | "disabled";
 export type CronExecutionStatus = "running" | "succeeded" | "failed" | "killed";
@@ -195,7 +195,7 @@ export async function killCronExecution(
   status: CronJobStatus = "disabled",
 ): Promise<CronJobRecord> {
   const execution = job.activeExecutionId ? readExecution(env, job.id, job.activeExecutionId) : undefined;
-  const signal = execution?.pid ? await terminateProcess(execution.pid) : "SIGTERM";
+  const signal = execution?.pid ? await terminateProcess(env, execution.pid) : "SIGTERM";
   if (execution) {
     writeExecution(env, job.id, {
       ...execution,
@@ -245,9 +245,11 @@ function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProce
     closeSync(stderrFd);
   };
 
+  // Own process group (POSIX) so `cron kill`/`stop`/`rm --force`, which only
+  // know the recorded PID, can signal everything this execution started.
   const child = spawn(resolveHeadlessCronBinary(env), job.command.args, {
     cwd: job.command.workDir,
-    detached: false,
+    detached: true,
     env: env as NodeJS.ProcessEnv,
     stdio: ["ignore", stdoutFd, stderrFd],
   });
@@ -491,6 +493,9 @@ function readPidFile(path: string): number | undefined {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+// NOTE: treats EPERM (process exists, owned by someone else) as dead, which is
+// wrong for liveness. Left as-is until processAlive is consolidated across
+// modules; cron kill's own liveness probe (processGroupAlive) handles EPERM.
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -500,36 +505,14 @@ function processAlive(pid: number): boolean {
   }
 }
 
-async function terminateProcess(pid: number): Promise<NodeJS.Signals | null> {
-  if (!processAlive(pid)) {
-    return "SIGTERM";
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return "SIGTERM";
-  }
-  if (await waitForProcessExit(pid, killGraceMs)) {
-    return "SIGTERM";
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    return "SIGKILL";
-  }
-  await waitForProcessExit(pid, killGraceMs);
-  return "SIGKILL";
-}
-
-async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!processAlive(pid)) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return !processAlive(pid);
+async function terminateProcess(env: Env, pid: number): Promise<NodeJS.Signals | null> {
+  // SIGTERM the execution's process group; headless forwards it to the
+  // agent's own group and escalates there after one grace period, so allow it
+  // that long (plus margin) before SIGKILLing headless's group ourselves.
+  return await terminateProcessGroup(
+    { pid, kill: (signal) => process.kill(pid, signal) },
+    { graceMs: supervisorKillGraceMs(env) },
+  );
 }
 
 function acquireDaemonLock(env: Env): () => void {

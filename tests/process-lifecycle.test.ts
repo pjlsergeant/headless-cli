@@ -6,6 +6,9 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { runCli } from "../src/cli.ts";
+import { cronRoot, parseCronSchedule, readCronJob, recordCronJob, runDueCronJobsOnce } from "../src/cron.ts";
+
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const posixOnly = { skip: process.platform === "win32" };
 
@@ -143,4 +146,60 @@ test("an agent tree that ignores SIGTERM is SIGKILLed after the grace period", p
   assert.ok(result.elapsedMs >= 450, `headless exited after ${result.elapsedMs}ms, before the grace period`);
   assert.ok(processGone(result.agentPid));
   assert.ok(processGone(result.grandchildPid));
+});
+
+test("cron kill terminates the agent's grandchild, not just the headless process", posixOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-lifecycle-cron-test-"));
+  const agentPidFile = join(dir, "agent.pid");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const binDir = join(dir, "bin");
+  writeFakeAgent(binDir, "codex");
+  const headlessBin = join(dir, "headless");
+  writeFileSync(
+    headlessBin,
+    ["#!/bin/sh", `exec "${process.execPath}" --import tsx "${join(repoRoot, "src", "cli.ts")}" "$@"`, ""].join("\n"),
+  );
+  chmodSync(headlessBin, 0o755);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: join(dir, "home"),
+    HEADLESS_CRON_DIR: join(dir, "cron"),
+    HEADLESS_CLI_BIN: headlessBin,
+    HEADLESS_KILL_GRACE_MS: "500",
+    HEADLESS_TEST_AGENT_PID: agentPidFile,
+    HEADLESS_TEST_GRANDCHILD_PID: grandchildPidFile,
+    HEADLESS_TEST_IGNORE_TERM: "1",
+    PATH: `${binDir}:${process.env.PATH ?? ""}`,
+  };
+  mkdirSync(env.HOME as string, { recursive: true });
+  let headlessPid: number | undefined;
+  try {
+    recordCronJob(env, {
+      agent: "codex",
+      // repoRoot so the wrapper's `--import tsx` resolves.
+      command: { args: ["codex", "--prompt", "tick"], workDir: repoRoot },
+      id: "lifecycle",
+      schedule: parseCronSchedule({ every: "1h" }),
+      now: new Date("2026-05-15T12:00:00.000Z"),
+    });
+    await runDueCronJobsOnce(env, new Date("2026-05-15T13:00:01.000Z"));
+    const executionId = readCronJob(env, "lifecycle")?.activeExecutionId;
+    assert.ok(executionId);
+    const result = JSON.parse(
+      readFileSync(join(cronRoot(env), "jobs", "lifecycle", "executions", executionId, "result.json"), "utf8"),
+    );
+    headlessPid = result.pid;
+    await waitFor(() => readPid(agentPidFile) !== undefined, 10_000);
+    const agentPid = readPid(agentPidFile)!;
+    const grandchildPid = readPid(grandchildPidFile)!;
+
+    assert.equal(await runCli(["cron", "kill", "lifecycle"], { env, stdout: () => {} }), 0);
+
+    await waitFor(() => processGone(headlessPid!) && processGone(agentPid) && processGone(grandchildPid));
+  } finally {
+    killQuietly(headlessPid);
+    killQuietly(readPid(agentPidFile));
+    killQuietly(readPid(grandchildPidFile));
+    rmSync(dir, { force: true, recursive: true });
+  }
 });
