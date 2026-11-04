@@ -40,12 +40,13 @@ test("builds read-only commands for supported agents", () => {
       "--model",
       "claude-opus-4-6",
       "-p",
-      "hello",
       "--output-format",
       "stream-json",
       "--verbose",
       "--allowedTools",
       "Read,Grep,Glob,LS,WebFetch,WebSearch",
+      "--",
+      "hello",
     ],
   });
 
@@ -60,13 +61,14 @@ test("builds read-only commands for supported agents", () => {
       "--model",
       "gemini-3.1-pro-preview",
       "--skip-trust",
-      "-p",
-      "hello",
+      "--prompt",
+      "",
       "--output-format",
       "stream-json",
       "--approval-mode",
       "plan",
     ],
+    stdinText: "hello",
   });
 
   assert.deepEqual(buildAgentCommand("antigravity", { prompt: "hello", allow: "read-only", workDir: "/work" }, {}), {
@@ -114,11 +116,12 @@ test("builds explicit yolo commands for supported agents", () => {
     "--model",
     "claude-opus-4-6",
     "-p",
-    "hello",
     "--output-format",
     "stream-json",
     "--verbose",
     "--dangerously-skip-permissions",
+    "--",
+    "hello",
   ]);
   assert.deepEqual(buildAgentCommand("cursor", { prompt: "hello", allow: "yolo" }, {}).args, [
     "-p",
@@ -134,8 +137,8 @@ test("builds explicit yolo commands for supported agents", () => {
     "--model",
     "gemini-3.1-pro-preview",
     "--skip-trust",
-    "-p",
-    "hello",
+    "--prompt",
+    "",
     "--output-format",
     "stream-json",
     "--approval-mode",
@@ -187,7 +190,7 @@ test("defaults to yolo commands for supported agents", () => {
 test("builds read-only interactive commands for tmux mode", () => {
   assert.deepEqual(buildInteractiveAgentCommand("codex", { prompt: "hello", allow: "read-only" }, {}), {
     command: "codex",
-    args: ["--sandbox", "read-only", "--ask-for-approval", "never", "--search", "--model", "gpt-5.5", "hello"],
+    args: ["--sandbox", "read-only", "--ask-for-approval", "never", "--search", "--model", "gpt-5.5", "--", "hello"],
   });
   assert.deepEqual(buildInteractiveAgentCommand("claude", { prompt: "hello", allow: "read-only" }, {}), {
     command: "claude",
@@ -196,6 +199,7 @@ test("builds read-only interactive commands for tmux mode", () => {
       "claude-opus-4-6",
       "--allowedTools",
       "Read,Grep,Glob,LS,WebFetch,WebSearch",
+      "--",
       "hello",
     ],
   });
@@ -352,7 +356,7 @@ test("CLI print-command includes allow mode flags", async () => {
   assert.equal(code, 0);
   assert.equal(
     stdout.join(""),
-    "gemini --model gemini-3.1-pro-preview --skip-trust -p hello --output-format stream-json --approval-mode plan\n",
+    "printf %s hello | gemini --model gemini-3.1-pro-preview --skip-trust --prompt '' --output-format stream-json --approval-mode plan\n",
   );
 });
 
@@ -400,7 +404,7 @@ test("CLI warns when Gemini reasoning effort is unsupported", async () => {
   assert.equal(code, 0);
   assert.equal(
     stdout.join(""),
-    "gemini --model gemini-3.1-pro-preview --skip-trust -p hello --output-format stream-json --approval-mode yolo\n",
+    "printf %s hello | gemini --model gemini-3.1-pro-preview --skip-trust --prompt '' --output-format stream-json --approval-mode yolo\n",
   );
   assert.match(stderr.join(""), /reasoning effort is not supported by gemini and was ignored/);
 });
@@ -412,7 +416,7 @@ test("CLI tmux print-command includes reasoning effort flags", async () => {
   });
 
   assert.equal(code, 0);
-  assert.match(stdout.join(""), /codex .* -c '\\''model_reasoning_effort="high"'\\'' hello/);
+  assert.match(stdout.join(""), /codex .* -c '\\''model_reasoning_effort="high"'\\'' -- hello/);
 });
 
 test("CLI tmux warns when reasoning effort is unsupported", async () => {
@@ -435,7 +439,7 @@ test("CLI tmux print-command includes allow mode flags", async () => {
   });
 
   assert.equal(code, 0);
-  assert.match(stdout.join(""), /codex --sandbox read-only --ask-for-approval never --search --model gpt-5\.5 hello/);
+  assert.match(stdout.join(""), /codex --sandbox read-only --ask-for-approval never --search --model gpt-5\.5 -- hello/);
 });
 
 test("CLI Antigravity tmux print-command includes allow mode flags", async () => {

@@ -31,3 +31,5 @@ Known non-show-stopper issues in process lifecycle handling, kept for later.
 - User-supplied `--docker-arg` volume mounts are not checked for overlap with Headless state.
 - Flaky under full-suite load: "cron daemon keeps its signal handlers until active executions are killed" (tests/cron.test.ts) failed once in a full run, passes alone; timing-sensitive.
 - Attacker-filled old mailbox launch directories can linger: the bounded best-effort sweep on the next launch does not recurse into subdirectories a container nested inside its mailbox.
+- Prompts starting with "-" are still passed as a bare positional (or `-p` value) to Cursor (`agent`, one-shot and interactive), OpenCode (`run` and interactive run), Pi (one-shot and interactive), Gemini interactive, and Antigravity (`agy -p`); none of these CLIs is installed here to verify whether they accept `--` or a dash-leading value, and none has a stdin prompt path in Headless. Claude, Codex and Gemini one-shot are fixed.
+- Gemini one-shot now sends inline prompts on stdin with `--prompt ''` (the path prompt files already used); not verified against an installed gemini.

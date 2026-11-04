@@ -18,10 +18,10 @@ printf "Review this diff" | headless pi --model claude-opus
 | --- | --- |
 | `acp` | `headless acp-client -- <acp-server-command>`, selected with `--acp-agent` or `--acp-command` |
 | `antigravity` | `agy -p ... --dangerously-skip-permissions` |
-| `claude` | `claude -p ... --output-format stream-json --verbose --dangerously-skip-permissions` |
+| `claude` | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions -- ...` |
 | `codex` | `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check ...` |
 | `cursor` | `agent -p --trust --force --output-format stream-json --model gpt-5.5-medium ...` |
-| `gemini` | `gemini --model gemini-3.1-pro-preview --skip-trust -p ... --output-format stream-json --approval-mode yolo` |
+| `gemini` | `gemini --model gemini-3.1-pro-preview --skip-trust --prompt '' --output-format stream-json --approval-mode yolo` (prompt on stdin) |
 | `opencode` | `opencode run --format json --model openai/gpt-5.4 --dangerously-skip-permissions ...` |
 | `pi` | `pi --no-session --mode json --provider openai-codex --model gpt-5.5 --tools read,bash,edit,write ...` |
 

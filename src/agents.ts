@@ -293,9 +293,11 @@ function buildClaude(options: BuildOptions, env: Env): BuiltCommand {
     return buildClaudeCommand(args, env, { stdinFile: options.promptFile });
   }
 
-  args.push(options.prompt, "--output-format", "stream-json", "--verbose");
+  args.push("--output-format", "stream-json", "--verbose");
   args.push(...withClaudeEffort([], options.reasoningEffort));
   args.push(...withClaudeAllow([], options.allow));
+  // After "--", so a prompt starting with "-" (a markdown list) is not parsed as options.
+  args.push("--", options.prompt);
   return buildClaudeCommand(args, env);
 }
 
@@ -347,10 +349,11 @@ function buildInteractiveCodex(options: BuildOptions, env: Env): BuiltCommand {
   if (options.reasoningEffort) {
     args.push("-c", `model_reasoning_effort="${options.reasoningEffort}"`);
   }
+  // "--" keeps a prompt starting with "-" from being parsed as options.
   if (options.sessionMode === "resume" && options.sessionId) {
-    args.push("resume", options.sessionId, options.prompt);
+    args.push("resume", options.sessionId, "--", options.prompt);
   } else {
-    args.push(options.prompt);
+    args.push("--", options.prompt);
   }
   return { command: "codex", args };
 }
@@ -399,13 +402,13 @@ function buildGemini(options: BuildOptions): BuiltCommand {
     args.push("--resume", options.sessionId);
   }
 
+  // The prompt always goes through stdin (gemini appends stdin to --prompt):
+  // as a -p value, a prompt starting with "-" is parsed as options.
+  args.push("--prompt", "", "--output-format", "stream-json", ...withGeminiAllow([], options.allow));
   if (options.promptFile) {
-    args.push("--prompt", "", "--output-format", "stream-json", ...withGeminiAllow([], options.allow));
     return { command: "gemini", args, stdinFile: options.promptFile };
   }
-
-  args.push("-p", options.prompt, "--output-format", "stream-json", ...withGeminiAllow([], options.allow));
-  return { command: "gemini", args };
+  return { command: "gemini", args, stdinText: options.prompt };
 }
 
 function buildInteractiveGemini(options: BuildOptions): BuiltCommand {
@@ -570,7 +573,7 @@ const harnesses: Record<AgentName, AgentHarness> = {
       }
       args.push(...withClaudeEffort([], options.reasoningEffort));
       args.push(...withClaudeAllow([], options.allow));
-      args.push(options.prompt);
+      args.push("--", options.prompt);
       return buildClaudeCommand(args, env);
     },
   },
