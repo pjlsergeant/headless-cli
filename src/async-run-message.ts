@@ -177,7 +177,13 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
     activeChild = child;
     activeTree = cliProcessTree(child);
     const tree = activeTree;
-    child.once("error", reject);
+    // Every outcome, failure included, settles only after the close-time
+    // sweep: the caller releases the node lock as soon as this settles.
+    let failure: { error: unknown } | undefined;
+    const fail = (error: unknown) => {
+      failure ??= { error };
+    };
+    child.once("error", fail);
     child.once("spawn", () => {
       try {
         if (!child.pid) throw new Error("async message CLI started without a process ID");
@@ -189,7 +195,7 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
         send({ type: "started" });
       } catch (error) {
         terminateActiveChild("SIGKILL");
-        reject(error);
+        fail(error);
       }
     });
     child.once("close", (code, signal) => {
@@ -200,7 +206,8 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
       void sweep(tree).then(() => {
         activeChild = undefined;
         activeTree = undefined;
-        resolve(status);
+        if (failure) reject(failure.error);
+        else resolve(status);
       });
     });
   });
