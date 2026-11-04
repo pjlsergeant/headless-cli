@@ -7,7 +7,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { acquireDockerSessionLock, acquireLaunchLock, dockerSessionLockPath, launchLockPath } from "../src/launch-lock.ts";
+import {
+  acquireDockerSessionLock,
+  acquireLaunchLock,
+  dockerSessionLockPath,
+  launchLockPath,
+} from "../src/launch-lock.ts";
 import { acquireOwnerLockSync, inspectOwnerLock, readOwnerLockHolder, tryAcquireOwnerLock } from "../src/owner-lock.ts";
 
 const repoRoot = process.cwd();
@@ -325,5 +330,86 @@ test("owner locks refuse a symlink planted in place of the lock directory", { sk
     symlinkSync(target, join(home, "lock"));
     assert.throws(() => tryAcquireOwnerLock(join(home, "lock")), /not a directory/);
     assert.deepEqual(readdirSync(target), []);
+  });
+});
+
+test("a foreign-host holder older than maxHoldMs is stale; a fresh one is not", async () => {
+  await withHome((home) => {
+    const lockPath = join(home, "lock");
+    // E.g. a nested headless in a Docker container that died holding the lock.
+    forgeHolder(lockPath, { hostname: "container-1", pid: process.pid, acquiredAt: new Date(Date.now() - 120_000).toISOString() });
+    const reclaimed = acquireOwnerLockSync(lockPath, { maxHoldMs: 60_000, timeoutMs: 0 });
+    assert.equal(readOwnerLockHolder(lockPath)?.token, reclaimed.owner.token);
+    reclaimed.release();
+
+    const fresh = join(home, "fresh");
+    forgeHolder(fresh, { hostname: "container-2", pid: process.pid, acquiredAt: new Date().toISOString() });
+    assert.throws(() => acquireOwnerLockSync(fresh, { maxHoldMs: 60_000, timeoutMs: 50 }), /timed out acquiring lock/);
+    // Without maxHoldMs a foreign holder is never judged stale.
+    forgeHolder(join(home, "old"), { hostname: "container-3", pid: process.pid, acquiredAt: new Date(0).toISOString() });
+    assert.equal(tryAcquireOwnerLock(join(home, "old")), undefined);
+  });
+});
+
+test("a holder that outlived maxHoldMs sees it no longer holds the lock", async () => {
+  await withHome((home) => {
+    const lockPath = join(home, "lock");
+    const slow = acquireOwnerLockSync(lockPath, { timeoutMs: 0 });
+    // Age the record as if the section had run for two minutes.
+    const [generation] = generations(lockPath);
+    writeFileSync(join(lockPath, generation!), `${JSON.stringify({
+      ...slow.owner, acquiredAt: new Date(Date.now() - 120_000).toISOString(),
+    })}\n`);
+    const next = acquireOwnerLockSync(lockPath, { maxHoldMs: 60_000, timeoutMs: 0 });
+    assert.equal(slow.held(), false);
+    slow.release();
+    assert.equal(next.held(), true);
+    next.release();
+  });
+});
+
+test("owner locks refuse filesystems without hard links instead of publishing in place", async () => {
+  await withHome((home) => {
+    const lockPath = join(home, "lock");
+    const link = () => {
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    };
+    assert.throws(() => tryAcquireOwnerLock(lockPath, { link }), (error: Error) =>
+      error.message.includes(lockPath) && /does not support hard links \(EPERM\)/.test(error.message));
+    // Nothing was published, and the private temp record was removed.
+    assert.deepEqual(readdirSync(lockPath), []);
+  });
+});
+
+test("a FIFO planted as a lock record neither hangs nor holds the lock", { skip: process.platform === "win32" }, async () => {
+  await withHome((home) => {
+    const lockPath = join(home, "lock");
+    mkdirSync(lockPath);
+    const fifo = spawnSync("mkfifo", [join(lockPath, "000000000001")], { encoding: "utf8" });
+    assert.equal(fifo.status, 0, fifo.stderr);
+    // In a child with a deadline: a blocking open would hang it, signals included.
+    const child = spawnSync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "--eval",
+      [
+        `const { readOwnerLockHolder, tryAcquireOwnerLock } = await import(${JSON.stringify(ownerLockUrl)});`,
+        `if (readOwnerLockHolder(${JSON.stringify(lockPath)}) !== undefined) process.exit(3);`,
+        `const lock = tryAcquireOwnerLock(${JSON.stringify(lockPath)});`,
+        `if (!lock) process.exit(4);`,
+        `lock.release();`,
+      ].join("\n"),
+    ], { cwd: repoRoot, encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" });
+    assert.equal(child.signal, null, "lock code hung on a FIFO");
+    assert.equal(child.status, 0, child.stderr);
+  });
+});
+
+test("a garbage lock record does not hold the lock", async () => {
+  await withHome((home) => {
+    const lockPath = join(home, "lock");
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "000000000001"), "{\"hostname\":");
+    const lock = tryAcquireOwnerLock(lockPath);
+    assert.ok(lock);
+    lock.release();
   });
 });

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -9,7 +11,6 @@ import {
   readdirSync,
   readSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -40,9 +41,19 @@ import { isSameProcess, ownProcessStartIdentity, validProcessId } from "./proces
  * reclamation atomic without a compare-and-delete: two waiters can never both
  * hold, and a slow or dead former holder can never remove a newer holder.
  *
- * Staleness never depends on timers or mtimes: a holder is stale exactly when
- * it is on this host and is no longer the same process (dead, zombie, or its
- * PID reused). Owners on other hosts (shared filesystems) are treated as alive.
+ * A holder is stale when it is on this host and is no longer the same process
+ * (dead, zombie, or its PID reused). Owners on other hosts (shared
+ * filesystems, or a nested headless inside a Docker container on a mounted
+ * home) cannot be probed, so they count as alive, unless the lock sets
+ * `maxHoldMs`: then any holder whose acquiredAt is older than that is stale
+ * whatever its host. Short critical sections set it so a holder that died
+ * elsewhere cannot wedge the lock; long-held host-only locks do not.
+ *
+ * Publication must be atomic. A filesystem without hard links is refused
+ * with an error rather than written in place, which would let a waiter take
+ * a half-written record for garbage while its creator also wins. Records are
+ * opened without following symlinks or blocking, and anything that is not a
+ * small regular file (a planted FIFO or device) counts as garbage.
  */
 
 export interface OwnerLockRecord {
@@ -69,6 +80,24 @@ export interface OwnerLockOptions {
   retryMs?: number;
   /** Names the lock in timeout errors. */
   label?: string;
+  /**
+   * A holder that acquired the lock longer ago than this is stale on any
+   * host. Set only for locks held for short, bounded sections. A holder still
+   * alive past it loses the lock; it should check `held()` before committing.
+   */
+  maxHoldMs?: number;
+  /** Test seam: replaces fs.linkSync for publishing generation files. */
+  link?: (existingPath: string, newPath: string) => void;
+}
+
+interface AttemptContext {
+  verified: Map<string, number>;
+  maxHoldMs?: number;
+  link: (existingPath: string, newPath: string) => void;
+}
+
+function contextFor(options: OwnerLockOptions): AttemptContext {
+  return { verified: new Map(), maxHoldMs: options.maxHoldMs, link: options.link ?? linkSync };
 }
 
 export const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
@@ -77,9 +106,6 @@ const maximumRecordBytes = 4096;
 const privateDirMode = 0o700;
 const privateFileMode = 0o600;
 const generationPattern = /^\d{1,15}$/;
-// An unparseable top record is only possible through the non-link fallback
-// (written in place) or outside interference; give a writer this long.
-const unreadableGraceMs = 5_000;
 // Re-verify a holder's start identity (a `ps`/PowerShell spawn off Linux) at
 // most this often; liveness itself is re-probed on every attempt.
 const identityRecheckMs = 1_000;
@@ -88,7 +114,7 @@ type TopRecord =
   | { kind: "none" }
   | { kind: "held"; generation: number; owner: OwnerLockRecord }
   | { kind: "released"; generation: number }
-  | { kind: "unreadable"; generation: number; fresh: boolean }
+  | { kind: "unreadable"; generation: number }
   | { kind: "vanished" };
 
 export class OwnerLockTimeoutError extends Error {
@@ -99,15 +125,15 @@ export class OwnerLockTimeoutError extends Error {
 }
 
 /** One attempt; undefined when another live owner holds the lock. */
-export function tryAcquireOwnerLock(path: string): OwnerLock | undefined {
-  return attempt(path, new Map());
+export function tryAcquireOwnerLock(path: string, options: OwnerLockOptions = {}): OwnerLock | undefined {
+  return attempt(path, contextFor(options));
 }
 
 export function acquireOwnerLockSync(path: string, options: OwnerLockOptions = {}): OwnerLock {
   const deadline = deadlineFor(options);
-  const verified = new Map<string, number>();
+  const context = contextFor(options);
   while (true) {
-    const lock = attempt(path, verified);
+    const lock = attempt(path, context);
     if (lock) return lock;
     if (Date.now() >= deadline) throw timeoutError(path, options);
     sleepSync(Math.min(options.retryMs ?? defaultRetryMs, Math.max(1, deadline - Date.now())));
@@ -117,9 +143,9 @@ export function acquireOwnerLockSync(path: string, options: OwnerLockOptions = {
 /** Waits without blocking the event loop. */
 export async function acquireOwnerLock(path: string, options: OwnerLockOptions = {}): Promise<OwnerLock> {
   const deadline = deadlineFor(options);
-  const verified = new Map<string, number>();
+  const context = contextFor(options);
   while (true) {
-    const lock = attempt(path, verified);
+    const lock = attempt(path, context);
     if (lock) return lock;
     if (Date.now() >= deadline) throw timeoutError(path, options);
     const delay = Math.min(options.retryMs ?? defaultRetryMs, Math.max(1, deadline - Date.now()));
@@ -128,10 +154,14 @@ export async function acquireOwnerLock(path: string, options: OwnerLockOptions =
 }
 
 /** Runs `callback` while holding the lock (sync wait; keep `callback` short). */
-export function withOwnerLockSync<T>(path: string, callback: () => T, options: OwnerLockOptions = {}): T {
+export function withOwnerLockSync<T>(
+  path: string,
+  callback: (lock: OwnerLock) => T,
+  options: OwnerLockOptions = {},
+): T {
   const lock = acquireOwnerLockSync(path, options);
   try {
-    return callback();
+    return callback(lock);
   } finally {
     lock.release();
   }
@@ -148,7 +178,7 @@ export function readOwnerLockHolder(path: string): OwnerLockRecord | undefined {
       throw error;
     }
     if (top.kind === "vanished") continue;
-    return top.kind === "held" && holderAlive(top.owner, new Map()) ? top.owner : undefined;
+    return top.kind === "held" && holderAlive(top.owner, contextFor({})) ? top.owner : undefined;
   }
   return undefined;
 }
@@ -173,13 +203,12 @@ export function inspectOwnerLock(path: string): { state: "free" | "held" | "rele
   return { state: "held" };
 }
 
-function attempt(path: string, verified: Map<string, number>): OwnerLock | undefined {
+function attempt(path: string, context: AttemptContext): OwnerLock | undefined {
   ensureLockDirectory(path);
   for (let tries = 0; tries < 10; tries += 1) {
     const top = readTop(path);
     if (top.kind === "vanished") continue;
-    if (top.kind === "held" && holderAlive(top.owner, verified)) return undefined;
-    if (top.kind === "unreadable" && top.fresh) return undefined;
+    if (top.kind === "held" && holderAlive(top.owner, context)) return undefined;
     const generation = top.kind === "none" ? 1 : top.generation + 1;
     const owner: OwnerLockRecord = {
       hostname: hostname(),
@@ -188,7 +217,7 @@ function attempt(path: string, verified: Map<string, number>): OwnerLock | undef
       token: randomUUID(),
       acquiredAt: new Date().toISOString(),
     };
-    if (!createGeneration(path, generation, owner)) continue;
+    if (!createGeneration(path, generation, owner, context.link)) continue;
     const highest = highestGeneration(path);
     if (highest !== generation) {
       removeGeneration(path, generation);
@@ -197,12 +226,17 @@ function attempt(path: string, verified: Map<string, number>): OwnerLock | undef
     for (const lower of listGenerations(path)) {
       if (lower < generation) removeGeneration(path, lower);
     }
-    return lockHandle(path, generation, owner);
+    return lockHandle(path, generation, owner, context.link);
   }
   return undefined;
 }
 
-function lockHandle(path: string, generation: number, owner: OwnerLockRecord): OwnerLock {
+function lockHandle(
+  path: string,
+  generation: number,
+  owner: OwnerLockRecord,
+  link: AttemptContext["link"],
+): OwnerLock {
   let released = false;
   const held = () => {
     if (released) return false;
@@ -217,7 +251,7 @@ function lockHandle(path: string, generation: number, owner: OwnerLockRecord): O
       if (released) return;
       released = true;
       try {
-        if (!createGeneration(path, generation + 1, { released: true, token: owner.token })) return;
+        if (!createGeneration(path, generation + 1, { released: true, token: owner.token }, link)) return;
       } catch (error) {
         // The lock directory was removed from under us: nothing left to release.
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -229,8 +263,16 @@ function lockHandle(path: string, generation: number, owner: OwnerLockRecord): O
   };
 }
 
-function holderAlive(owner: OwnerLockRecord, verified: Map<string, number>): boolean {
-  if (owner.hostname !== hostname()) return true;
+function holderAlive(owner: OwnerLockRecord, context: AttemptContext): boolean {
+  if (owner.hostname === hostname() && !sameLocalProcess(owner, context.verified)) return false;
+  if (context.maxHoldMs !== undefined) {
+    const acquiredAt = Date.parse(owner.acquiredAt);
+    if (!Number.isFinite(acquiredAt) || Date.now() - acquiredAt > context.maxHoldMs) return false;
+  }
+  return true;
+}
+
+function sameLocalProcess(owner: OwnerLockRecord, verified: Map<string, number>): boolean {
   const checkedAt = verified.get(owner.token);
   if (checkedAt !== undefined && Date.now() - checkedAt < identityRecheckMs) {
     // Identity recently matched; only re-probe that the PID still lives.
@@ -245,19 +287,19 @@ function readTop(path: string): TopRecord {
   const generation = highestGeneration(path);
   if (generation === undefined) return { kind: "none" };
   const file = generationPath(path, generation);
-  let text: string;
-  let mtimeMs: number;
+  let text: string | undefined;
   try {
-    mtimeMs = statSync(file).mtimeMs;
-    text = readBounded(file);
+    text = readRecordFile(file);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "vanished" };
     throw error;
   }
-  const record = parseRecord(text);
+  const record = text === undefined ? undefined : parseRecord(text);
   if (record === "released") return { kind: "released", generation };
   if (record) return { kind: "held", generation, owner: record };
-  return { kind: "unreadable", generation, fresh: Date.now() - mtimeMs < unreadableGraceMs };
+  // Publication is atomic, so this is garbage (or something planted), not a
+  // record still being written: it does not hold the lock.
+  return { kind: "unreadable", generation };
 }
 
 function parseRecord(text: string): OwnerLockRecord | "released" | undefined {
@@ -299,26 +341,31 @@ function generationPath(path: string, generation: number): string {
 }
 
 /** Atomically creates a generation file with its full content; false if it exists. */
-function createGeneration(path: string, generation: number, content: object): boolean {
+function createGeneration(
+  path: string,
+  generation: number,
+  content: object,
+  link: AttemptContext["link"],
+): boolean {
   const target = generationPath(path, generation);
   const temporary = join(path, `.tmp-${randomUUID()}`);
   writeFileSync(temporary, `${JSON.stringify(content)}\n`, { flag: "wx", mode: privateFileMode });
   try {
-    linkSync(temporary, target);
+    link(temporary, target);
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "EEXIST") return false;
-    if (code !== "EPERM" && code !== "ENOTSUP" && code !== "ENOSYS" && code !== "EOPNOTSUPP") throw error;
-    // No hard links on this filesystem: exclusive create, written in place.
-    // Readers give a not-yet-parseable file unreadableGraceMs to fill in.
-    try {
-      writeFileSync(target, `${JSON.stringify(content)}\n`, { flag: "wx", mode: privateFileMode });
-      return true;
-    } catch (fallbackError) {
-      if ((fallbackError as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw fallbackError;
+    if (code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS" || code === "EOPNOTSUPP" || code === "EXDEV") {
+      throw Object.assign(
+        new Error(
+          `cannot lock ${path}: its filesystem does not support hard links (${code}), `
+            + "which headless needs to publish lock records atomically",
+        ),
+        { code },
+      );
     }
+    throw error;
   } finally {
     rmSync(temporary, { force: true });
   }
@@ -341,9 +388,22 @@ function ensureLockDirectory(path: string): void {
   chmodSync(path, privateDirMode);
 }
 
-function readBounded(file: string): string {
-  const descriptor = openSync(file, "r");
+/**
+ * A generation file's text, or undefined when it is not a small regular file.
+ * Opened non-blocking and without following symlinks: a FIFO or device
+ * planted in a container-writable lock directory must not hang the host.
+ */
+function readRecordFile(file: string): string | undefined {
+  let descriptor: number;
   try {
+    descriptor = openSync(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+    throw error;
+  }
+  try {
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile() || stats.size > maximumRecordBytes) return undefined;
     const buffer = Buffer.alloc(maximumRecordBytes);
     const length = readSync(descriptor, buffer, 0, buffer.length, 0);
     return buffer.subarray(0, length).toString("utf8");
