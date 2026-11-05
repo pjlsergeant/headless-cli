@@ -301,7 +301,7 @@ test("forwards Sakana credentials to Docker without rendering the secret value",
       command: { command: "codex", args: ["exec", "-"] },
       dockerArgs: [],
       dockerEnv: [],
-      env: { HOME: home, SAKANA_API_KEY: "sakana-secret" },
+      env: { HOME: home, SAKANA_API_KEY: "sakana-secret", ZAI_API_KEY: "zai-secret" },
       image: DEFAULT_DOCKER_IMAGE,
       workDir,
     });
@@ -309,6 +309,8 @@ test("forwards Sakana credentials to Docker without rendering the secret value",
     const rendered = quoteCommand(command);
     assert.match(rendered, /--env SAKANA_API_KEY/);
     assert.doesNotMatch(rendered, /sakana-secret/);
+    assert.match(rendered, /--env ZAI_API_KEY/);
+    assert.doesNotMatch(rendered, /zai-secret/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

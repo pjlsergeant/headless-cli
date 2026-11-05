@@ -67,6 +67,35 @@ Pass `--profile <name>` to select a Codex configuration profile for one-shot, tm
 
 When a profile sets top-level `model` and `model_provider` keys, `--usage`, the wait spinner, and SDK results report that model and provider, and usage is priced from models.dev using the Codex provider id as the models.dev provider id. An explicit `--model` (or `CODEX_MODEL`) still overrides the profile's model.
 
+### Z.AI (GLM) through Codex
+
+Codex can run Z.AI's GLM models through a profile. Put this in `~/.codex/zai.config.toml`, next to your normal `config.toml` and OpenAI login, which stay unchanged (or in `$CODEX_HOME/zai.config.toml` if you set `CODEX_HOME`):
+
+```toml
+model = "glm-5.3"
+model_provider = "zai"
+model_reasoning_effort = "max"
+# Optional: a Codex model catalog describing glm-5.3 (context window, reasoning levels).
+# model_catalog_json = "/home/you/.codex/zai-models.json"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+env_key_instructions = "Set ZAI_API_KEY to the API key from https://z.ai/manage-apikey/apikey-list."
+wire_api = "responses"
+```
+
+Then export your Z.AI key and select the profile:
+
+```bash
+export ZAI_API_KEY=...
+headless codex --profile zai --prompt "Summarize this repo" --usage
+headless codex --profile zai --docker --prompt "Fix the failing tests"
+```
+
+`model_provider = "zai"` matches the models.dev provider id, so `--usage` prices GLM runs. Docker and Modal seed the profile (and its catalog) into the remote Codex home and forward `ZAI_API_KEY` automatically.
+
 ## Output Modes
 
 Raw mode is the default: Headless prints the extracted final assistant message.
@@ -355,4 +384,4 @@ See [orchestration.md](orchestration.md) for `--role`, `--run`, `--node`, `--tea
 
 On POSIX, Headless terminates the agent's whole process tree: its process group plus, at signal time, every descendant found by parent PID (so a descendant that called `setsid` is still killed). This includes the cleanup after an agent exits on its own, which reaches only processes that remain in the agent's process group or are still descendants when Headless looks. Some agent CLIs start their shell commands in a separate session (verified for Claude Code: a `sleep &` run by its Bash tool gets its own session and is reparented to init within milliseconds), so background processes those agents start are not cleaned up. The same applies to programs that daemonize (`setsid`, `tmux new-session -d`, pm2, and similar) and to any descendant that double-forks and is reparented away before Headless looks. Agents started with `--tmux` belong to the tmux server by design and are not killed when Headless exits. Cron executions report their agent's process group to the daemon, so `cron kill`/`stop`/`rm --force` reach the agent even if the Headless process itself has died. By default, after an agent exits on its own Headless waits one kill grace period (`HEADLESS_KILL_GRACE_MS`, 5s) for its output to drain, then terminates whatever it left behind (`SIGTERM`, grace, `SIGKILL`) before returning, so a finished run leaves no agent processes behind and a background process holding the agent's output cannot hang the run. With `--keep-background`, Headless stops waiting on the output after that window and returns without killing anything; once the agent has exited, kept background processes are left alone even if Headless is signalled while it finishes up (Headless completes its own cleanup, such as lock release and temporary-directory removal, and then exits with that signal).
 
-Docker and Modal modes also pass common agent/provider credential variables when present, including `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `SAKANA_API_KEY`, Cursor/Pi credential variables, common AWS variables, and OpenAI-compatible endpoint variables. Use `--docker-env` or `--modal-env` for anything else. Modal mode additionally supports named Modal Secrets with `--modal-secret`. When `AWS_PROFILE` is forwarded, Docker and Modal get only what that profile needs from `~/.aws`: its `config` and `credentials` sections and those of every profile it reaches through `source_profile`, the `sso-session` sections they use, and only the matching SSO token cache files (`~/.aws/sso/cache/<sha1>.json` for the session name or legacy start URL). Nothing else from `~/.aws` is shared. For Docker these are staged in a private temporary directory removed after the run, and a durable `--session` home gets a fresh `~/.aws` on every start.
+Docker and Modal modes also pass common agent/provider credential variables when present, including `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `SAKANA_API_KEY`, `ZAI_API_KEY`, Cursor/Pi credential variables, common AWS variables, and OpenAI-compatible endpoint variables. Use `--docker-env` or `--modal-env` for anything else. Modal mode additionally supports named Modal Secrets with `--modal-secret`. When `AWS_PROFILE` is forwarded, Docker and Modal get only what that profile needs from `~/.aws`: its `config` and `credentials` sections and those of every profile it reaches through `source_profile`, the `sso-session` sections they use, and only the matching SSO token cache files (`~/.aws/sso/cache/<sha1>.json` for the session name or legacy start URL). Nothing else from `~/.aws` is shared. For Docker these are staged in a private temporary directory removed after the run, and a durable `--session` home gets a fresh `~/.aws` on every start.
