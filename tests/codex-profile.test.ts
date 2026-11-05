@@ -101,3 +101,72 @@ test("Codex profile model selection is empty when the profile cannot be read", (
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+function withProfile(profile: string, config: string | undefined, run: (codexHome: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "headless-codex-profile-"));
+  try {
+    writeFileSync(join(dir, "p.config.toml"), profile);
+    if (config !== undefined) writeFileSync(join(dir, "config.toml"), config);
+    run(dir);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+}
+
+test("Codex profile model selection skips assignments inside multiline strings", () => {
+  withProfile(
+    ['note = """', 'model = "fake"', 'model_provider = "fake"', '"""', 'model = "glm-5.3"', ""].join("\n"),
+    undefined,
+    (codexHome) => assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), { model: "glm-5.3" }),
+  );
+});
+
+test("Codex profile model selection reads past brackets inside strings", () => {
+  withProfile(
+    ['instructions = "[draft] be brief"', 'model = "glm-5.3"', "model_provider = 'zai'", ""].join("\n"),
+    undefined,
+    (codexHome) =>
+      assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), {
+        model: "glm-5.3",
+        provider: "zai",
+      }),
+  );
+});
+
+test("Codex profile model selection reads quoted keys", () => {
+  withProfile(
+    ['"model" = "glm-5.3"', "'model_provider' = \"zai\"", ""].join("\n"),
+    undefined,
+    (codexHome) =>
+      assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), {
+        model: "glm-5.3",
+        provider: "zai",
+      }),
+  );
+});
+
+test("Codex profile model selection is empty for undecodable values", () => {
+  for (const profile of ['model = """glm"""\n', "model = 5\n", 'model_provider = ["zai"]\n']) {
+    withProfile(profile, 'model = "base"\nmodel_provider = "openai"\n', (codexHome) =>
+      assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), {}, profile),
+    );
+  }
+});
+
+test("Codex profile model selection falls back to the root config.toml per key", () => {
+  withProfile(
+    'model = "glm-5.3"\n',
+    'model = "gpt-5.5"\nmodel_provider = "zai"\n\n[profiles.other]\nmodel_provider = "nope"\n',
+    (codexHome) =>
+      assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), {
+        model: "glm-5.3",
+        provider: "zai",
+      }),
+  );
+  withProfile('model_provider = "zai"\n', 'model = "glm-5"\n', (codexHome) =>
+    assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: codexHome }, "p"), {
+      model: "glm-5",
+      provider: "zai",
+    }),
+  );
+});

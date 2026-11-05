@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
+import { rootTomlString } from "./root-toml.js";
 import type { Env } from "./types.js";
 
 const maxProfileBytes = 1024 * 1024;
@@ -78,34 +79,32 @@ export interface CodexProfileModelSelection {
 }
 
 /**
- * The profile's own top-level `model` and `model_provider`, used to label and
- * price runs. Best effort: an unreadable or unparsable profile yields `{}` so
- * usage reporting never fails a run that Codex itself would accept.
+ * The model and provider a profile run uses, to label and price it. Codex
+ * overlays the profile on `config.toml`, so each key falls back to the root
+ * of `<CODEX_HOME>/config.toml` when the profile does not set it. Best
+ * effort: an unreadable file or an undecodable value yields `{}` so usage
+ * reporting never fails a run that Codex itself would accept.
  */
 export function readCodexProfileModelSelection(env: Env, profile: string): CodexProfileModelSelection {
-  let content: string;
   try {
-    content = readBoundedRegularFile(codexProfilePath(env, profile), maxProfileBytes, "Codex profile");
+    const profileContent = readBoundedRegularFile(codexProfilePath(env, profile), maxProfileBytes, "Codex profile");
+    let baseContent: string | undefined;
+    let baseRead = false;
+    const setting = (key: string): string | undefined => {
+      const own = rootTomlString(profileContent, key);
+      if (own !== undefined) return own.trim() || undefined;
+      if (!baseRead) {
+        const base = readOptionalCodexFile(join(codexHomePath(env), "config.toml"), ".codex/config.toml", maxProfileBytes);
+        baseContent = base?.content;
+        baseRead = true;
+      }
+      return rootTomlString(baseContent, key)?.trim() || undefined;
+    };
+    const model = setting("model");
+    const provider = setting("model_provider");
+    return { ...(model ? { model } : {}), ...(provider ? { provider } : {}) };
   } catch {
     return {};
-  }
-  const tableStart = content.search(/^\s*\[/m);
-  const topLevel = tableStart === -1 ? content : content.slice(0, tableStart);
-  const selection: CodexProfileModelSelection = {};
-  const model = topLevelString(topLevel, "model");
-  const provider = topLevelString(topLevel, "model_provider");
-  if (model) selection.model = model;
-  if (provider) selection.provider = provider;
-  return selection;
-}
-
-function topLevelString(content: string, key: string): string | undefined {
-  const match = new RegExp(`^\\s*${key}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*')\\s*(?:#.*)?$`, "m").exec(content);
-  if (!match) return undefined;
-  try {
-    return parseTomlString(match[1] as string).trim() || undefined;
-  } catch {
-    return undefined;
   }
 }
 
