@@ -69,7 +69,7 @@ function processIsAlive(pid: number): boolean {
 }
 
 test("lists all supported agents", () => {
-  assert.deepEqual(listAgents(), ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"]);
+  assert.deepEqual(listAgents(), ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "grok", "opencode", "pi"]);
 });
 
 test("default Docker image reference is accepted by Docker", () => {
@@ -657,6 +657,7 @@ test("builds Claude commands with normalized model shorthand", () => {
 test("each harness declares its tmux-wait resolution tier", () => {
   assert.equal(waitTierForAgent("claude"), "pin");
   assert.equal(waitTierForAgent("gemini"), "pin");
+  assert.equal(waitTierForAgent("grok"), "pin");
   assert.equal(waitTierForAgent("cursor"), "mint");
   assert.equal(waitTierForAgent("opencode"), "tag");
   assert.equal(waitTierForAgent("pi"), "dir");

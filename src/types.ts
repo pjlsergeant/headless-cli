@@ -1,4 +1,4 @@
-export type AgentName = "acp" | "antigravity" | "claude" | "codex" | "cursor" | "gemini" | "opencode" | "pi";
+export type AgentName = "acp" | "antigravity" | "claude" | "codex" | "cursor" | "gemini" | "grok" | "opencode" | "pi";
 
 export type PromptFileMode = "argument" | "stdin";
 
@@ -32,7 +32,7 @@ export interface BuildOptions {
 
 // How `--tmux --wait` identifies the native transcript for a given harness
 // without polluting the prompt. See waitTierForAgent in agents.ts.
-//  pin   — caller assigns a resolvable new-session id (claude/gemini --session-id)
+//  pin   — caller assigns a resolvable new-session id (claude/gemini/grok --session-id)
 //  mint  — round-trip to mint a resumable id, then pin it (cursor create-chat)
 //  tag   — unique metadata resolvable later (opencode --title)
 //  dir   — unique per-run session directory (pi --session-dir)

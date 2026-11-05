@@ -376,3 +376,75 @@ test("CLI --check does not report Pi AWS auth for the default OpenAI provider", 
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("CLI --check reports grok version from its own banner and the default model", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir);
+    // Banner shape of the real CLI: xai-grok-version/src/lib.rs.
+    await writeExecutable(
+      join(binDir, "grok-bin"),
+      ["#!/bin/sh", "if [ \"$1\" = \"--version\" ]; then echo 'grok 1.0.70 (f50904eaee6c)'; exit 0; fi", "exit 1", ""].join("\n"),
+    );
+
+    const stdout: string[] = [];
+    const code = await runCli(["--check"], {
+      env: { HOME: join(dir, "home"), PATH: binDir, GROK_CLI_BIN: "grok-bin" },
+      stdout: (text) => stdout.push(text),
+    });
+
+    assert.equal(code, 0);
+    assert.match(stdout.join(""), /^\| grok\s+\| ✓\s+\| -\s+\| 1\.0\.70\s+\| grok-4\.6\s+\| -\s+\|$/m);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI --check reports grok API auth from XAI_API_KEY and its legacy name", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    for (const name of ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"]) {
+      const stdout: string[] = [];
+      const code = await runCli(["--check"], {
+        env: { HOME: join(dir, "home"), PATH: join(dir, "bin"), [name]: "xai-test" },
+        stdout: (text) => stdout.push(text),
+      });
+      assert.equal(code, 0);
+      assert.match(stdout.join(""), /^\| grok\s+\| ✗\s+\| api\s+\| -\s+\| grok-4\.6\s+\| -\s+\|$/m, name);
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI --check reports grok OAuth from auth.json under GROK_HOME or ~/.grok", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  try {
+    const home = join(dir, "home");
+    const grokHome = join(dir, "grok-home");
+    mkdirSync(join(home, ".grok"), { recursive: true });
+    mkdirSync(grokHome, { recursive: true });
+
+    const check = async (env: Record<string, string>) => {
+      const stdout: string[] = [];
+      const code = await runCli(["--check"], {
+        env: { HOME: home, PATH: join(dir, "bin"), ...env },
+        stdout: (text) => stdout.push(text),
+      });
+      assert.equal(code, 0);
+      return /^\| grok\s+\| ✗\s+\| (\S+)\s+\|/m.exec(stdout.join(""))?.[1];
+    };
+
+    assert.equal(await check({}), "-");
+    writeFileSync(join(home, ".grok", "auth.json"), "{}\n");
+    assert.equal(await check({}), "oauth");
+    // GROK_HOME replaces ~/.grok entirely, so the home-dir file no longer counts.
+    assert.equal(await check({ GROK_HOME: grokHome }), "-");
+    writeFileSync(join(grokHome, "auth.json"), "{}\n");
+    assert.equal(await check({ GROK_HOME: grokHome, XAI_API_KEY: "xai-test" }), "api+oauth");
+    assert.equal(await check({ GROK_HOME: join(dir, "missing"), GROK_AUTH_PROVIDER_COMMAND: "print-token" }), "oauth");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

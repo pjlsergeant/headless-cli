@@ -15,11 +15,12 @@ import { commandFromCustom, resolveAcpCommand } from "./acp.js";
 import { BUILTIN_AGENT_DEFAULTS } from "./config.js";
 import { validateCodexProfileName } from "./codex-profile.js";
 
-const agentOrder: AgentName[] = ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"];
+const agentOrder: AgentName[] = ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "grok", "opencode", "pi"];
 const defaultClaudeModel = BUILTIN_AGENT_DEFAULTS.claude.model;
 const defaultCodexModel = BUILTIN_AGENT_DEFAULTS.codex.model;
 export const DEFAULT_CURSOR_MODEL = BUILTIN_AGENT_DEFAULTS.cursor.model ?? "gpt-5.5";
 export const DEFAULT_GEMINI_MODEL = BUILTIN_AGENT_DEFAULTS.gemini.model ?? "gemini-3.1-pro-preview";
+export const DEFAULT_GROK_MODEL = BUILTIN_AGENT_DEFAULTS.grok.model ?? "grok-4.6";
 export const DEFAULT_OPENCODE_MODEL = BUILTIN_AGENT_DEFAULTS.opencode.model ?? "openai/gpt-5.4";
 export const DEFAULT_PI_MODEL = BUILTIN_AGENT_DEFAULTS.pi.model ?? "openai-codex/gpt-5.5";
 const claudeReadOnlyTools = "Read,Grep,Glob,LS,WebFetch,WebSearch";
@@ -424,6 +425,70 @@ function buildInteractiveGemini(options: BuildOptions): BuiltCommand {
   return { command: "gemini", args };
 }
 
+export function grokCommand(env: Env): string {
+  return env.GROK_CLI_BIN || "grok";
+}
+
+// Grok resolves its home as $GROK_HOME when non-empty, else ~/.grok
+// (~/grok-build crates/codegen/xai-dirs/src/lib.rs resolve_grok_home_from).
+export function grokHome(env: Env): string | undefined {
+  if (env.GROK_HOME) return env.GROK_HOME;
+  return env.HOME ? join(env.HOME, ".grok") : undefined;
+}
+
+// OAuth login (`grok login`) persists to $GROK_AUTH_PATH, else <grok home>/auth.json
+// (xai-grok-login/src/storage.rs auth_json_path); GROK_AUTH_PROVIDER_COMMAND
+// supplies tokens from an external command instead.
+export function grokAuthExists(env: Env): boolean {
+  if (env.GROK_AUTH_PROVIDER_COMMAND) return true;
+  if (env.GROK_AUTH_PATH) return fileExists(env.GROK_AUTH_PATH);
+  const home = grokHome(env);
+  return home ? fileExists(join(home, "auth.json")) : false;
+}
+
+// Built-in read-only tool ids accepted by headless `--tools`
+// (xai-grok-pager/docs/user-guide/14-headless-mode.md "Tool Filtering").
+const grokReadOnlyTools = "read_file,grep,list_dir,web_search,web_fetch";
+
+function withGrokModelAndEffort(options: BuildOptions): string[] {
+  const args = withModel([], options.model ?? DEFAULT_GROK_MODEL);
+  return options.reasoningEffort ? [...args, "--reasoning-effort", options.reasoningEffort] : args;
+}
+
+function withGrokSession(args: string[], options: BuildOptions): string[] {
+  if (options.sessionMode === "resume" && options.sessionId) return [...args, "--resume", options.sessionId];
+  if (options.sessionMode === "new" && options.sessionId) return [...args, "--session-id", options.sessionId];
+  return args;
+}
+
+function buildGrok(options: BuildOptions, env: Env): BuiltCommand {
+  const args = [...withGrokModelAndEffort(options), "--output-format", "streaming-json", "--no-auto-update"];
+  // --tools is headless-only. Without --always-approve, headless answers every
+  // permission request with Cancelled (xai-grok-pager/src/headless.rs
+  // RequestPermission arm), so anything outside the allowlist fails closed.
+  if (options.allow === "read-only") {
+    args.push("--tools", grokReadOnlyTools);
+  } else {
+    args.push("--always-approve");
+  }
+  // `--single=<prompt>` keeps a prompt starting with "-" from being parsed as options.
+  return { command: grokCommand(env), args: [...withGrokSession(args, options), `--single=${options.prompt}`] };
+}
+
+function buildInteractiveGrok(options: BuildOptions, env: Env): BuiltCommand {
+  const args = [...withGrokModelAndEffort(options), "--no-auto-update"];
+  if (options.allow === "read-only") {
+    // The TUI ignores --tools, so deny the mutating tool families by rule
+    // (xai-grok-permission-rules/src/rules.rs tool_name_to_filter: Edit covers Write).
+    args.push("--deny", "Bash", "--deny", "Edit", "--deny", "MCPTool");
+  } else {
+    // --trust pre-grants folder trust so the TUI does not block on a trust
+    // prompt inside tmux (the analogue of trustClaudeWorkspace for claude).
+    args.push("--trust", "--always-approve");
+  }
+  return { command: grokCommand(env), args: [...withGrokSession(args, options), "--", options.prompt] };
+}
+
 function buildOpencode(options: BuildOptions): BuiltCommand {
   const args = ["run", "--format", "json"];
   const model = options.model ?? DEFAULT_OPENCODE_MODEL;
@@ -610,6 +675,19 @@ const harnesses: Record<AgentName, AgentHarness> = {
     buildCommand: buildGemini,
     buildInteractiveCommand: buildInteractiveGemini,
   },
+  grok: {
+    name: "grok",
+    promptFileMode: "argument",
+    configRelDir: ".grok",
+    workspaceConfigRelDir: ".grok",
+    seedPaths: [".grok"],
+    // Credentials and settings only: sessions/, logs/, bundled/ and bin/ stay on the host.
+    dockerSeedFiles: {
+      ".grok": ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"],
+    },
+    buildCommand: buildGrok,
+    buildInteractiveCommand: buildInteractiveGrok,
+  },
   opencode: {
     name: "opencode",
     promptFileMode: "argument",
@@ -689,6 +767,7 @@ const waitTiers: Record<AgentName, WaitTier> = {
   antigravity: "claim", // claim the new brain/<conversation>/transcript.jsonl under a launch lock
   claude: "pin", // --session-id <uuid>
   gemini: "pin", // --session-id <uuid>
+  grok: "pin", // --session-id <uuid>
   cursor: "mint", // create-chat mints an id, then --resume <id>
   opencode: "tag", // --title <uuid>, resolved via the session store
   pi: "dir", // --session-dir <unique dir>

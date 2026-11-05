@@ -41,6 +41,7 @@ const dockerSessionAgentHomeVariables = {
   codex: ["CODEX_HOME"],
   cursor: ["CURSOR_HOME"],
   gemini: ["GEMINI_HOME"],
+  grok: ["GROK_HOME"],
   opencode: ["OPENCODE_DATA_HOME"],
   pi: ["PI_CODING_AGENT_HOME"],
 } satisfies Record<AgentName, readonly string[]>;
