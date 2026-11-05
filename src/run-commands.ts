@@ -1,5 +1,6 @@
 import { closeSync } from "node:fs";
 import { fork, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { extractFinalMessage } from "./output.js";
@@ -20,7 +21,6 @@ import {
 } from "./runs.js";
 import {
   containerMailboxRoot,
-  newRequestId,
   readMailboxSnapshot,
   submitMailboxRequest,
   waitForMailboxReply,
@@ -153,7 +153,7 @@ async function handleMailboxRunCommand(
     if (nodeId !== ownNodeId) {
       throw new Error(`a container can only mark its own node (${ownNodeId})`);
     }
-    const reply = await sendMailboxRequest(handlers.env, root, { version: 1, id: newRequestId(), op: "mark", status: input.status });
+    const reply = await sendMailboxRequest(handlers.env, root, { version: 1, id: randomUUID(), op: "mark", status: input.status });
     if (!reply.ok) throw new Error(reply.error ?? "run mailbox rejected the request");
     handlers.stdout(`marked: ${runId}/${nodeId} ${input.status}\n`);
     return 0;
@@ -161,7 +161,7 @@ async function handleMailboxRunCommand(
   if (input.command !== "message") throw new Error("unsupported run command");
   const prompt = await handlers.resolvePrompt();
   const request = {
-    version: 1 as const, id: newRequestId(), op: "message" as const, target: nodeId, prompt: prompt.prompt, async: input.async,
+    version: 1 as const, id: randomUUID(), op: "message" as const, target: nodeId, prompt: prompt.prompt, async: input.async,
   };
   if (input.printCommand) {
     handlers.stdout(`${JSON.stringify(request)}\n`);
@@ -467,8 +467,9 @@ async function startDetachedNodeMessage(
     closeSync(errFd);
   }
 
+  const invocation = buildNodeInvocationCommand(env, runId, nodeId, node, prompt);
   const task: AsyncRunMessageTask = {
-    command: withExtraArgs(buildNodeInvocationCommand(env, runId, nodeId, node, prompt), sandboxArgs),
+    command: { command: invocation.command, args: [...invocation.args, ...sandboxArgs] },
     cwd: node.workDir,
     runId,
     nodeId,
@@ -498,10 +499,6 @@ async function startDetachedNodeMessage(
   }
   if (worker.connected) worker.disconnect();
   worker.unref();
-}
-
-function withExtraArgs(command: { command: string; args: string[] }, extra: string[]): { command: string; args: string[] } {
-  return { command: command.command, args: [...command.args, ...extra] };
 }
 
 function prepareAsyncWorker(worker: ChildProcess, task: AsyncRunMessageTask): Promise<void> {

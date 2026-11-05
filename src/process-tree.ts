@@ -75,8 +75,6 @@ function linuxProcessEntry(pid: number): ProcessEntry | undefined {
   return { pid, ppid: stat.ppid, pgid: stat.pgid, exited: linuxStateExited(stat.state) };
 }
 
-const probe = processExists;
-
 function sendSignal(pid: number, signal: NodeJS.Signals): boolean {
   try {
     process.kill(pid, signal);
@@ -84,6 +82,13 @@ function sendSignal(pid: number, signal: NodeJS.Signals): boolean {
   } catch {
     return false;
   }
+}
+
+/** Signals that, delivered to headless itself, should tear down its children. */
+export function parentExitSignals(): NodeJS.Signals[] {
+  return process.platform === "win32"
+    ? ["SIGINT", "SIGTERM", "SIGBREAK"]
+    : ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
 }
 
 export interface ProcessTreeOptions {
@@ -144,7 +149,7 @@ export class ProcessTree {
 
   /** Windows: `taskkill /PID <pid> /T /F` every root, awaiting each (bounded). */
   async taskkillAll(timeoutMs: number): Promise<void> {
-    await Promise.all(this.windowsTargets().filter(probe).map((pid) =>
+    await Promise.all(this.windowsTargets().filter(processExists).map((pid) =>
       runTaskkill(pid, timeoutMs, this.options.taskkill, this.options.systemRoot)));
   }
 
@@ -222,18 +227,18 @@ export class ProcessTree {
   }
 
   alive(): boolean {
-    if (this.windows) return this.windowsTargets().some(probe);
+    if (this.windows) return this.windowsTargets().some(processExists);
     const table = readProcessTable();
     if (!table) {
-      if ([...this.groups].some((pgid) => probe(-pgid))) return true;
-      if ([...this.roots].some((pid) => !this.exclude.has(pid) && probe(pid))) return true;
-      return this.childAlive() ?? false;
+      if ([...this.groups].some((pgid) => processExists(-pgid))) return true;
+      if ([...this.roots].some((pid) => !this.exclude.has(pid) && processExists(pid))) return true;
+      return this.childAlive();
     }
     this.refresh(table);
     if (this.tracked.size > 0) return true;
     // Group members hidden from the table (e.g. /proc hidepid) still count.
     for (const pgid of this.groups) {
-      if (probe(-pgid) && ![...table.values()].some((entry) => entry.pgid === pgid)) return true;
+      if (processExists(-pgid) && ![...table.values()].some((entry) => entry.pgid === pgid)) return true;
     }
     return false;
   }
@@ -246,9 +251,9 @@ export class ProcessTree {
     }
   }
 
-  private childAlive(): boolean | undefined {
+  private childAlive(): boolean {
     const pid = this.options.child?.pid;
-    return pid === undefined ? undefined : probe(pid);
+    return pid !== undefined && processExists(pid);
   }
 }
 
@@ -256,11 +261,6 @@ export class ProcessTree {
 export function childProcessTree(child: KillableProcess, exclude: number[] = [process.pid]): ProcessTree {
   const pid = child.pid;
   return new ProcessTree({ groups: pid ? [pid] : [], roots: pid ? [pid] : [], exclude, child });
-}
-
-/** True while the group led by `pid`, or `pid`'s descendants, have a live process. */
-export function processGroupAlive(pid: number): boolean {
-  return new ProcessTree({ groups: [pid], roots: [pid], exclude: [process.pid] }).alive();
 }
 
 export interface TerminateProcessTreeOptions {

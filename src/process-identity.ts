@@ -109,11 +109,6 @@ export function processStartIdentity(
   return undefined;
 }
 
-export function captureProcessIdentity(pid: number): ProcessIdentity {
-  const startIdentity = processStartIdentity(pid);
-  return startIdentity === undefined ? { pid } : { pid, startIdentity };
-}
-
 let ownIdentity: string | undefined | null = null;
 
 /** This process's start identity (cached: it never changes). */

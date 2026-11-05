@@ -1523,9 +1523,8 @@ function symlinkTargetIsWithin(workDir: string, linkPath: string, target: string
   if (!isSafeLinkText(target)) {
     return false;
   }
-  const normalized = target;
   const parent = dirname(linkPath);
-  if (!isWithin(workDir, resolve(parent, normalized))) {
+  if (!isWithin(workDir, resolve(parent, target))) {
     return false;
   }
   let rootReal: string;
@@ -1541,7 +1540,7 @@ function symlinkTargetIsWithin(workDir: string, linkPath: string, target: string
     // The parent does not exist yet; its existing ancestors were checked.
     return true;
   }
-  for (const segment of normalized.split("/")) {
+  for (const segment of target.split("/")) {
     if (!segment || segment === ".") continue;
     if (segment === "..") {
       current = dirname(current);

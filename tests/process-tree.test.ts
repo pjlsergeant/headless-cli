@@ -10,12 +10,16 @@ import {
   forceKillWindowsProcessTree,
   killGraceMs,
   childProcessTree,
-  processGroupAlive,
   ProcessTree,
   terminateProcessTree,
   windowsTaskkillPath,
   type TaskkillLauncher,
 } from "../src/process-tree.ts";
+
+/** True while the group led by `pid`, or `pid`'s descendants, have a live process. */
+function processGroupAlive(pid: number): boolean {
+  return new ProcessTree({ groups: [pid], roots: [pid], exclude: [process.pid] }).alive();
+}
 
 class FakeTaskkill extends EventEmitter {
   readonly signals: Array<NodeJS.Signals | number | undefined> = [];

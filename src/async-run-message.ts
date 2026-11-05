@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 
-import { killGraceMs, ProcessTree, terminateProcessTree, windowsTaskkillPath } from "./process-tree.js";
+import { childProcessTree, killGraceMs, type ProcessTree, terminateProcessTree, windowsTaskkillPath } from "./process-tree.js";
 import {
   handoffNodeStoreLockOwner,
   nodeStoreLockHasLiveSuccessor,
@@ -71,7 +71,7 @@ async function handleRequest(request: AsyncRunMessageRequest): Promise<void> {
 }
 
 function terminateActiveChild(signal: NodeJS.Signals): void {
-  if (!activeChild) return;
+  if (!activeChild || !activeTree) return;
   if (process.platform === "win32" && activeChild.pid) {
     try {
       execFileSync(windowsTaskkillPath(), ["/pid", String(activeChild.pid), "/T", "/F"], {
@@ -86,7 +86,7 @@ function terminateActiveChild(signal: NodeJS.Signals): void {
   }
   // The CLI leads its own process group and keeps the agent inside it, so
   // signal the whole tree and SIGKILL it if anything outlives the grace.
-  const tree = activeTree ?? new ProcessTree({ child: activeChild });
+  const tree = activeTree;
   if (signal === "SIGKILL" || activeChildTermination) {
     tree.signal(signal);
     return;
@@ -94,16 +94,6 @@ function terminateActiveChild(signal: NodeJS.Signals): void {
   activeChildTermination = terminateProcessTree(tree, {
     signal,
     graceMs: killGraceMs(process.env),
-  });
-}
-
-function cliProcessTree(child: ChildProcess): ProcessTree {
-  const pid = child.pid;
-  return new ProcessTree({
-    groups: pid && process.platform !== "win32" ? [pid] : [],
-    roots: pid ? [pid] : [],
-    exclude: [process.pid],
-    child,
   });
 }
 
@@ -175,7 +165,7 @@ function runChild(currentTask: AsyncRunMessageTask): Promise<number> {
       stdio: ["ignore", "ignore", "inherit"],
     });
     activeChild = child;
-    activeTree = cliProcessTree(child);
+    activeTree = childProcessTree(child);
     const tree = activeTree;
     // Every outcome, failure included, settles only after the close-time
     // sweep: the caller releases the node lock as soon as this settles.

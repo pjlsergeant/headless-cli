@@ -4,7 +4,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
-import { childProcessTree, killGraceMs, ProcessTree, terminateProcessTree } from "./process-tree.js";
+import { childProcessTree, killGraceMs, parentExitSignals, ProcessTree, terminateProcessTree } from "./process-tree.js";
 import type { AllowMode, BuiltCommand, Env } from "./types.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -306,12 +306,6 @@ function childExit(child: ReturnType<typeof spawn>): Promise<number> {
     child.once("error", () => resolve(127));
     child.once("close", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
   });
-}
-
-function parentExitSignals(): NodeJS.Signals[] {
-  return process.platform === "win32"
-    ? ["SIGINT", "SIGTERM", "SIGBREAK"]
-    : ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
 }
 
 /**

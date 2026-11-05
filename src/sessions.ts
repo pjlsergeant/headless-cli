@@ -60,8 +60,7 @@ function updateSessionStore(path: string, update: (store: SessionStoreFile) => S
   return withOwnerLockSync(`${path}.lock`, (lock) => {
     const store = readSessionStore(path);
     const stored = update(store);
-    // A holder past maxHoldMs loses the lock; never publish over a newer
-    // writer. (Residual: losing it between this check and the rename.)
+    // A holder past maxHoldMs loses the lock; never publish over a newer writer.
     if (!lock.held()) throw new Error(`session store lock was lost before writing: ${path}`);
     writeSessionStore(path, store);
     return stored;

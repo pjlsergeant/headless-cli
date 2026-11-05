@@ -147,11 +147,10 @@ const cronJobLockMaxHoldMs = 60_000;
 let heldJobLock: OwnerLock | undefined;
 
 /**
- * Called before every job-state write: a section that outlived maxHoldMs has
- * lost its lock and must not overwrite a newer holder's state. (Residual:
- * losing it between this check and the rename.)
+ * Called before every job-state write: throws if a held job lock was lost (a
+ * section that outlived maxHoldMs) so it cannot overwrite a newer holder's state.
  */
-function assertJobLockHeld(): void {
+function assertJobLockNotLost(): void {
   if (heldJobLock && !heldJobLock.held()) {
     throw new Error(`cron job lock was lost before writing: ${heldJobLock.path}`);
   }
@@ -185,7 +184,7 @@ export function updateCronJob(
 
 function writeJob(env: Env, job: CronJobRecord): CronJobRecord {
   validateCronJobId(job.id);
-  assertJobLockHeld();
+  assertJobLockNotLost();
   ensurePrivateDir(jobsRoot(env));
   ensurePrivateDir(jobHistoryRoot(env, job.id));
   writeJsonPrivate(jobFilePath(env, job.id), job);
@@ -226,7 +225,7 @@ export function deleteCronJob(env: Env, id: string): void {
 }
 
 function removeJobFiles(env: Env, id: string): void {
-  assertJobLockHeld();
+  assertJobLockNotLost();
   rmSync(jobFilePath(env, id), { force: true });
   rmSync(jobHistoryRoot(env, id), { force: true, recursive: true });
 }
@@ -388,7 +387,7 @@ export function recentCronExecutions(env: Env, jobId: string, limit = 10): CronE
 
 /** Spawns job `job`'s next execution. Caller holds the job's lock. */
 function startCronExecution(env: Env, job: CronJobRecord, now: Date): ChildProcess {
-  assertJobLockHeld();
+  assertJobLockNotLost();
   const executionId = generatedExecutionId(now);
   const executionDir = executionRoot(env, job.id, executionId);
   ensurePrivateDir(executionDir);
@@ -613,7 +612,7 @@ function readExecution(env: Env, jobId: string, executionId: string): CronExecut
 }
 
 function writeExecution(env: Env, jobId: string, execution: CronExecutionRecord): void {
-  assertJobLockHeld();
+  assertJobLockNotLost();
   ensurePrivateDir(executionRoot(env, jobId, execution.executionId));
   writeJsonPrivate(executionPath(env, jobId, execution.executionId), execution);
 }
@@ -763,6 +762,7 @@ async function sweepOrphanedAgent(
   if (tree.alive()) await terminateProcessTree(tree, { graceMs: killGraceMs(env) });
 }
 
+// Options that take a value; parseArgs in cli.ts is the source of truth.
 const cronValueOptions = new Set([
   "--prompt", "--prompt-file", "--model", "--profile", "--reasoning-effort", "--allow", "--work-dir",
   "--docker-image", "--docker-arg", "--docker-env", "--modal-app", "--modal-cpu", "--modal-env",
