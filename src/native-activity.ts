@@ -27,6 +27,8 @@ interface NativeActivityEvent {
   text: string[];
   toolUseId?: string;
   timestampMs: number | null;
+  // Set by harness-specific parsers for an explicit, durable turn-end record.
+  terminal?: boolean;
 }
 
 interface NativeActivityDecision {
@@ -113,6 +115,7 @@ function readOpenCodeActivityEvents(transcript: NativeTranscript): NativeActivit
 }
 
 function parseActivityEvents(agent: AgentName, text: string): NativeActivityEvent[] {
+  if (agent === "grok") return parseGrokActivityEvents(text);
   const events: NativeActivityEvent[] = [];
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -122,6 +125,79 @@ function parseActivityEvents(agent: AgentName, text: string): NativeActivityEven
     } catch {
       // Native logs may include non-JSON warnings. They do not carry activity state.
     }
+  }
+  return events;
+}
+
+// grok's updates.jsonl: one SessionUpdateEnvelope per line,
+// {timestamp: unix seconds, method, params: {sessionId, update: {sessionUpdate, ...}, _meta?}}
+// (grok-build xai-grok-shell/src/session/storage/mod.rs). Text arrives as many
+// agent_message_chunk updates, so consecutive chunks are joined untrimmed into
+// one assistant event. `turn_completed` on the `_x.ai/session/update` rail is
+// the durable turn-end record (extensions/notification.rs TurnCompleted);
+// its agent_result is set only for failed turns and carries the error text.
+function parseGrokActivityEvents(text: string): NativeActivityEvent[] {
+  const events: NativeActivityEvent[] = [];
+  let chunkText: { event: NativeActivityEvent; text: string } | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let raw: Record<string, unknown>;
+    try {
+      raw = asJsonRecord(JSON.parse(trimmed) as unknown);
+    } catch {
+      continue;
+    }
+    const params = asJsonRecord(raw.params);
+    const update = asJsonRecord(params.update);
+    const sessionUpdate = asString(update.sessionUpdate);
+    const meta = asJsonRecord(params._meta);
+    const timestampMs =
+      epochMsFromUnknown(meta.agentTimestampMs) ??
+      (typeof raw.timestamp === "number" && Number.isFinite(raw.timestamp) && raw.timestamp > 0 ? raw.timestamp * 1000 : null);
+    const base = { rawType: normalizeMarkerText(sessionUpdate), raw, timestampMs };
+
+    if (sessionUpdate === "agent_message_chunk") {
+      const content = asJsonRecord(update.content);
+      const chunk = asString(content.type) === "text" ? asString(content.text) : "";
+      if (chunkText && events.at(-1) === chunkText.event) {
+        chunkText.text += chunk;
+        chunkText.event.timestampMs = timestampMs ?? chunkText.event.timestampMs;
+      } else {
+        const event: NativeActivityEvent = { ...base, kind: "assistant", text: [] };
+        events.push(event);
+        chunkText = { event, text: chunk };
+      }
+      const joined = chunkText.text.trim();
+      chunkText.event.text = joined ? [joined] : [];
+      continue;
+    }
+    if (sessionUpdate === "user_message_chunk") {
+      events.push({ ...base, kind: "user", text: collectText(update.content) });
+      continue;
+    }
+    if (sessionUpdate === "tool_call") {
+      events.push({ ...base, kind: "tool_use", text: [], toolUseId: asString(update.toolCallId) || undefined });
+      continue;
+    }
+    if (sessionUpdate === "tool_call_update") {
+      const status = asString(update.status);
+      const finished = status === "completed" || status === "failed";
+      events.push({
+        ...base,
+        kind: finished ? "tool_result" : "meta",
+        text: [],
+        toolUseId: finished ? asString(update.toolCallId) || undefined : undefined,
+      });
+      continue;
+    }
+    if (sessionUpdate === "turn_completed") {
+      const failure = asString(update.stop_reason) === "end_turn" ? "" : asString(update.agent_result).trim();
+      events.push({ ...base, kind: "meta", text: failure ? [failure] : [], terminal: true });
+      continue;
+    }
+    // available_commands_update, rewind_marker, task_*, auto_compact_*, ...: no activity state.
+    events.push({ ...base, kind: "meta", text: [] });
   }
   return events;
 }
@@ -237,6 +313,7 @@ function findLatestTerminalDoneEvent(agent: AgentName, events: NativeActivityEve
 }
 
 function isTerminalDoneEvent(agent: AgentName, event: NativeActivityEvent): boolean {
+  if (event.terminal) return true;
   const raw = event.raw;
   const payload = asJsonRecord(raw.payload);
   const message = asJsonRecord(raw.message);
@@ -302,6 +379,7 @@ function hasWaitingSignal(event: NativeActivityEvent): boolean {
 }
 
 function isPassiveActivityEvent(event: NativeActivityEvent): boolean {
+  if (event.terminal) return false;
   const raw = event.raw;
   const payload = asJsonRecord(raw.payload);
   const part = asJsonRecord(raw.part);
