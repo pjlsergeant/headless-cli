@@ -21,6 +21,7 @@ import {
   processStartIdentity,
   validProcessId,
   windowsPowerShellPath,
+  type WindowsProcessProbeOptions,
 } from "./process-identity.js";
 import { ProcessTree } from "./process-tree.js";
 
@@ -62,10 +63,7 @@ export interface RunStateReplacementOptions {
   sleep?: (milliseconds: number) => void;
 }
 
-export interface WindowsProcessTreeProbeOptions {
-  execute?: (command: string, args: string[]) => string;
-  systemRoot?: string;
-}
+export type WindowsProcessTreeProbeOptions = WindowsProcessProbeOptions;
 
 export function acquireRunStoreLock(lockPath: string, runId: string): () => void {
   const deadline = Date.now() + runLockTimeoutMs;

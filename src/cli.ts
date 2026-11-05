@@ -108,6 +108,7 @@ import {
   childProcessTree,
   forceKillWindowsProcessTree,
   killGraceMs,
+  parentExitSignals,
   ProcessTree,
 } from "./process-tree.js";
 import { compactOversizedTraceLine } from "./relevant-trace.js";
@@ -1452,12 +1453,6 @@ function installWrapUpGuard(
   };
 }
 
-function parentExitSignals(): NodeJS.Signals[] {
-  return process.platform === "win32"
-    ? ["SIGINT", "SIGTERM", "SIGBREAK"]
-    : ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
-}
-
 function randomWaitingSpinnerVerb(): string {
   return waitingSpinnerVerbs[Math.floor(Math.random() * waitingSpinnerVerbs.length)] ?? waitingSpinnerVerbs[0];
 }
@@ -2058,17 +2053,9 @@ async function executeCommand(
       };
       const asyncMessageWorker = env.HEADLESS_ASYNC_MESSAGE_WORKER === "1";
       // POSIX: the agent always leads its own process group (detached =>
-      // setsid) so every termination path can signal the whole agent tree.
-      // The one exception is the async message worker: it already spawned
-      // this headless as the leader of a dedicated group, records that group
-      // as the node lock's process tree, and signals/escalates on the group
-      // itself. Keeping the agent inside it means the lock stays held while
-      // any agent process is alive and the worker's SIGKILL reaches the agent
-      // even if headless dies first.
-      // The agent's stdio is never a TTY here (stdin is ignore/pipe/file,
-      // stdout/stderr are pipes), so leaving the terminal's session cannot
-      // cause SIGTTIN/SIGTTOU stops; terminal-generated signals (Ctrl-C,
-      // Ctrl-Z, Ctrl-\) now reach headless only and are forwarded below.
+      // setsid) so every termination path can signal the whole agent tree,
+      // except under the async message worker, whose own group (the node
+      // lock's process tree) must keep the agent so its SIGKILL reaches it.
       const ownsChildProcessGroup = process.platform !== "win32" && !asyncMessageWorker;
       const handlesParentSignals = process.platform !== "win32"
         || asyncMessageWorker
@@ -2092,8 +2079,7 @@ async function executeCommand(
       });
       // Report the agent's group to a supervisor (cron) synchronously, before
       // anything else runs, so it can reach the agent directly even if this
-      // headless process is SIGKILLed before it can forward anything. The
-      // only remaining gap is a kill between fork() and this write.
+      // headless process is SIGKILLed before it can forward anything.
       const agentPgidFile = env.HEADLESS_AGENT_PGID_FILE;
       if (agentPgidFile && ownsChildProcessGroup && child.pid) {
         try {
@@ -3608,7 +3594,6 @@ function headlessStateRoots(env: Env): string[] {
     env.HOME ? join(env.HOME, ".headless") : undefined,
     env.HOME || env.HEADLESS_RUN_DIR ? runStoreRoot(env) : undefined,
     env.HOME || env.HEADLESS_CRON_DIR ? cronRoot(env) : undefined,
-    sessionStorePath(env) ? dirname(sessionStorePath(env) as string) : undefined,
     dockerSessionRootPath(env),
   ];
   return roots.filter((root): root is string => Boolean(root)).map((root) => resolve(root));
