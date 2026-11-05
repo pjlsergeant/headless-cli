@@ -148,3 +148,37 @@ test("grok activity for a failed turn reports the error text when no answer was 
     assert.equal(activity?.message, "upstream unavailable");
   });
 });
+
+test("grok activity names the stop reason of a turn that ended without any text", () => {
+  withWorkspace(({ home, workDir, realWorkDir }) => {
+    // An earlier turn's answer must not stand in for this turn's empty result.
+    const contents = [
+      grokEnvelope(grokTextChunk("user_message_chunk", "first"), ts),
+      grokEnvelope(grokTextChunk("agent_message_chunk", "old answer"), ts),
+      grokEnvelope(grokTurnCompleted(), ts, "_x.ai/session/update"),
+      grokEnvelope(grokTextChunk("user_message_chunk", "second"), ts),
+      grokEnvelope(grokTurnCompleted("rate_limit"), ts, "_x.ai/session/update"),
+      "",
+    ].join("\n");
+    writeSession(join(home, ".grok", "sessions"), grokSessionDirName(realWorkDir), grokSessionId, contents);
+    const transcript = resolveNativeTranscript("grok", grokSessionId, workDir, { HOME: home });
+    const activity = deriveNativeTranscriptActivity("grok", transcript, { nowMs: ts * 1000, terminalDonePrecedence: true });
+    assert.equal(activity?.reason, "terminal_done");
+    assert.equal(activity?.message, "grok turn ended: rate_limit");
+  });
+});
+
+test("grok activity keeps the answer of a turn that stopped early but produced text", () => {
+  withWorkspace(({ home, workDir, realWorkDir }) => {
+    const contents = [
+      grokEnvelope(grokTextChunk("user_message_chunk", "go"), ts),
+      grokEnvelope(grokTextChunk("agent_message_chunk", "partial answer"), ts),
+      grokEnvelope(grokTurnCompleted("max_tokens"), ts, "_x.ai/session/update"),
+      "",
+    ].join("\n");
+    writeSession(join(home, ".grok", "sessions"), grokSessionDirName(realWorkDir), grokSessionId, contents);
+    const transcript = resolveNativeTranscript("grok", grokSessionId, workDir, { HOME: home });
+    const activity = deriveNativeTranscriptActivity("grok", transcript, { nowMs: ts * 1000, terminalDonePrecedence: true });
+    assert.equal(activity?.message, "partial answer");
+  });
+});

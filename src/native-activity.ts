@@ -139,6 +139,7 @@ function parseActivityEvents(agent: AgentName, text: string): NativeActivityEven
 function parseGrokActivityEvents(text: string): NativeActivityEvent[] {
   const events: NativeActivityEvent[] = [];
   let chunkText: { event: NativeActivityEvent; text: string } | undefined;
+  let answeredSinceUser = false;
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -170,9 +171,11 @@ function parseGrokActivityEvents(text: string): NativeActivityEvent[] {
       }
       const joined = chunkText.text.trim();
       chunkText.event.text = joined ? [joined] : [];
+      if (joined) answeredSinceUser = true;
       continue;
     }
     if (sessionUpdate === "user_message_chunk") {
+      answeredSinceUser = false;
       events.push({ ...base, kind: "user", text: collectText(update.content) });
       continue;
     }
@@ -192,8 +195,13 @@ function parseGrokActivityEvents(text: string): NativeActivityEvent[] {
       continue;
     }
     if (sessionUpdate === "turn_completed") {
-      const failure = asString(update.stop_reason) === "end_turn" ? "" : asString(update.agent_result).trim();
-      events.push({ ...base, kind: "meta", text: failure ? [failure] : [], terminal: true });
+      // agent_result is the error text of a failed turn. A turn that ends with
+      // no answer at all (rate_limit carries agent_result null) names its stop
+      // reason, so --tmux --wait returns instead of waiting for text that never comes.
+      const stopReason = asString(update.stop_reason) || "unknown";
+      const errorText = asString(update.agent_result).trim();
+      const message = errorText || (answeredSinceUser ? "" : `grok turn ended: ${stopReason}`);
+      events.push({ ...base, kind: "meta", text: message ? [message] : [], terminal: true });
       continue;
     }
     // available_commands_update, rewind_marker, task_*, auto_compact_*, ...: no activity state.
