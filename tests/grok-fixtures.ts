@@ -2,6 +2,15 @@
 // source (commit f50904eaee6c, the build that `grok --version` reports) rather
 // than from a captured run: no credentials are available to record one.
 // Paths are relative to grok-build/crates/codegen.
+//
+// Real recordings now sit beside these in tests/fixtures/grok (see
+// grok-real-fixtures.test.ts). They agree on every key the parsers read; the
+// real stream additionally shows per-response `usage` lines without
+// messageId/stopReason (xAI backend), repeated `available_commands` lines,
+// token-sized text chunks, a status-null tool_call_update, a `cwd` key on
+// end/error, UUIDv7 session ids, and the model id grok-4.6-build. Its
+// updates.jsonl holds one agent_message_chunk per response, a tool_call with
+// no status, and a turn_completed carrying the PromptUsage totals.
 
 // --- `--output-format streaming-json` -------------------------------------
 // xai-grok-pager/src/headless/reducer/acp.rs:
