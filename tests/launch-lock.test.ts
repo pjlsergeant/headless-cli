@@ -314,7 +314,7 @@ test("Docker session lock release reports permission failures without rejecting"
   }
 });
 
-test("Docker session locks do not retry permanent namespace errors", async () => {
+test("Docker session lock refuses a non-directory lock root", async () => {
   await withHome(async (home) => {
     const persistentHome = join(home, "sessions", "codex", "work");
     mkdirSync(persistentHome, { recursive: true });

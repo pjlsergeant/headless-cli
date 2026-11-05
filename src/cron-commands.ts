@@ -169,7 +169,7 @@ function cronList(input: CronCommandInput, handlers: CronCommandHandlers): numbe
 }
 
 function cronView(jobId: string, input: CronCommandInput, handlers: CronCommandHandlers): number {
-  const job = requireJob(handlers.env, jobId);
+  const job = requireJob(jobId, readCronJob(handlers.env, jobId));
   const executions = recentCronExecutions(handlers.env, jobId, 10);
   const promptFile = promptFileFromArgs(job.command.args);
   const warnings = promptFile && !existsSync(promptFile) ? [`prompt file not found: ${promptFile}`] : [];
@@ -296,7 +296,7 @@ function redactScheduledArgs(args: string[]): string[] {
 }
 
 function cronPause(jobId: string, handlers: CronCommandHandlers): number {
-  requireUpdatedJob(jobId, updateCronJob(handlers.env, jobId, (job) => ({
+  requireJob(jobId, updateCronJob(handlers.env, jobId, (job) => ({
     ...job,
     status: "paused",
     pending: false,
@@ -308,7 +308,7 @@ function cronPause(jobId: string, handlers: CronCommandHandlers): number {
 
 function cronResume(jobId: string, handlers: CronCommandHandlers): number {
   const now = new Date();
-  const resumed = requireUpdatedJob(jobId, updateCronJob(handlers.env, jobId, (job) => {
+  const resumed = requireJob(jobId, updateCronJob(handlers.env, jobId, (job) => {
     const schedule = parseCronSchedule(job.schedule.kind === "every" ? { every: job.schedule.value } : { schedule: job.schedule.value });
     return {
       ...job,
@@ -324,14 +324,14 @@ function cronResume(jobId: string, handlers: CronCommandHandlers): number {
 }
 
 async function cronKill(jobId: string, handlers: CronCommandHandlers): Promise<number> {
-  requireJob(handlers.env, jobId);
-  requireUpdatedJob(jobId, await killCronExecution(handlers.env, jobId, "disabled"));
+  requireJob(jobId, readCronJob(handlers.env, jobId));
+  requireJob(jobId, await killCronExecution(handlers.env, jobId, "disabled"));
   handlers.stdout(`killed: ${jobId}\n`);
   return 0;
 }
 
 async function cronRemove(jobId: string, force: boolean, handlers: CronCommandHandlers): Promise<number> {
-  requireJob(handlers.env, jobId);
+  requireJob(jobId, readCronJob(handlers.env, jobId));
   if (!(await removeCronJob(handlers.env, jobId, force))) throw new Error(`unknown cron job: ${jobId}`);
   handlers.stdout(`removed: ${jobId}\n`);
   return 0;
@@ -455,15 +455,7 @@ function requireJobId(input: CronCommandInput): string {
   return input.jobId;
 }
 
-function requireJob(env: Env, jobId: string): CronJobRecord {
-  const job = readCronJob(env, jobId);
-  if (!job) {
-    throw new Error(`unknown cron job: ${jobId}`);
-  }
-  return job;
-}
-
-function requireUpdatedJob(jobId: string, job: CronJobRecord | undefined): CronJobRecord {
+function requireJob(jobId: string, job: CronJobRecord | undefined): CronJobRecord {
   if (!job) {
     throw new Error(`unknown cron job: ${jobId}`);
   }

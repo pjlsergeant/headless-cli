@@ -51,9 +51,7 @@ import { isSameProcess, ownProcessStartIdentity, validProcessId } from "./proces
  *
  * Publication must be atomic. A filesystem without hard links is refused
  * with an error rather than written in place, which would let a waiter take
- * a half-written record for garbage while its creator also wins. Records are
- * opened without following symlinks or blocking, and anything that is not a
- * small regular file (a planted FIFO or device) counts as garbage.
+ * a half-written record for garbage while its creator also wins.
  */
 
 export interface OwnerLockRecord {
@@ -100,7 +98,7 @@ function contextFor(options: OwnerLockOptions): AttemptContext {
   return { verified: new Map(), maxHoldMs: options.maxHoldMs, link: options.link ?? linkSync };
 }
 
-export const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const defaultRetryMs = 25;
 const maximumRecordBytes = 4096;
 const privateDirMode = 0o700;
@@ -169,18 +167,8 @@ export function withOwnerLockSync<T>(
 
 /** The current holder if one is alive (or on another host); otherwise undefined. */
 export function readOwnerLockHolder(path: string): OwnerLockRecord | undefined {
-  for (let tries = 0; tries < 10; tries += 1) {
-    let top: TopRecord;
-    try {
-      top = readTop(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw error;
-    }
-    if (top.kind === "vanished") continue;
-    return top.kind === "held" && holderAlive(top.owner, contextFor({})) ? top.owner : undefined;
-  }
-  return undefined;
+  const top = readSettledTop(path);
+  return top.kind === "held" && holderAlive(top.owner, contextFor({})) ? top.owner : undefined;
 }
 
 /**
@@ -188,23 +176,34 @@ export function readOwnerLockHolder(path: string): OwnerLockRecord | undefined {
  * acquirer even if it has since died (use readOwnerLockHolder for a live one).
  */
 export function inspectOwnerLock(path: string): { state: "free" | "held" | "released"; owner?: OwnerLockRecord } {
+  const top = readSettledTop(path);
+  if (top.kind === "held") return { state: "held", owner: top.owner };
+  if (top.kind === "vanished") return { state: "held" };
+  return { state: top.kind === "released" ? "released" : "free" };
+}
+
+/**
+ * readTop, retried while the top generation vanishes under a concurrent
+ * acquire; a missing lock directory reads as "none". Still "vanished" after
+ * ten tries when the lock is churning.
+ */
+function readSettledTop(path: string): TopRecord {
   for (let tries = 0; tries < 10; tries += 1) {
     let top: TopRecord;
     try {
       top = readTop(path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "free" };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
       throw error;
     }
-    if (top.kind === "vanished") continue;
-    if (top.kind === "held") return { state: "held", owner: top.owner };
-    return { state: top.kind === "released" ? "released" : "free" };
+    if (top.kind !== "vanished") return top;
   }
-  return { state: "held" };
+  return { kind: "vanished" };
 }
 
 function attempt(path: string, context: AttemptContext): OwnerLock | undefined {
   ensureLockDirectory(path);
+  const startIdentity = ownProcessStartIdentity();
   for (let tries = 0; tries < 10; tries += 1) {
     const top = readTop(path);
     if (top.kind === "vanished") continue;
@@ -213,7 +212,7 @@ function attempt(path: string, context: AttemptContext): OwnerLock | undefined {
     const owner: OwnerLockRecord = {
       hostname: hostname(),
       pid: process.pid,
-      ...(ownProcessStartIdentity() === undefined ? {} : { startIdentity: ownProcessStartIdentity() }),
+      ...(startIdentity === undefined ? {} : { startIdentity }),
       token: randomUUID(),
       acquiredAt: new Date().toISOString(),
     };

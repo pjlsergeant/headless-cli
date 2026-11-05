@@ -49,9 +49,6 @@ export async function acquireLaunchLock(
 
   ensurePrivateDir(dirname(lockPath));
   const maxHoldMs = launchLockMaxHoldMs(options.claimTimeoutSeconds);
-  // Residual: a live claim that outlasts maxHoldMs (no --timeout and an agent
-  // that takes over ten minutes to write its transcript) can be overtaken,
-  // so two runs may then contend for the same new transcript.
   const lock = await acquireOwnerLock(lockPath, {
     label: "launch lock",
     maxHoldMs,
