@@ -34,9 +34,9 @@ const privateFileMode = 0o600;
  * rewritten whole on each update. Keep only a short preview on the record;
  * the full prompt still reaches the launched target through its command.
  */
-export const messagePreviewChars = 4096;
+const messagePreviewChars = 4096;
 
-export function previewMessage(message: string): string {
+function previewMessage(message: string): string {
   return message.length <= messagePreviewChars ? message : `${message.slice(0, messagePreviewChars)}...[truncated]`;
 }
 

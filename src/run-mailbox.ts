@@ -43,9 +43,9 @@ import type { Env } from "./types.js";
  * Nothing a container writes is used as a path, command, work dir,
  * permission mode, or environment on the host.
  */
-export const RUN_MAILBOX_ENV = "HEADLESS_RUN_MAILBOX";
-export const CONTAINER_MAILBOX_ROOT = "/headless-mailbox";
-export const MAILBOX_SNAPSHOT_NAME = "run.json";
+const RUN_MAILBOX_ENV = "HEADLESS_RUN_MAILBOX";
+const CONTAINER_MAILBOX_ROOT = "/headless-mailbox";
+const MAILBOX_SNAPSHOT_NAME = "run.json";
 
 export const mailboxLimits = {
   /** Largest request file the host reads. */
@@ -131,7 +131,7 @@ export interface RunMailboxServiceOptions {
   runId: string;
   nodeId: string;
   paths: MailboxPaths;
-  deliver?: MailboxDeliver;
+  deliver: MailboxDeliver;
   log?: (text: string) => void;
   intervalMs?: number;
 }
@@ -296,12 +296,12 @@ export class RunMailboxService {
     if (target.nodeId === nodeId) {
       throw new Error("a node cannot message itself");
     }
-    const refusal = deliveryRefusal(target, Boolean(this.options.deliver));
+    const refusal = deliveryRefusal(target);
     if (refusal) {
       recordMessage(env, runId, nodeId, target.nodeId, request.prompt);
       return { version: 1, id: request.id, ok: true, delivered: false, error: refusal };
     }
-    await this.options.deliver!(target, request.prompt, nodeId);
+    await this.options.deliver(target, request.prompt, nodeId);
     return { version: 1, id: request.id, ok: true, delivered: true };
   }
 
@@ -346,7 +346,7 @@ export class RunMailboxService {
 }
 
 /** Why a container's message to target is recorded but not started, if it is not started. */
-function deliveryRefusal(target: RunNode, canDeliver: boolean): string | undefined {
+function deliveryRefusal(target: RunNode): string | undefined {
   if (target.sandbox === "none") {
     return `node ${target.nodeId} runs on the host; a container cannot start it`;
   }
@@ -359,14 +359,11 @@ function deliveryRefusal(target: RunNode, canDeliver: boolean): string | undefin
   if (target.status === "busy" || target.status === "starting") {
     return `node ${target.nodeId} is ${target.status}`;
   }
-  if (!canDeliver) {
-    return "this node cannot start other nodes";
-  }
   return undefined;
 }
 
 /** Strict schema check; returns the request or the reason it was rejected. */
-export function parseMailboxRequest(text: string, id: string): MailboxRequest | string {
+function parseMailboxRequest(text: string, id: string): MailboxRequest | string {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -413,10 +410,8 @@ function readRequestFile(path: string): string {
     if (!stats.isFile()) throw new Error("request is not a regular file");
     // A hard link lets the container keep or swap the inode behind our back.
     if (stats.nlink !== 1) throw new Error("request has multiple hard links");
-    // Read straight from the fd into a fixed buffer rather than readFileSync,
-    // which would follow the inode to EOF even if the container grows it after
-    // the fstat (a TOCTOU that could exhaust host memory). One byte over the
-    // cap fills the buffer and the request is rejected.
+    // Read into a fixed buffer, not readFileSync: the container could grow the
+    // inode after the fstat (TOCTOU). One byte over the cap rejects it.
     const buffer = Buffer.allocUnsafe(mailboxLimits.requestBytes + 1);
     let total = 0;
     while (total < buffer.length) {
@@ -523,10 +518,6 @@ export function readMailboxSnapshot(root: string, runId: string): RunRecord | un
   } catch {
     return undefined;
   }
-}
-
-export function newRequestId(): string {
-  return randomUUID();
 }
 
 export function submitMailboxRequest(root: string, request: MailboxRequest): void {
