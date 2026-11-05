@@ -65,7 +65,7 @@ Fast mode is off by default and is controlled per invocation, not through `~/.he
 
 Pass `--profile <name>` to select a Codex configuration profile for one-shot, tmux, session, coordinated-run, Docker, Modal, or `cron add` invocations. Named sessions and coordinated run nodes remember the profile for later turns. Profiles are CLI-only: Headless does not define a profile default in `~/.headless/config.toml`, and non-Codex agents reject the option.
 
-When a profile sets top-level `model` and `model_provider` keys, `--usage`, the wait spinner, and SDK results report that model and provider, and usage is priced from models.dev using the Codex provider id as the models.dev provider id. An explicit `--model` (or `CODEX_MODEL`) still overrides the profile's model.
+For profile runs, `--usage`, the wait spinner, and SDK results report the model and provider from the profile's top-level `model` and `model_provider` keys, falling back to the same keys at the root of `<CODEX_HOME>/config.toml` (as Codex does when it overlays the profile). Usage is priced from models.dev using the Codex provider id as the models.dev provider id, matched case-insensitively. A Headless model still overrides the profile's model: `--model`, `CODEX_MODEL`, or a `model` configured under `[agents.codex]` or the active `[roles.<role>]` in `~/.headless/config.toml`.
 
 ### Z.AI (GLM) through Codex
 
@@ -94,7 +94,7 @@ headless codex --profile zai --prompt "Summarize this repo" --usage
 headless codex --profile zai --docker --prompt "Fix the failing tests"
 ```
 
-`model_provider = "zai"` matches the models.dev provider id, so `--usage` prices GLM runs. Docker and Modal seed the profile (and its catalog) into the remote Codex home and forward `ZAI_API_KEY` automatically.
+`model_provider = "zai"` matches the models.dev provider id (Z.AI's own docs spell it `ZAI`, which matches too), so `--usage` prices GLM runs. Docker and Modal seed the profile (and its catalog) into the remote Codex home and forward `ZAI_API_KEY` automatically.
 
 ## Output Modes
 
