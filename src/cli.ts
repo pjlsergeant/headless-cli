@@ -51,7 +51,7 @@ import {
   type HeadlessConfig,
   type InvocationDefaults,
 } from "./config.js";
-import { validateCodexProfileName } from "./codex-profile.js";
+import { readCodexProfileModelSelection, validateCodexProfileName } from "./codex-profile.js";
 import {
   buildDockerAgentCommand,
   DEFAULT_DOCKER_IMAGE,
@@ -1183,9 +1183,15 @@ function usageContext(
 ): UsageContext {
   if (agent === "codex") {
     const model = defaults.model ?? env.CODEX_MODEL;
-    return profile
-      ? { model, useDefaultProvider: false }
-      : { provider: "openai", model: model ?? "gpt-5.5" };
+    if (!profile) return { provider: "openai", model: model ?? "gpt-5.5" };
+    // Explicit Headless model overrides win; the profile supplies the rest.
+    // Codex provider ids are used as models.dev provider ids (e.g. "zai").
+    const selection = readCodexProfileModelSelection(env, profile);
+    return {
+      ...(selection.provider ? { provider: selection.provider } : {}),
+      model: model ?? selection.model,
+      useDefaultProvider: false,
+    };
   }
   if (agent === "claude") {
     return { provider: "anthropic", model: claudeModel(defaults.model ?? "claude-opus-4-6") };
@@ -1505,7 +1511,8 @@ function createWaitingSpinner(label: string, write: (text: string) => void): Wai
 
 function spinnerModelLabel(agent: AgentName, defaults: InvocationDefaults, env: Env, profile?: string): string {
   if (agent === "codex") {
-    return defaults.model ?? env.CODEX_MODEL ?? profile ?? "gpt-5.5";
+    return defaults.model ?? env.CODEX_MODEL ??
+      (profile ? (readCodexProfileModelSelection(env, profile).model ?? profile) : "gpt-5.5");
   }
   if (agent === "claude") {
     return claudeModel(defaults.model ?? "claude-opus-4-6") ?? "claude-opus-4-6";

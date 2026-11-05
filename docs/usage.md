@@ -65,6 +65,8 @@ Fast mode is off by default and is controlled per invocation, not through `~/.he
 
 Pass `--profile <name>` to select a Codex configuration profile for one-shot, tmux, session, coordinated-run, Docker, Modal, or `cron add` invocations. Named sessions and coordinated run nodes remember the profile for later turns. Profiles are CLI-only: Headless does not define a profile default in `~/.headless/config.toml`, and non-Codex agents reject the option.
 
+When a profile sets top-level `model` and `model_provider` keys, `--usage`, the wait spinner, and SDK results report that model and provider, and usage is priced from models.dev using the Codex provider id as the models.dev provider id. An explicit `--model` (or `CODEX_MODEL`) still overrides the profile's model.
+
 ## Output Modes
 
 Raw mode is the default: Headless prints the extracted final assistant message.

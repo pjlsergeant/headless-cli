@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { codexProfileSeedFiles, readCodexProfileFiles, validateCodexProfileName } from "../src/codex-profile.ts";
+import {
+  codexProfileSeedFiles,
+  readCodexProfileFiles,
+  readCodexProfileModelSelection,
+  validateCodexProfileName,
+} from "../src/codex-profile.ts";
 
 test("Codex profile names follow the CLI plain-name grammar", () => {
   for (const profile of ["fugu", "Research42", "research_name", "research-name"]) {
@@ -46,6 +51,52 @@ test("Codex profile seeds reject symlinked profile files", { skip: process.platf
     symlinkSync(externalProfile, join(codexHome, "work.config.toml"));
 
     assert.throws(() => readCodexProfileFiles({ CODEX_HOME: codexHome }, "work"), /ELOOP/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Codex profile model selection reads top-level model and provider keys", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-codex-profile-"));
+  try {
+    writeFileSync(
+      join(dir, "zai.config.toml"),
+      [
+        "# Z.AI through Codex",
+        'model = "glm-5.3" # comment',
+        "model_provider = 'zai'",
+        'model_reasoning_effort = "max"',
+        "",
+        "[model_providers.zai]",
+        'name = "Z.AI"',
+        'model = "table-model"',
+        "",
+      ].join("\n"),
+    );
+    assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: dir }, "zai"), {
+      model: "glm-5.3",
+      provider: "zai",
+    });
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Codex profile model selection ignores keys that only appear inside tables", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-codex-profile-"));
+  try {
+    writeFileSync(join(dir, "tables.config.toml"), '[model_providers.x]\nmodel = "nope"\nmodel_provider = "nope"\n');
+    assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: dir }, "tables"), {});
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Codex profile model selection is empty when the profile cannot be read", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-codex-profile-"));
+  try {
+    assert.deepEqual(readCodexProfileModelSelection({ CODEX_HOME: dir }, "missing"), {});
+    assert.deepEqual(readCodexProfileModelSelection({}, "nohome"), {});
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

@@ -43,10 +43,14 @@ export function readCodexBaseFiles(env: Env): CodexBaseFile[] {
   ].filter((file): file is CodexBaseFile => file !== undefined);
 }
 
-export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFiles {
+function codexProfilePath(env: Env, profile: string): string {
   validateCodexProfileName(profile);
+  return resolve(codexHomePath(env), `${profile}.config.toml`);
+}
+
+export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFiles {
+  const profilePath = codexProfilePath(env, profile);
   const codexHome = codexHomePath(env);
-  const profilePath = resolve(codexHome, `${profile}.config.toml`);
   const content = readBoundedRegularFile(profilePath, maxProfileBytes, "Codex profile");
   const assignment = catalogAssignment.exec(content);
   if (!assignment) {
@@ -66,6 +70,43 @@ export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFi
     content,
     path: profilePath,
   };
+}
+
+export interface CodexProfileModelSelection {
+  model?: string;
+  provider?: string;
+}
+
+/**
+ * The profile's own top-level `model` and `model_provider`, used to label and
+ * price runs. Best effort: an unreadable or unparsable profile yields `{}` so
+ * usage reporting never fails a run that Codex itself would accept.
+ */
+export function readCodexProfileModelSelection(env: Env, profile: string): CodexProfileModelSelection {
+  let content: string;
+  try {
+    content = readBoundedRegularFile(codexProfilePath(env, profile), maxProfileBytes, "Codex profile");
+  } catch {
+    return {};
+  }
+  const tableStart = content.search(/^\s*\[/m);
+  const topLevel = tableStart === -1 ? content : content.slice(0, tableStart);
+  const selection: CodexProfileModelSelection = {};
+  const model = topLevelString(topLevel, "model");
+  const provider = topLevelString(topLevel, "model_provider");
+  if (model) selection.model = model;
+  if (provider) selection.provider = provider;
+  return selection;
+}
+
+function topLevelString(content: string, key: string): string | undefined {
+  const match = new RegExp(`^\\s*${key}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*')\\s*(?:#.*)?$`, "m").exec(content);
+  if (!match) return undefined;
+  try {
+    return parseTomlString(match[1] as string).trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function codexProfileSeedFiles(
