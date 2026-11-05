@@ -173,7 +173,7 @@ test("builds explicit yolo commands for supported agents", () => {
 });
 
 test("defaults to yolo commands for supported agents", () => {
-  const agents = ["antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"] as const;
+  const agents = ["antigravity", "claude", "codex", "cursor", "gemini", "grok", "opencode", "pi"] as const;
 
   for (const agent of agents) {
     assert.deepEqual(

@@ -43,6 +43,7 @@ export const BUILTIN_AGENT_DEFAULTS: Record<AgentName, AgentDefaults> = {
   codex: { model: "gpt-5.5" },
   cursor: { model: "gpt-5.5", reasoningEffort: "medium" },
   gemini: { model: "gemini-3.1-pro-preview" },
+  grok: { model: "grok-4.6" },
   opencode: { model: "openai/gpt-5.4" },
   pi: { model: "openai-codex/gpt-5.5" },
 };
@@ -214,6 +215,7 @@ function parseAgentName(value: string, lineNumber: number): AgentName {
     value === "codex" ||
     value === "cursor" ||
     value === "gemini" ||
+    value === "grok" ||
     value === "opencode" ||
     value === "pi"
   ) {
@@ -255,6 +257,7 @@ function parseConfigDefaultAgent(value: string, lineNumber: number): AgentName {
     value === "codex" ||
     value === "cursor" ||
     value === "gemini" ||
+    value === "grok" ||
     value === "opencode" ||
     value === "pi"
   ) {

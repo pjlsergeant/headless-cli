@@ -264,6 +264,14 @@ function formatErrorRecord(record: JsonRecord): string {
 export function extractAgentError(agent: AgentName, stdout: string): string {
   const records = parseJsonValues(stdout).flatMap(flattenRecords);
   for (const record of records) {
+    // grok's error line is {"type":"error","message":...}; the generic
+    // formatter would echo the type back as a redundant "error:" prefix.
+    if (agent === "grok") {
+      const message = asString(record.type) === "error" ? asString(record.message).trim() : "";
+      if (message) return `grok error: ${message}`;
+      continue;
+    }
+
     const rowType = asString(record.type).trim().toLowerCase();
     if (rowType !== "error" && Object.keys(asRecord(record.error)).length === 0) {
       continue;
@@ -291,6 +299,49 @@ function extractGeminiDeltaMessage(values: unknown[]): string {
   }
 
   return latest.trim();
+}
+
+// Grok streams one response as many text chunks. Two shapes reach here:
+//  - `--output-format streaming-json` lines: {"type":"text","data":...}, with
+//    tool_call / tool_call_update / per-response usage lines between model
+//    responses (grok-build xai-grok-pager/src/headless/reducer/acp.rs AcpLine);
+//  - updates.jsonl envelopes for --tmux --wait: {"method":...,"params":{"update":
+//    {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":...}}}}
+//    (xai-grok-shell/src/session/storage/mod.rs SessionUpdateEnvelope).
+// The final message is the last response that produced text; a new user
+// prompt discards earlier turns.
+function extractGrokFinalMessage(values: unknown[]): string {
+  let current = "";
+  let latest = "";
+  const boundary = () => {
+    if (current.trim()) latest = current;
+    current = "";
+  };
+
+  for (const record of values.flatMap(flattenRecords)) {
+    const type = asString(record.type);
+    if (type === "text") {
+      current += asString(record.data);
+      continue;
+    }
+    if (type === "tool_call" || type === "tool_call_update" || type === "usage") {
+      boundary();
+      continue;
+    }
+    const update = asRecord(asRecord(record.params).update);
+    const sessionUpdate = asString(update.sessionUpdate);
+    if (sessionUpdate === "agent_message_chunk") {
+      const content = asRecord(update.content);
+      if (asString(content.type) === "text") current += asString(content.text);
+    } else if (sessionUpdate === "user_message_chunk") {
+      current = "";
+      latest = "";
+    } else if (sessionUpdate === "tool_call" || sessionUpdate === "tool_call_update") {
+      boundary();
+    }
+  }
+
+  return (current.trim() || latest).trim();
 }
 
 function extractAntigravityFinalMessage(stdout: string): string {
@@ -353,6 +404,9 @@ export function extractFinalMessage(agent: AgentName, stdout: string): string {
   }
 
   const values = parseJsonValues(stdout);
+  if (agent === "grok") {
+    return extractGrokFinalMessage(values);
+  }
   if (agent === "gemini") {
     const deltaMessage = extractGeminiDeltaMessage(values);
     if (deltaMessage) return deltaMessage;

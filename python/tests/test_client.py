@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import get_args
 from unittest.mock import Mock
 
 import pytest
 from conftest import read_record
 
 from headless_cli import Headless
-from headless_cli.models import CommandResult, SdkResult
+from headless_cli.models import Agent, CommandResult, SdkResult
 
 
 def test_run_builds_structured_one_shot_command(
@@ -151,6 +152,16 @@ def test_run_supports_prompt_file_acp_modal_and_print_command(
         "--modal-keep-sandbox",
         "--print-command",
     ]
+
+
+def test_grok_is_a_typed_agent(fake_headless: tuple[Path, Path]) -> None:
+    assert "grok" in get_args(Agent)
+    binary, record = fake_headless
+    client = Headless(binary=binary, env={"FAKE_HEADLESS_RECORD": str(record)})
+
+    client.run("grok", prompt="hi", tmux=True, wait=True)
+
+    assert read_record(record)["argv"] == ["grok", "--tmux", "--wait"]
 
 
 def test_run_preserves_tmux_mode_without_sdk_format(

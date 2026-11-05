@@ -183,7 +183,7 @@ test("SDK check output exposes agent and Docker checks without terminal tables",
 
     assert.equal(code, 0);
     const envelope = parseEnvelope(stdout.join(""));
-    assert.equal((envelope.data?.agents as unknown[]).length, 8);
+    assert.equal((envelope.data?.agents as unknown[]).length, 9);
     assert.equal((envelope.data?.docker as { available: boolean }).available, false);
   } finally {
     rmSync(dir, { force: true, recursive: true });

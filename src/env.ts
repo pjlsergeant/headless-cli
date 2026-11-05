@@ -18,6 +18,7 @@ export const defaultForwardedEnvNames = [
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
+  "GROK_CODE_XAI_API_KEY",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "OPENROUTER_API_KEY",
@@ -26,6 +27,7 @@ export const defaultForwardedEnvNames = [
   "PI_CODING_AGENT_MODELS",
   "PI_CODING_AGENT_PROVIDER",
   "SAKANA_API_KEY",
+  "XAI_API_KEY",
   "ZAI_API_KEY",
 ];
 

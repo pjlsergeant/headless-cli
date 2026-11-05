@@ -139,6 +139,7 @@ function defaultProvider(agent: AgentName): string | undefined {
   if (agent === "codex") return "openai";
   if (agent === "claude") return "anthropic";
   if (agent === "gemini") return "google";
+  if (agent === "grok") return "xai";
   return undefined;
 }
 
@@ -421,6 +422,55 @@ function extractGeminiUsage(records: JsonRecord[], context: UsageContext): Usage
   });
 }
 
+// Grok puts whole-turn spend on its terminal `end` (or `error`) line; the
+// per-response `usage` lines carry the same ResponseUsage fields and must not
+// be mistaken for totals. Shape: grok-build xai-grok-shell/src/extensions/
+// notification.rs project_result_usage. `usage.input_tokens` is already
+// uncached and disjoint from the two cache buckets, and reasoning_tokens is a
+// subset of output_tokens (total = input + cache_read + cache_creation + output).
+// Grok omits total_cost_usd whenever cost is partial or incomplete ("absent cost
+// does not mean free"), so only a present total is trusted as native.
+function extractGrokUsage(records: JsonRecord[], context: UsageContext): UsageSummary | undefined {
+  const record = latestRecordWith(records, (item) => {
+    const type = asString(item.type);
+    return (type === "end" || type === "error") && (Object.keys(asRecord(item.usage)).length > 0 || item.usage_is_incomplete === true);
+  });
+  if (!record) return undefined;
+  const usage = asRecord(record.usage);
+  const incomplete = record.usage_is_incomplete === true;
+  const totalCost = incomplete || record.cost_is_partial === true ? undefined : asOptionalNumber(record.total_cost_usd);
+  const requested = requestedProviderModel(context);
+  const provider = requested.provider ?? "xai";
+  const modelEntries = Object.entries(asRecord(record.modelUsage)).map(([model, value]): UsagePart => {
+    const row = asRecord(value);
+    return {
+      provider,
+      model,
+      inputTokens: asNumber(row.inputTokens),
+      cacheReadTokens: asNumber(row.cacheReadInputTokens),
+      cacheWriteTokens: asNumber(row.cacheCreationInputTokens),
+      outputTokens: asNumber(row.outputTokens),
+    };
+  });
+  const reportedModel = modelEntries.length === 1 ? modelEntries[0]?.model : modelEntries.length > 1 ? "mixed" : undefined;
+  return summarizeUsage({
+    agent: "grok",
+    provider,
+    model: reportedModel ?? requested.model,
+    inputTokens: asNumber(usage.input_tokens),
+    cacheReadTokens: asNumber(usage.cache_read_input_tokens),
+    cacheWriteTokens: asNumber(usage.cache_creation_input_tokens),
+    outputTokens: asNumber(usage.output_tokens),
+    reasoningOutputTokens: asNumber(usage.reasoning_tokens),
+    usageStatus: incomplete ? "missing" : "reported",
+    cost: totalCost === undefined ? null : nativeCost(totalCost),
+    costBasis: totalCost === undefined ? null : "native-reported",
+    pricingSource: totalCost === undefined ? null : "native",
+    pricingStatus: totalCost === undefined ? "missing" : "native",
+    ...(totalCost === undefined && modelEntries.length > 0 ? { modelBreakdowns: modelEntries } : {}),
+  });
+}
+
 function extractOpencodeUsage(records: JsonRecord[], context: UsageContext): UsageSummary | undefined {
   const steps = new OpencodeUsageAccumulator();
   for (const record of records) steps.add(record);
@@ -536,9 +586,11 @@ export function extractUsageSummary(
             ? extractCursorUsage(records, context)
             : agent === "gemini"
               ? extractGeminiUsage(records, context)
-              : agent === "opencode"
-                ? extractOpencodeUsage(records, context)
-                : extractPiUsage(records, context);
+              : agent === "grok"
+                ? extractGrokUsage(records, context)
+                : agent === "opencode"
+                  ? extractOpencodeUsage(records, context)
+                  : extractPiUsage(records, context);
 
   return (
     summary ??

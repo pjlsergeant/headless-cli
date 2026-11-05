@@ -15,11 +15,12 @@ import { commandFromCustom, resolveAcpCommand } from "./acp.js";
 import { BUILTIN_AGENT_DEFAULTS } from "./config.js";
 import { validateCodexProfileName } from "./codex-profile.js";
 
-const agentOrder: AgentName[] = ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"];
+const agentOrder: AgentName[] = ["acp", "antigravity", "claude", "codex", "cursor", "gemini", "grok", "opencode", "pi"];
 const defaultClaudeModel = BUILTIN_AGENT_DEFAULTS.claude.model;
 const defaultCodexModel = BUILTIN_AGENT_DEFAULTS.codex.model;
 export const DEFAULT_CURSOR_MODEL = BUILTIN_AGENT_DEFAULTS.cursor.model ?? "gpt-5.5";
 export const DEFAULT_GEMINI_MODEL = BUILTIN_AGENT_DEFAULTS.gemini.model ?? "gemini-3.1-pro-preview";
+export const DEFAULT_GROK_MODEL = BUILTIN_AGENT_DEFAULTS.grok.model ?? "grok-4.6";
 export const DEFAULT_OPENCODE_MODEL = BUILTIN_AGENT_DEFAULTS.opencode.model ?? "openai/gpt-5.4";
 export const DEFAULT_PI_MODEL = BUILTIN_AGENT_DEFAULTS.pi.model ?? "openai-codex/gpt-5.5";
 const claudeReadOnlyTools = "Read,Grep,Glob,LS,WebFetch,WebSearch";
@@ -424,6 +425,93 @@ function buildInteractiveGemini(options: BuildOptions): BuiltCommand {
   return { command: "gemini", args };
 }
 
+export function grokCommand(env: Env): string {
+  return env.GROK_CLI_BIN || "grok";
+}
+
+// Grok resolves its home as $GROK_HOME when non-empty, else ~/.grok
+// (~/grok-build crates/codegen/xai-dirs/src/lib.rs resolve_grok_home_from).
+export function grokHome(env: Env): string | undefined {
+  if (env.GROK_HOME) return env.GROK_HOME;
+  return env.HOME ? join(env.HOME, ".grok") : undefined;
+}
+
+// OAuth login (`grok login`) persists to $GROK_AUTH_PATH, else <grok home>/auth.json
+// (xai-grok-login/src/storage.rs auth_json_path); GROK_AUTH_PROVIDER_COMMAND
+// supplies tokens from an external command instead.
+export function grokAuthExists(env: Env): boolean {
+  if (env.GROK_AUTH_PROVIDER_COMMAND) return true;
+  if (env.GROK_AUTH_PATH) return fileExists(env.GROK_AUTH_PATH);
+  const home = grokHome(env);
+  return home ? fileExists(join(home, "auth.json")) : false;
+}
+
+export const grokApiKeyEnvNames = ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"] as const;
+
+// grok's OAuth login is never copied into Docker or Modal (see the grok seedPaths),
+// so a container run needs an API key in its forwarded environment.
+export function grokContainerAuthError(forwardedValue: (name: string) => string | undefined): string | undefined {
+  if (grokApiKeyEnvNames.some((name) => Boolean(forwardedValue(name)))) return undefined;
+  return "grok in Docker or Modal needs XAI_API_KEY or GROK_CODE_XAI_API_KEY; the host grok login cannot be used in containers (its refresh tokens are single-use). Set XAI_API_KEY, or pass it with --docker-env/--modal-env.";
+}
+
+// Built-in read-only tool ids accepted by headless `--tools`
+// (xai-grok-pager/docs/user-guide/14-headless-mode.md "Tool Filtering").
+const grokReadOnlyTools = "read_file,grep,list_dir,web_search,web_fetch";
+// A --tools allowlist keeps the MCP bridge meta-tools; only the denylist, which
+// runs first, removes them (xai-grok-agent/src/tool_list.rs).
+const grokMcpBridgeTools = "search_tool,use_tool";
+// An explicit CLI permission mode outranks a persisted [ui] permission_mode,
+// approval_mode or yolo = true, and only bypassPermissions/always-approve turn
+// yolo on (xai-grok-shell/src/util/config/permissions.rs resolve_effective_yolo).
+// clap accepts "default" (not "ask"); both parse to Ask.
+const grokAskModeArgs = ["--permission-mode", "default"];
+
+function withGrokModelAndEffort(options: BuildOptions): string[] {
+  const args = withModel([], options.model ?? DEFAULT_GROK_MODEL);
+  return options.reasoningEffort ? [...args, "--reasoning-effort", options.reasoningEffort] : args;
+}
+
+function withGrokSession(args: string[], options: BuildOptions): string[] {
+  if (options.sessionMode === "resume" && options.sessionId) return [...args, "--resume", options.sessionId];
+  if (options.sessionMode === "new" && options.sessionId) return [...args, "--session-id", options.sessionId];
+  return args;
+}
+
+function buildGrok(options: BuildOptions, env: Env): BuiltCommand {
+  const args = [...withGrokModelAndEffort(options), "--output-format", "streaming-json", "--no-auto-update"];
+  // --tools is headless-only. Without --always-approve, headless answers every
+  // permission request with Cancelled (xai-grok-pager/src/headless.rs
+  // RequestPermission arm), so anything outside the allowlist fails closed.
+  if (options.allow === "read-only") {
+    args.push(...grokAskModeArgs, "--tools", grokReadOnlyTools, "--disallowed-tools", grokMcpBridgeTools);
+  } else {
+    // --trust persists a folder-trust grant (app/cli.rs `trust`) so a yolo run
+    // loads the project's AGENTS.md, skills, hooks and MCP servers like the TUI
+    // would; read-only one-shot stays untrusted and skips them.
+    args.push("--trust", "--always-approve");
+  }
+  // `--single=<prompt>` keeps a prompt starting with "-" from being parsed as options.
+  return { command: grokCommand(env), args: [...withGrokSession(args, options), `--single=${options.prompt}`] };
+}
+
+function buildInteractiveGrok(options: BuildOptions, env: Env): BuiltCommand {
+  // Every tmux session passes --trust, which persists a folder-trust grant
+  // (app/cli.rs `trust`), so a trust prompt cannot stall the session; the
+  // analogue of trustClaudeWorkspace for claude.
+  const args = [...withGrokModelAndEffort(options), "--no-auto-update", "--trust"];
+  if (options.allow === "read-only") {
+    // The TUI ignores --tools, so deny the mutating tool families by rule
+    // (xai-grok-permission-rules/src/rules.rs tool_name_to_filter: Edit covers Write).
+    // A tool-wide Edit deny also locks AccessKind::Tool (task, scheduler,
+    // workflow, image_gen) per permission-rules policy.rs rule_reaches.
+    args.push(...grokAskModeArgs, "--deny", "Bash", "--deny", "Edit", "--deny", "MCPTool");
+  } else {
+    args.push("--always-approve");
+  }
+  return { command: grokCommand(env), args: [...withGrokSession(args, options), "--", options.prompt] };
+}
+
 function buildOpencode(options: BuildOptions): BuiltCommand {
   const args = ["run", "--format", "json"];
   const model = options.model ?? DEFAULT_OPENCODE_MODEL;
@@ -610,6 +698,25 @@ const harnesses: Record<AgentName, AgentHarness> = {
     buildCommand: buildGemini,
     buildInteractiveCommand: buildInteractiveGemini,
   },
+  grok: {
+    name: "grok",
+    promptFileMode: "argument",
+    configRelDir: ".grok",
+    workspaceConfigRelDir: ".grok",
+    // Listed file by file (like claude/codex) rather than as a ".grok" directory
+    // with dockerSeedFiles: Modal ignores dockerSeedFiles and would upload all of
+    // ~/.grok, including sessions/, logs/ and the self-updating bin/ and downloads/.
+    // Only config.toml is seeded. trusted_folders.toml is keyed by host path and
+    // the workdir keeps that path in the container, so it would silently
+    // re-enable a host-trusted repo's project hooks. auth.json and
+    // mcp_credentials.json hold OAuth refresh tokens that rotate on every use
+    // (xai-grok-login manager/refresh_chain.rs; xai-grok-mcp credentials.rs),
+    // so a container refresh would strand the host login: grok authenticates in
+    // containers only through XAI_API_KEY (see grokContainerAuthError).
+    seedPaths: [".grok/config.toml"],
+    buildCommand: buildGrok,
+    buildInteractiveCommand: buildInteractiveGrok,
+  },
   opencode: {
     name: "opencode",
     promptFileMode: "argument",
@@ -689,6 +796,7 @@ const waitTiers: Record<AgentName, WaitTier> = {
   antigravity: "claim", // claim the new brain/<conversation>/transcript.jsonl under a launch lock
   claude: "pin", // --session-id <uuid>
   gemini: "pin", // --session-id <uuid>
+  grok: "pin", // --session-id <uuid>
   cursor: "mint", // create-chat mints an id, then --resume <id>
   opencode: "tag", // --title <uuid>, resolved via the session store
   pi: "dir", // --session-dir <unique dir>

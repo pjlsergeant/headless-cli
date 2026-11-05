@@ -308,6 +308,51 @@ test("wraps argument-mode commands without stdin or unrelated env", () => {
   }
 });
 
+test("seeds only grok config into Docker, never its OAuth stores or history, and forwards xAI keys", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
+  try {
+    const home = join(dir, "home");
+    const grokDir = join(home, ".grok");
+    const workDir = join(dir, "project");
+    mkdirSync(join(grokDir, "sessions"), { recursive: true });
+    mkdirSync(workDir);
+    for (const name of ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"]) {
+      writeFileSync(join(grokDir, name), "{}");
+    }
+    writeFileSync(join(grokDir, "sessions", "session_search.sqlite"), "history");
+
+    const command = buildDockerAgentCommand({
+      agent: "grok",
+      command: { command: "grok", args: ["--single=hello"] },
+      dockerArgs: [],
+      dockerEnv: [],
+      env: { HOME: home, XAI_API_KEY: "xai-secret", GROK_CODE_XAI_API_KEY: "legacy-secret", GROK_HOME: join(dir, "elsewhere") },
+      hostUser: "501:20",
+      image: DEFAULT_DOCKER_IMAGE,
+      workDir,
+    });
+
+    assert.ok(command.args.includes(`${join(grokDir, "config.toml")}:/tmp/headless-host-home/.grok/config.toml:ro`));
+    // grok's xAI and MCP OAuth stores rotate single-use refresh tokens, so a
+    // container refresh would strand the host login; containers use XAI_API_KEY.
+    assert.ok(!command.args.some((arg) => arg.includes("auth.json")));
+    assert.ok(!command.args.some((arg) => arg.includes("mcp_credentials.json")));
+    // Trust grants are keyed by host path, and the workdir keeps its host path in
+    // the container, so seeding them would re-enable project hooks there.
+    assert.ok(!command.args.some((arg) => arg.includes("trusted_folders.toml")));
+    assert.ok(!command.args.some((arg) => arg.includes("sessions")));
+    assert.ok(!command.args.some((arg) => arg.startsWith(`${grokDir}:`)));
+    const rendered = quoteCommand(command);
+    assert.match(rendered, /--env XAI_API_KEY /);
+    assert.match(rendered, /--env GROK_CODE_XAI_API_KEY /);
+    // A host GROK_HOME would point the container at a path that does not exist there.
+    assert.doesNotMatch(rendered, /GROK_HOME/);
+    assert.doesNotMatch(rendered, /xai-secret|legacy-secret/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("forwards Sakana credentials to Docker without rendering the secret value", () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
   try {

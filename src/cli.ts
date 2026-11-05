@@ -26,6 +26,7 @@ import {
   buildInteractiveOpencodeRun,
   buildInteractiveAgentCommand,
   DEFAULT_GEMINI_MODEL,
+  DEFAULT_GROK_MODEL,
   DEFAULT_OPENCODE_MODEL,
   DEFAULT_PI_MODEL,
   claudeModel,
@@ -33,6 +34,7 @@ import {
   piModelSpec,
   getAgentConfig,
   getAgentHarness,
+  grokContainerAuthError,
   isAgentName,
   listAgents,
   waitTierForAgent,
@@ -42,6 +44,7 @@ import { BillingError, prepareBillingAttempt, prepareBillingPreview, resolveBill
 import { runWithBilling, type BillingExecutionAttempt, type BillingRunResult } from "./billing-run.js";
 import { resolveCapacityRetries, waitForCapacityRetry } from "./capacity-retry.js";
 import { buildDockerBillingVolumeInitCommand, removeDockerBillingVolume } from "./docker-billing.js";
+import { collectForwardedEnvEntries } from "./env.js";
 import { checkAgents, checkDocker, commandExists, commandForAgent, renderAgentChecks, renderDockerCheck } from "./check.js";
 import {
   BUILTIN_AGENT_DEFAULTS,
@@ -1143,7 +1146,27 @@ function validateWorkDir(workDir: string | undefined): string | undefined {
   return workDir;
 }
 
-const autoAgentPreference: AgentName[] = ["codex", "claude", "pi", "opencode", "gemini", "antigravity", "cursor"];
+// grok's OAuth login is never copied into a container, so a grok Docker/Modal
+// run needs an xAI API key. The check is skipped whenever the key may arrive by
+// a route Headless cannot inspect: extra docker run arguments, a custom image,
+// or a named Modal Secret.
+function assertGrokContainerAuth(
+  parsed: Pick<
+    ParsedArgs,
+    "agent" | "docker" | "dockerArgs" | "dockerEnv" | "dockerImage" | "modal" | "modalEnv" | "modalImage" | "modalSecrets"
+  >,
+  env: Env,
+): void {
+  if (parsed.agent !== "grok") return;
+  if (parsed.docker && (parsed.dockerArgs.length > 0 || parsed.dockerImage !== undefined)) return;
+  if (parsed.modal && (parsed.modalSecrets.length > 0 || parsed.modalImage !== undefined)) return;
+  if (!parsed.docker && !parsed.modal) return;
+  const forwarded = collectForwardedEnvEntries(env, undefined, parsed.docker ? parsed.dockerEnv : parsed.modalEnv);
+  const error = grokContainerAuthError((name) => forwarded.find((entry) => entry.name === name)?.actualValue);
+  if (error) throw new CliError(error);
+}
+
+const autoAgentPreference: AgentName[] = ["codex", "claude", "pi", "opencode", "gemini", "antigravity", "cursor", "grok"];
 
 function selectDefaultAgent(env: Env, preferredAgent: AgentName | undefined): AgentName {
   if (preferredAgent && commandExists(commandForAgent(preferredAgent, env), env)) {
@@ -1203,6 +1226,9 @@ function usageContext(
   }
   if (agent === "gemini") {
     return { provider: "google", model: defaults.model ?? DEFAULT_GEMINI_MODEL };
+  }
+  if (agent === "grok") {
+    return { provider: "xai", model: defaults.model ?? DEFAULT_GROK_MODEL };
   }
   if (agent === "pi") {
     return piModelSpec(defaults.model, env);
@@ -1528,6 +1554,9 @@ function spinnerModelLabel(agent: AgentName, defaults: InvocationDefaults, env: 
   if (agent === "gemini") {
     return defaults.model ?? DEFAULT_GEMINI_MODEL;
   }
+  if (agent === "grok") {
+    return defaults.model ?? DEFAULT_GROK_MODEL;
+  }
   if (agent === "opencode") {
     return defaults.model ?? DEFAULT_OPENCODE_MODEL;
   }
@@ -1619,7 +1648,7 @@ function buildSessionPlan(
   return {
     alias: validAlias,
     mode: "new",
-    nativeId: agent === "claude" ? randomUUID() : undefined,
+    nativeId: agent === "claude" || agent === "grok" ? randomUUID() : undefined,
     profile: profile ?? stored?.profile,
   };
 }
@@ -3910,6 +3939,8 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         throw new CliError(`--sdk-format cannot be used with cron ${parsed.cronCommand}`);
       }
       validateCronCliOptions(parsed);
+      // A scheduled grok container job would fail on every run without a key.
+      if (parsed.cronCommand === "add") assertGrokContainerAuth(parsed, env);
       try {
         return await handleCronCommandImpl(
           {
@@ -4389,6 +4420,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     if (parsed.fast !== undefined && parsed.agent !== "claude" && parsed.agent !== "codex") {
       throw new CliError("--fast is supported only by claude and codex");
     }
+    assertGrokContainerAuth(parsed, env);
     if (parsed.profile !== undefined && parsed.agent !== "codex") {
       throw new CliError("--profile is supported only by codex");
     }

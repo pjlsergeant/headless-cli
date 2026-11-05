@@ -5,7 +5,7 @@
 <h1 align="center">Headless CLI</h1>
 
 <p align="center">
-  One CLI entrypoint for running Antigravity, Claude, Codex, Cursor, Gemini, Pi, OpenCode, and ACP-compatible agents in headless mode.
+  One CLI entrypoint for running Antigravity, Claude, Codex, Cursor, Gemini, Grok, Pi, OpenCode, and ACP-compatible agents in headless mode.
 </p>
 
 <p align="center">
@@ -118,7 +118,7 @@ headless attach --all
 headless --check
 ```
 
-When no agent is specified, Headless selects the first installed agent in this order: `codex`, `claude`, `pi`, `opencode`, `gemini`, `antigravity`, `cursor`. ACP-compatible agents are explicit-only: use `headless acp --acp-agent ...` or `headless acp --acp-command ...`.
+When no agent is specified, Headless selects the first installed agent in this order: `codex`, `claude`, `pi`, `opencode`, `gemini`, `antigravity`, `cursor`, `grok`. ACP-compatible agents are explicit-only: use `headless acp --acp-agent ...` or `headless acp --acp-command ...`.
 
 ## Billing and subscription fallback
 
@@ -259,6 +259,7 @@ Roles include `orchestrator`, `explorer`, `worker`, and `reviewer`. Team specs a
 | [Claude Code](https://code.claude.com/docs/en/cli-reference) | `npm install -g @anthropic-ai/claude-code` | `claude` |
 | [Cursor](https://cursor.com/docs/cli/headless) | `curl https://cursor.com/install -fsS \| bash` | `agent`, or set `CURSOR_CLI_BIN=cursor-agent` |
 | [Gemini CLI](https://geminicli.com/docs/cli/cli-reference/) | `npm install -g @google/gemini-cli` | `gemini` |
+| [Grok Build](https://docs.x.ai/build/overview) | `curl -fsSL https://x.ai/cli/install.sh \| bash` (runs xAI's install script) | `grok`, or set `GROK_CLI_BIN` |
 | [OpenCode](https://opencode.ai/docs/cli/) | `curl -fsSL https://opencode.ai/install \| bash` or `npm install -g opencode-ai` | `opencode` |
 | [Pi](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/rpc.md) | `npm install -g @mariozechner/pi-coding-agent` | `pi`, or set `PI_CODING_AGENT_BIN` |
 | [ACP](https://agentclientprotocol.com/) | Use `--acp-agent <id>` to resolve from the ACP registry, or `--acp-command <cmd>` for a custom ACP server | `headless acp-client ...` adapter |

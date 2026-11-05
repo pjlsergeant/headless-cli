@@ -1,0 +1,28 @@
+{"type":"available_commands","tools":["run_terminal_command","read_file","list_dir"],"commands":["compact","example-skill"]}
+{"type":"available_commands","tools":["run_terminal_command","read_file","list_dir"],"commands":["compact","example-skill"]}
+{"type":"text","data":"I'll"}
+{"type":"text","data":" list"}
+{"type":"text","data":" the"}
+{"type":"text","data":" current"}
+{"type":"text","data":" directory"}
+{"type":"text","data":" and"}
+{"type":"text","data":" then"}
+{"type":"text","data":" return"}
+{"type":"text","data":" only"}
+{"type":"text","data":" the"}
+{"type":"text","data":" file"}
+{"type":"text","data":" names"}
+{"type":"text","data":"."}
+{"type":"available_commands","tools":["run_terminal_command","read_file","list_dir"],"commands":["compact","example-skill"]}
+{"type":"usage","usage":{"input_tokens":14198,"output_tokens":52,"cache_read_input_tokens":128,"cache_creation_input_tokens":0,"reasoning_tokens":26},"signature":"<signature>"}
+{"type":"tool_call","toolCallId":"call-00000000-0000-4000-8000-000000000003-0","title":"list_dir","kind":"list","status":"pending","toolName":"list_dir","rawInput":{"target_directory":"."},"content":[],"locations":[]}
+{"type":"tool_call_update","toolCallId":"call-00000000-0000-4000-8000-000000000003-0","status":null,"content":[],"rawOutput":null,"locations":[{"path":"."}]}
+{"type":"tool_call_update","toolCallId":"call-00000000-0000-4000-8000-000000000003-0","status":"completed","content":[],"rawOutput":{"type":"ListDir","Content":{"content":"- /work/repo/\n  - a.txt\n  - b.txt","absolute_root_path":"/work/repo/."}},"locations":[]}
+{"type":"text","data":"a"}
+{"type":"text","data":".txt"}
+{"type":"text","data":","}
+{"type":"text","data":" b"}
+{"type":"text","data":".txt"}
+{"type":"available_commands","tools":["run_terminal_command","read_file","list_dir"],"commands":["compact","example-skill"]}
+{"type":"usage","usage":{"input_tokens":5359,"output_tokens":39,"cache_read_input_tokens":9088,"cache_creation_input_tokens":0,"reasoning_tokens":34},"signature":"<signature>"}
+{"type":"end","stopReason":"end_turn","sessionId":"01a1ab5e-0000-7000-8000-000000000001","requestId":"2f3640a0-0000-4000-8000-000000000002","cwd":"/work/repo","usage":{"input_tokens":19557,"cache_read_input_tokens":9216,"cache_creation_input_tokens":0,"output_tokens":91,"reasoning_tokens":60,"total_tokens":28864},"num_turns":2,"total_cost_usd":0.01505112,"total_cost_usd_ticks":150511200,"modelUsage":{"grok-4.6-build":{"inputTokens":19557,"outputTokens":91,"cacheReadInputTokens":9216,"cacheCreationInputTokens":0,"modelCalls":2,"costUSD":0.01505112}}}

@@ -8,6 +8,7 @@ import {
   assertSafeDockerOpenCodeDatabase,
   assertSafeDockerTree,
 } from "./docker-transcript-safety.js";
+import { grokHome } from "./agents.js";
 import { extractFinalMessage } from "./output.js";
 import type { NativeTranscript } from "./runs.js";
 import type { AgentName, Env } from "./types.js";
@@ -45,6 +46,8 @@ export function resolveNativeTranscript(
           ? cursorTranscriptPath(nativeId, workDir, env)
           : agent === "gemini"
             ? geminiTranscriptPath(nativeId, workDir, env)
+            : agent === "grok"
+              ? grokTranscriptPath(nativeId, workDir, env)
             : agent === "opencode"
               ? opencodeDatabasePath(env)
               : agent === "pi"
@@ -132,6 +135,8 @@ export function resolveLatestNativeTranscripts(
           ? latestFiles(cursorTranscriptsRoot(workspace, env), partial)
           : agent === "gemini"
             ? latestGeminiTranscripts(workspace, env, partial, options.dockerSessionRoot)
+            : agent === "grok"
+              ? latestGrokTranscripts(workspace, partial, env, options.dockerSessionRoot)
             : agent === "pi"
               ? latestPiTranscripts(workspace, env, partial, options.dockerSessionRoot)
               : [];
@@ -267,6 +272,92 @@ function geminiTranscriptPath(nativeId: string, workDir: string | undefined, env
   const projectSlot = geminiProjectSlot(root, workspace);
   if (!projectSlot) return undefined;
   return findFileContaining(join(root, "tmp", projectSlot, "chats"), nativeId.slice(0, 8));
+}
+
+// Grok keeps one directory per session at
+// <grok home>/sessions/<encoded cwd>/<session id>/, holding updates.jsonl (the
+// replayable ACP update log read here), chat_history.jsonl and summary.json
+// (grok-build xai-grok-config/src/paths.rs sessions_cwd_dir_in).
+function grokSessionsRoot(env: Env): string | undefined {
+  const home = grokHome(env);
+  return home ? join(home, "sessions") : undefined;
+}
+
+// Rust `urlencoding::encode`: every byte outside A-Za-z0-9 - . _ ~ becomes
+// upper-case %XX (paths.rs encode_cwd_dirname). encodeURIComponent differs: it
+// leaves ! ' ( ) * unescaped.
+export function grokSessionDirName(cwd: string): string {
+  let encoded = "";
+  for (const byte of Buffer.from(cwd, "utf8")) {
+    const char = String.fromCharCode(byte);
+    encoded += /[A-Za-z0-9\-._~]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return encoded;
+}
+
+// Session directories that belong to the workspace. Encodings longer than 255
+// bytes switch to `<slug>-<blake3 16 hex>` plus a .cwd file holding the cwd
+// (paths.rs ensure_sessions_cwd_dir_in); without blake3 here, match on .cwd.
+function grokWorkspaceSessionDirs(root: string, workspace: string): string[] {
+  const dirs: string[] = [];
+  const direct = grokSessionDirName(workspace);
+  if (direct.length <= 255 && existsSync(join(root, direct))) dirs.push(join(root, direct));
+  if (!existsSync(root)) return dirs;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === direct) continue;
+    try {
+      if (readFileSync(join(root, entry.name, ".cwd"), "utf8").trim() === workspace) dirs.push(join(root, entry.name));
+    } catch {
+      // No .cwd: a short-path directory for another cwd.
+    }
+  }
+  return dirs;
+}
+
+function grokTranscriptPath(nativeId: string, workDir: string | undefined, env: Env): string | undefined {
+  if (!/^[A-Za-z0-9_.:-]+$/.test(nativeId) || nativeId === "." || nativeId === "..") return undefined;
+  const root = grokSessionsRoot(env);
+  const workspace = realWorkspace(workDir);
+  if (!root || !existsSync(root)) return undefined;
+  const scoped = workspace ? grokWorkspaceSessionDirs(root, workspace) : [];
+  for (const dir of scoped) {
+    const path = join(dir, nativeId, "updates.jsonl");
+    if (existsSync(path)) return path;
+  }
+  // Session ids are UUIDs, unique across cwds, so a resumed session that grok
+  // filed under a different cwd encoding is still unambiguous.
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const path = join(root, entry.name, nativeId, "updates.jsonl");
+    if (existsSync(path)) return path;
+  }
+  return undefined;
+}
+
+function latestGrokTranscripts(
+  workspace: string,
+  partial: Partial<NativeTranscript>,
+  env: Env,
+  dockerSessionRoot?: string,
+): string[] {
+  const root = grokSessionsRoot(env);
+  if (!root || !existsSync(root)) return [];
+  if (dockerSessionRoot) {
+    assertSafeDockerTree(dockerSessionRoot, root);
+  }
+  const startedAtMs = partial.startedAt ? Date.parse(partial.startedAt) : Number.NaN;
+  const files: Array<{ path: string; mtimeMs: number }> = [];
+  for (const dir of grokWorkspaceSessionDirs(root, workspace)) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const path = join(dir, entry.name, "updates.jsonl");
+      if (!existsSync(path)) continue;
+      const stat = statSync(path);
+      if (Number.isFinite(startedAtMs) && stat.mtimeMs < startedAtMs) continue;
+      files.push({ path, mtimeMs: stat.mtimeMs });
+    }
+  }
+  return files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path)).map((file) => file.path);
 }
 
 function opencodeDatabasePath(env: Env): string | undefined {
@@ -616,6 +707,10 @@ function nativeIdFromPath(agent: AgentName, path: string): string | undefined {
     const parts = path.split("/");
     const brainIndex = parts.lastIndexOf("brain");
     const nativeId = brainIndex >= 0 ? parts[brainIndex + 1] : undefined;
+    return nativeId && /^[A-Za-z0-9_.:-]+$/.test(nativeId) ? nativeId : undefined;
+  }
+  if (agent === "grok") {
+    const nativeId = path.split("/").at(-2);
     return nativeId && /^[A-Za-z0-9_.:-]+$/.test(nativeId) ? nativeId : undefined;
   }
   const name = path.split("/").at(-1)?.replace(/\.jsonl$/, "");
