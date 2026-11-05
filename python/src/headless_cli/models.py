@@ -9,6 +9,7 @@ Agent = Literal[
     "codex",
     "cursor",
     "gemini",
+    "grok",
     "opencode",
     "pi",
     "acp",
