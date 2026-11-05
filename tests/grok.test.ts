@@ -8,6 +8,7 @@ import {
   listAgents,
   waitTierForAgent,
 } from "../src/agents.ts";
+import { BillingError, prepareBillingAttempt } from "../src/billing.ts";
 import { BUILTIN_AGENT_DEFAULTS, parseHeadlessConfig } from "../src/config.ts";
 import {
   extractAgentError,
@@ -240,4 +241,11 @@ test("grok usage without an end line is missing", () => {
     .filter((line) => !line.includes('"type":"end"'))
     .join("\n");
   assert.equal(extractUsageSummary("grok", trace, { provider: "xai", model: "grok-4.6" }).usageStatus, "missing");
+});
+
+test("grok billing is native only", () => {
+  const options = { prompt: "hi" };
+  assert.equal(prepareBillingAttempt("grok", options, { XAI_API_KEY: "xai-test" }, "auto").route, "native");
+  assert.throws(() => prepareBillingAttempt("grok", options, {}, "subscription"), BillingError);
+  assert.throws(() => prepareBillingAttempt("grok", options, {}, "api"), BillingError);
 });

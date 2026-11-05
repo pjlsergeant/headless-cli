@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentName } from "../src/types.ts";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const agents: AgentName[] = ["codex", "claude", "pi", "gemini"];
+const agents: AgentName[] = ["codex", "claude", "pi", "gemini", "grok"];
 const expected = "smoke-ok";
 
 for (const agent of agents) {
