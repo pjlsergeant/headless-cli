@@ -449,6 +449,14 @@ export function grokAuthExists(env: Env): boolean {
 // Built-in read-only tool ids accepted by headless `--tools`
 // (xai-grok-pager/docs/user-guide/14-headless-mode.md "Tool Filtering").
 const grokReadOnlyTools = "read_file,grep,list_dir,web_search,web_fetch";
+// A --tools allowlist keeps the MCP bridge meta-tools; only the denylist, which
+// runs first, removes them (xai-grok-agent/src/tool_list.rs).
+const grokMcpBridgeTools = "search_tool,use_tool";
+// An explicit CLI permission mode outranks a persisted [ui] permission_mode,
+// approval_mode or yolo = true, and only bypassPermissions/always-approve turn
+// yolo on (xai-grok-shell/src/util/config/permissions.rs resolve_effective_yolo).
+// clap accepts "default" (not "ask"); both parse to Ask.
+const grokAskModeArgs = ["--permission-mode", "default"];
 
 function withGrokModelAndEffort(options: BuildOptions): string[] {
   const args = withModel([], options.model ?? DEFAULT_GROK_MODEL);
@@ -467,7 +475,7 @@ function buildGrok(options: BuildOptions, env: Env): BuiltCommand {
   // permission request with Cancelled (xai-grok-pager/src/headless.rs
   // RequestPermission arm), so anything outside the allowlist fails closed.
   if (options.allow === "read-only") {
-    args.push("--tools", grokReadOnlyTools);
+    args.push(...grokAskModeArgs, "--tools", grokReadOnlyTools, "--disallowed-tools", grokMcpBridgeTools);
   } else {
     args.push("--always-approve");
   }
@@ -480,7 +488,9 @@ function buildInteractiveGrok(options: BuildOptions, env: Env): BuiltCommand {
   if (options.allow === "read-only") {
     // The TUI ignores --tools, so deny the mutating tool families by rule
     // (xai-grok-permission-rules/src/rules.rs tool_name_to_filter: Edit covers Write).
-    args.push("--deny", "Bash", "--deny", "Edit", "--deny", "MCPTool");
+    // A tool-wide Edit deny also locks AccessKind::Tool (task, scheduler,
+    // workflow, image_gen) per permission-rules policy.rs rule_reaches.
+    args.push(...grokAskModeArgs, "--deny", "Bash", "--deny", "Edit", "--deny", "MCPTool");
   } else {
     // --trust pre-grants folder trust so the TUI does not block on a trust
     // prompt inside tmux (the analogue of trustClaudeWorkspace for claude).
@@ -683,7 +693,10 @@ const harnesses: Record<AgentName, AgentHarness> = {
     // Listed file by file (like claude/codex) rather than as a ".grok" directory
     // with dockerSeedFiles: Modal ignores dockerSeedFiles and would upload all of
     // ~/.grok, including sessions/, logs/ and the self-updating bin/ and downloads/.
-    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json", ".grok/trusted_folders.toml"],
+    // trusted_folders.toml is left out on purpose: its grants are keyed by host
+    // path and the workdir keeps that path in the container, so seeding it would
+    // silently re-enable a host-trusted repo's project hooks and MCP servers.
+    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json"],
     buildCommand: buildGrok,
     buildInteractiveCommand: buildInteractiveGrok,
   },

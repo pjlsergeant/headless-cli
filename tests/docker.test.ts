@@ -292,9 +292,12 @@ test("seeds grok credentials into Docker without session history and forwards xA
       workDir,
     });
 
-    for (const name of ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"]) {
+    for (const name of ["auth.json", "config.toml", "mcp_credentials.json"]) {
       assert.ok(command.args.includes(`${join(grokDir, name)}:/tmp/headless-host-home/.grok/${name}:ro`), name);
     }
+    // Trust grants are keyed by host path, and the workdir keeps its host path in
+    // the container, so seeding them would re-enable project hooks there.
+    assert.ok(!command.args.some((arg) => arg.includes("trusted_folders.toml")));
     assert.ok(!command.args.some((arg) => arg.includes("sessions")));
     assert.ok(!command.args.some((arg) => arg.startsWith(`${grokDir}:`)));
     const rendered = quoteCommand(command);

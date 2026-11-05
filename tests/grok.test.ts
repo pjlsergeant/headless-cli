@@ -80,18 +80,27 @@ test("grok one-shot honours GROK_CLI_BIN, model and reasoning effort", () => {
   );
 });
 
-test("grok read-only one-shot restricts built-in tools and does not auto-approve", () => {
+test("grok read-only one-shot forces ask mode, restricts built-in tools and strips the MCP bridge", () => {
   const args = buildAgentCommand("grok", { prompt: "review", allow: "read-only" }, {}).args;
+  // An explicit --permission-mode outranks a persisted [ui] permission_mode /
+  // approval_mode / yolo (xai-grok-shell util/config/permissions.rs
+  // resolve_effective_yolo), so a user's always-approve config cannot turn
+  // headless yolo back on; only bypassPermissions/always-approve would.
   assert.deepEqual(args, [
     "--model",
     "grok-4.6",
     "--output-format",
     "streaming-json",
     "--no-auto-update",
+    "--permission-mode",
+    "default",
     "--tools",
     "read_file,grep,list_dir,web_search,web_fetch",
+    "--disallowed-tools",
+    "search_tool,use_tool",
     "--single=review",
   ]);
+  assert.ok(!args.includes("--always-approve"));
 });
 
 test("grok one-shot sessions pin a new id or resume a stored one", () => {
@@ -112,11 +121,13 @@ test("builds interactive grok command with the prompt after --", () => {
   });
 });
 
-test("interactive grok read-only denies shell, edit and MCP tools and does not trust the folder", () => {
+test("interactive grok read-only forces ask mode, denies shell, edit and MCP tools and does not trust the folder", () => {
   assert.deepEqual(buildInteractiveAgentCommand("grok", { prompt: "look", allow: "read-only" }, {}).args, [
     "--model",
     "grok-4.6",
     "--no-auto-update",
+    "--permission-mode",
+    "default",
     "--deny",
     "Bash",
     "--deny",
@@ -156,7 +167,7 @@ test("grok uses the pin wait tier and seeds only credential/config files into Do
     promptFileMode: "argument",
     configRelDir: ".grok",
     workspaceConfigRelDir: ".grok",
-    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json", ".grok/trusted_folders.toml"],
+    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json"],
   });
 });
 
