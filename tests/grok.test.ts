@@ -155,10 +155,7 @@ test("grok uses the pin wait tier and seeds only credential/config files into Do
     promptFileMode: "argument",
     configRelDir: ".grok",
     workspaceConfigRelDir: ".grok",
-    seedPaths: [".grok"],
-    dockerSeedFiles: {
-      ".grok": ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"],
-    },
+    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json", ".grok/trusted_folders.toml"],
   });
 });
 

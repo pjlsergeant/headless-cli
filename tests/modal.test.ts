@@ -552,6 +552,55 @@ test("executeModalAgent seeds a selected Codex profile and rewrites its catalog 
   }
 });
 
+test("executeModalAgent seeds only grok credential and config files, never its session history or binaries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-modal-grok-"));
+  try {
+    const home = join(dir, "home");
+    const grokDir = join(home, ".grok");
+    const work = join(dir, "work");
+    const remote = join(dir, "remote");
+    mkdirSync(join(grokDir, "sessions", "%2Fwork", "s-1"), { recursive: true });
+    mkdirSync(join(grokDir, "bin"), { recursive: true });
+    mkdirSync(work);
+    mkdirSync(remote);
+    initGitWorkdir(work);
+    writeFileSync(join(work, "input.txt"), "local");
+    writeFileSync(join(grokDir, "auth.json"), "{}\n");
+    writeFileSync(join(grokDir, "config.toml"), "[ui]\n");
+    writeFileSync(join(grokDir, "sessions", "%2Fwork", "s-1", "updates.jsonl"), "history\n");
+    writeFileSync(join(grokDir, "bin", "grok"), "binary");
+    const sandbox = new FakeSandbox(remote);
+    const client = new FakeModalClient(sandbox);
+
+    await executeModalAgent({
+      agent: "grok",
+      appName: "headless-test",
+      command: buildAgentCommand("grok", { prompt: "hello" }, {}),
+      cpu: DEFAULT_MODAL_CPU,
+      env: { HOME: home, XAI_API_KEY: "xai-test" },
+      image: DEFAULT_MODAL_IMAGE,
+      includeGit: false,
+      memoryMiB: DEFAULT_MODAL_MEMORY_MIB,
+      modalEnv: [],
+      modalSecrets: [],
+      stderr: () => {},
+      stdout: () => {},
+      stdoutHandling: "capture",
+      timeoutSeconds: DEFAULT_MODAL_TIMEOUT_SECONDS,
+      workDir: work,
+      clientFactory: async () => client,
+    });
+
+    assert.equal(readFileSync(join(remote, "host-home", ".grok", "auth.json"), "utf8"), "{}\n");
+    assert.equal(readFileSync(join(remote, "host-home", ".grok", "config.toml"), "utf8"), "[ui]\n");
+    assert.equal(existsSync(join(remote, "host-home", ".grok", "sessions")), false);
+    assert.equal(existsSync(join(remote, "host-home", ".grok", "bin")), false);
+    assert.equal(sandbox.agentEnv?.XAI_API_KEY, "xai-test");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("executeModalAgent validates a selected Codex profile before creating a sandbox", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-profile-preflight-"));
   try {

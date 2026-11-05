@@ -268,6 +268,46 @@ test("wraps argument-mode commands without stdin or unrelated env", () => {
   }
 });
 
+test("seeds grok credentials into Docker without session history and forwards xAI keys", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
+  try {
+    const home = join(dir, "home");
+    const grokDir = join(home, ".grok");
+    const workDir = join(dir, "project");
+    mkdirSync(join(grokDir, "sessions"), { recursive: true });
+    mkdirSync(workDir);
+    for (const name of ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"]) {
+      writeFileSync(join(grokDir, name), "{}");
+    }
+    writeFileSync(join(grokDir, "sessions", "session_search.sqlite"), "history");
+
+    const command = buildDockerAgentCommand({
+      agent: "grok",
+      command: { command: "grok", args: ["--single=hello"] },
+      dockerArgs: [],
+      dockerEnv: [],
+      env: { HOME: home, XAI_API_KEY: "xai-secret", GROK_CODE_XAI_API_KEY: "legacy-secret", GROK_HOME: join(dir, "elsewhere") },
+      hostUser: "501:20",
+      image: DEFAULT_DOCKER_IMAGE,
+      workDir,
+    });
+
+    for (const name of ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"]) {
+      assert.ok(command.args.includes(`${join(grokDir, name)}:/tmp/headless-host-home/.grok/${name}:ro`), name);
+    }
+    assert.ok(!command.args.some((arg) => arg.includes("sessions")));
+    assert.ok(!command.args.some((arg) => arg.startsWith(`${grokDir}:`)));
+    const rendered = quoteCommand(command);
+    assert.match(rendered, /--env XAI_API_KEY /);
+    assert.match(rendered, /--env GROK_CODE_XAI_API_KEY /);
+    // A host GROK_HOME would point the container at a path that does not exist there.
+    assert.doesNotMatch(rendered, /GROK_HOME/);
+    assert.doesNotMatch(rendered, /xai-secret|legacy-secret/);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("forwards Sakana credentials to Docker without rendering the secret value", () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
   try {

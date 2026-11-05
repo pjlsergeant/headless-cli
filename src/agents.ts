@@ -680,11 +680,10 @@ const harnesses: Record<AgentName, AgentHarness> = {
     promptFileMode: "argument",
     configRelDir: ".grok",
     workspaceConfigRelDir: ".grok",
-    seedPaths: [".grok"],
-    // Credentials and settings only: sessions/, logs/, bundled/ and bin/ stay on the host.
-    dockerSeedFiles: {
-      ".grok": ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"],
-    },
+    // Listed file by file (like claude/codex) rather than as a ".grok" directory
+    // with dockerSeedFiles: Modal ignores dockerSeedFiles and would upload all of
+    // ~/.grok, including sessions/, logs/ and the self-updating bin/ and downloads/.
+    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json", ".grok/trusted_folders.toml"],
     buildCommand: buildGrok,
     buildInteractiveCommand: buildInteractiveGrok,
   },
