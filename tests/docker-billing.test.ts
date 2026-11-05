@@ -30,6 +30,12 @@ test("Docker subscription masks override paid backend variables inherited from t
         ANTHROPIC_API_KEY: "image-api-key", CLAUDE_CODE_OAUTH_TOKEN: "subscription" },
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), { oauth: "subscription" });
+    // Compare masked facts, never raw values: a failure must not print a real credential.
+    const seen = JSON.parse(result.stdout) as Record<string, string | undefined>;
+    assert.deepEqual({
+      bedrockSet: seen.bedrock !== undefined,
+      apiKeySet: seen.key !== undefined,
+      oauthIsSubscription: seen.oauth === "subscription",
+    }, { bedrockSet: false, apiKeySet: false, oauthIsSubscription: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
