@@ -615,11 +615,20 @@ function addCost(left: UsageCostBreakdown, right: UsageCostBreakdown): UsageCost
   };
 }
 
+// Provider ids come from user config (a Codex profile may say "ZAI") while
+// models.dev ids are lowercase, so fall back to a case-insensitive match.
+function pricingProviderId(pricingData: PricingData, provider: string): string {
+  if (Object.hasOwn(pricingData, provider)) return provider;
+  const folded = provider.toLowerCase();
+  return Object.keys(pricingData).find((id) => id.toLowerCase() === folded) ?? provider;
+}
+
 function priceUsagePart(part: UsagePart, pricingData: PricingData): UsageCostBreakdown | undefined {
   if (!part.provider && part.allowProviderSearch === false) return undefined;
-  const providers = part.allowProviderSearch === false && part.provider
-    ? { [part.provider]: pricingData[part.provider] ?? {} } : pricingData;
-  const pricing = findPricingModel(providers, part.provider ?? null, part.model ?? null);
+  const provider = part.provider ? pricingProviderId(pricingData, part.provider) : null;
+  const providers = part.allowProviderSearch === false && provider
+    ? { [provider]: pricingData[provider] ?? {} } : pricingData;
+  const pricing = findPricingModel(providers, provider, part.model ?? null);
   const cost = pricing?.model.cost;
   if (!cost) return undefined;
   const input = priceTokens(part.inputTokens, cost.input);

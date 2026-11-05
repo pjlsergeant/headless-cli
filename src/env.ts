@@ -26,6 +26,7 @@ export const defaultForwardedEnvNames = [
   "PI_CODING_AGENT_MODELS",
   "PI_CODING_AGENT_PROVIDER",
   "SAKANA_API_KEY",
+  "ZAI_API_KEY",
 ];
 
 export interface ForwardedEnvEntry {

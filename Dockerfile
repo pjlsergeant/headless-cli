@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim@sha256:d415caac2f1f77b98caaf9415c5f807e14bc8d7bdea62561ea2fef4fbd08a73c
+FROM node:22-bookworm-slim
 
 LABEL org.opencontainers.image.source=https://github.com/RobertTLange/headless-cli
 
@@ -8,45 +8,59 @@ RUN apt-get update \
 
 RUN mkdir -p /headless-home && chown node:node /headless-home
 
+# Everything below installs the latest release of each agent CLI at build
+# time. Those RUN lines never change, so a layer cache would keep serving
+# stale CLIs: CI passes a fresh AGENTS_REFRESH per run, and `headless docker
+# build` builds with --pull --no-cache. Using the ARG here invalidates this
+# layer and, through the chain, every agent layer after it, while the apt
+# layer above stays cacheable.
+ARG AGENTS_REFRESH
+RUN echo "Installing latest agent CLIs (refresh ${AGENTS_REFRESH:-unset})"
+
 RUN npm install -g \
-  @anthropic-ai/claude-code@2.1.119 \
-  @google/gemini-cli@0.39.1 \
-  @mariozechner/pi-coding-agent@0.70.2 \
-  @openai/codex@0.147.0 \
-  opencode-ai@1.14.25
+  @anthropic-ai/claude-code \
+  @google/gemini-cli \
+  @mariozechner/pi-coding-agent \
+  @openai/codex \
+  opencode-ai
 
 ARG TARGETARCH
-ARG CURSOR_AGENT_VERSION=2026.04.17-787b533
-ARG CURSOR_AGENT_SHA256_AMD64=942b2b583239497715f2390336eb8e2df3673703bd167bd59f7be33a27e15c5a
-ARG CURSOR_AGENT_SHA256_ARM64=985191ffc606da1317e1399f99306481f58643f345ed2252033b011504c780ce
-ARG AGY_VERSION=1.1.8
-ARG AGY_SHA256_AMD64=e92e6215532b3ce84455e341944067753ad90f6d24cebcec8002ce137e5162ce
-ARG AGY_SHA256_ARM64=e75cebb03fce0fcad7d3bb682eb84c356a3c50ff8fb3dc4a89d2051f34fca0ab
+
+# Grok's installer writes its binary under $HOME/.grok, which is the agent's
+# runtime config directory inside the container (seeded or mounted per run).
+# Install under a throwaway HOME and copy the resolved binary out instead.
+# Putting the installer's bin dir on PATH stops it from symlinking grok and
+# agent into /usr/local/bin (agent belongs to Cursor, installed next).
+RUN set -eu; \
+  grok_home="$(mktemp -d)"; \
+  curl -fsSL https://x.ai/cli/install.sh -o "${grok_home}/install.sh"; \
+  HOME="${grok_home}" PATH="${grok_home}/.grok/bin:${PATH}" bash "${grok_home}/install.sh"; \
+  install -m 0755 "$(readlink -f "${grok_home}/.grok/bin/grok")" /usr/local/bin/grok; \
+  rm -rf "${grok_home}"; \
+  test -x /usr/local/bin/grok
+
+# Cursor's official installer always installs the current release into
+# $HOME/.local/share/cursor-agent/versions/<version>; move that tree to a
+# non-root path so it works for any container user.
+RUN set -eu; \
+  cursor_home="$(mktemp -d)"; \
+  curl -fsSL https://cursor.com/install -o "${cursor_home}/install.sh"; \
+  HOME="${cursor_home}" bash "${cursor_home}/install.sh"; \
+  cursor_dir="$(dirname "$(readlink -f "${cursor_home}/.local/bin/cursor-agent")")"; \
+  rm -rf /opt/cursor-agent; \
+  mv "${cursor_dir}" /opt/cursor-agent; \
+  rm -rf "${cursor_home}"; \
+  ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent; \
+  ln -sf /usr/local/bin/cursor-agent /usr/local/bin/agent
 
 RUN set -eu; \
   case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-    amd64) cursor_arch="x64"; cursor_sha256="${CURSOR_AGENT_SHA256_AMD64}" ;; \
-    arm64) cursor_arch="arm64"; cursor_sha256="${CURSOR_AGENT_SHA256_ARM64}" ;; \
-    *) echo "unsupported Cursor Agent architecture: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
-  esac; \
-  cursor_tarball="/tmp/cursor-agent.tar.gz"; \
-  curl "https://downloads.cursor.com/lab/${CURSOR_AGENT_VERSION}/linux/${cursor_arch}/agent-cli-package.tar.gz" -fsSL -o "${cursor_tarball}"; \
-  echo "${cursor_sha256}  ${cursor_tarball}" | sha256sum -c -; \
-  mkdir -p /opt/cursor-agent \
-  && tar --strip-components=1 -xzf "${cursor_tarball}" -C /opt/cursor-agent \
-  && rm -f "${cursor_tarball}" \
-  && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent \
-  && ln -sf /usr/local/bin/cursor-agent /usr/local/bin/agent
-
-RUN set -eu; \
-  case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-    amd64) agy_file="agy_cli_linux_x64.tar.gz"; agy_sha256="${AGY_SHA256_AMD64}" ;; \
-    arm64) agy_file="agy_cli_linux_arm64.tar.gz"; agy_sha256="${AGY_SHA256_ARM64}" ;; \
+    amd64) agy_file="agy_cli_linux_x64.tar.gz" ;; \
+    arm64) agy_file="agy_cli_linux_arm64.tar.gz" ;; \
     *) echo "unsupported Antigravity CLI architecture: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
   esac; \
   agy_tarball="/tmp/agy.tar.gz"; \
-  curl "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${agy_file}" -fsSL -o "${agy_tarball}"; \
-  echo "${agy_sha256}  ${agy_tarball}" | sha256sum -c -; \
+  curl "https://github.com/google-antigravity/antigravity-cli/releases/latest/download/${agy_file}" -fsSL -o "${agy_tarball}"; \
   tar -xzf "${agy_tarball}" -C /tmp antigravity; \
   install -m 0755 /tmp/antigravity /usr/local/bin/agy; \
   rm -f "${agy_tarball}" /tmp/antigravity

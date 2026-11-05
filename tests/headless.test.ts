@@ -3344,7 +3344,9 @@ test("CLI docker build prints the packaged Dockerfile build command", async () =
   });
 
   assert.equal(code, 0);
-  assert.match(stdout.join(""), /^docker build -t headless-local:dev -f .*Dockerfile /);
+  // The Dockerfile installs unpinned latest CLIs, so a cached build would
+  // silently keep stale ones.
+  assert.match(stdout.join(""), /^docker build --pull --no-cache -t headless-local:dev -f .*Dockerfile /);
 });
 
 test("CLI docker build runs docker with a custom image tag", async () => {
@@ -3377,8 +3379,8 @@ test("CLI docker build runs docker with a custom image tag", async () => {
     const args = JSON.parse(readFileSync(captureFile, "utf8"));
     assert.equal(code, 0);
     assert.equal(stdout.join(""), "built\n");
-    assert.deepEqual(args.slice(0, 4), ["build", "-t", "custom/headless:dev", "-f"]);
-    assert.match(args[4], /Dockerfile$/);
+    assert.deepEqual(args.slice(0, 6), ["build", "--pull", "--no-cache", "-t", "custom/headless:dev", "-f"]);
+    assert.match(args[6], /Dockerfile$/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -4025,6 +4027,82 @@ test("CLI --usage does not attribute or price a Codex profile as OpenAI", async 
     assert.equal(usage.provider, null);
     assert.equal(usage.pricingStatus, "missing");
     assert.equal(usage.cost, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI --usage prices a Codex profile from the profile's model and provider", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-test-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const binDir = join(dir, "bin");
+    const codexHome = join(dir, "codex-home");
+    mkdirSync(binDir);
+    mkdirSync(codexHome);
+    writeFileSync(
+      join(codexHome, "zai.config.toml"),
+      'model = "glm-5.3"\nmodel_provider = "zai"\n\n[model_providers.zai]\nname = "Z.AI"\nenv_key = "ZAI_API_KEY"\n',
+    );
+    const binary = join(binDir, "codex");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "setTimeout(() => {",
+        "  console.log(JSON.stringify({ type: 'agent_message', text: 'final answer' }));",
+        "  console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1000000, output_tokens: 1000000 } }));",
+        "}, 180);",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          zai: {
+            models: {
+              "glm-5.3": { cost: { input: 1, output: 4 } },
+              "glm-5": { cost: { input: 2, output: 8 } },
+            },
+          },
+        }),
+      );
+
+    const run = async (extra: string[]) => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runCli(["codex", "--profile", "zai", ...extra, "--prompt", "hello", "--usage"], {
+        env: {
+          ...process.env,
+          CODEX_HOME: codexHome,
+          CODEX_MODEL: undefined,
+          HEADLESS_MODELS_DEV_CACHE: "",
+          NO_COLOR: "1",
+          PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        },
+        stderr: (text) => stderr.push(text),
+        stderrIsTTY: true,
+        stdout: (text) => stdout.push(text),
+      });
+      assert.equal(code, 0, stderr.join(""));
+      return {
+        stderr: stderr.join(""),
+        usage: JSON.parse(stdout.join("").trim().split("\n")[1] as string).usage,
+      };
+    };
+
+    const fromProfile = await run([]);
+    assert.equal(fromProfile.usage.provider, "zai");
+    assert.equal(fromProfile.usage.model, "glm-5.3");
+    assert.equal(fromProfile.usage.cost.total, 5);
+    assert.match(fromProfile.stderr, /\[codex-glm-5\.3-default\]/);
+
+    const overridden = await run(["--model", "glm-5"]);
+    assert.equal(overridden.usage.provider, "zai");
+    assert.equal(overridden.usage.model, "glm-5");
+    assert.equal(overridden.usage.cost.total, 10);
   } finally {
     globalThis.fetch = originalFetch;
     rmSync(dir, { force: true, recursive: true });

@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { rootTomlString as readRootTomlString, UninspectableTomlError } from "./root-toml.js";
 import type { HeadlessConfig } from "./config.js";
 import type { AgentName, BillingMode, BuildOptions, Env } from "./types.js";
 
@@ -193,36 +194,12 @@ function rejectCodexLoginRestriction(env: Env, conflicting: "api" | "chatgpt"): 
 }
 
 function rootTomlString(content: string | undefined, key: string): string | undefined {
-  let multiline: string | undefined;
-  for (const line of (content ?? "").split(/\r?\n/)) {
-    if (multiline) {
-      if (line.includes(multiline)) multiline = undefined;
-      continue;
-    }
-    const trimmed = line.trim();
-    if (trimmed.startsWith("[")) break;
-    if (trimmed.startsWith("#")) continue;
-    const assignment = trimmed.match(/^("(?:[^"\\]|\\.)*"|'[^']*'|[\w-]+)\s*=\s*(.*)$/);
-    if (!assignment) continue;
-    const name = /^["']/.test(assignment[1]) ? tomlString(assignment[1]) : assignment[1];
-    const rawValue = assignment[2];
-    const triple = rawValue.match(/^("""|''')/);
-    if (triple) {
-      if (name === key) throw uninspectableToml();
-      if (!rawValue.slice(3).includes(triple[1])) multiline = triple[1];
-      continue;
-    }
-    if (name !== key) continue;
-    const single = rawValue.match(/^("(?:[^"\\]|\\.)*"|'[^']*')\s*(?:#.*)?$/);
-    if (!single) throw uninspectableToml();
-    return tomlString(single[1]);
+  try {
+    return readRootTomlString(content, key);
+  } catch (error) {
+    if (error instanceof UninspectableTomlError) throw uninspectableToml();
+    throw error;
   }
-  return undefined;
-}
-
-function tomlString(value: string): string {
-  if (value.startsWith("'")) return value.slice(1, -1);
-  try { return JSON.parse(value) as string; } catch { throw uninspectableToml(); }
 }
 
 function uninspectableToml(): BillingError {

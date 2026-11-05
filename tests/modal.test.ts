@@ -79,7 +79,7 @@ test("builds a printable Modal sandbox summary command", () => {
 test("collects Modal env from curated, command, explicit, and HOME entries", () => {
   assert.deepEqual(
     collectModalEnv(
-      { OPENAI_API_KEY: "sk-test", SAKANA_API_KEY: "sakana-test", EXTRA_TOKEN: "extra", HOME: "/home/rob" },
+      { OPENAI_API_KEY: "sk-test", SAKANA_API_KEY: "sakana-test", ZAI_API_KEY: "zai-test", EXTRA_TOKEN: "extra", HOME: "/home/rob" },
       { CURSOR_API_KEY: "cursor" },
       ["EXTRA_TOKEN", "INLINE_TOKEN=value"],
     ),
@@ -90,6 +90,7 @@ test("collects Modal env from curated, command, explicit, and HOME entries", () 
       INLINE_TOKEN: "value",
       OPENAI_API_KEY: "sk-test",
       SAKANA_API_KEY: "sakana-test",
+      ZAI_API_KEY: "zai-test",
     },
   );
 });

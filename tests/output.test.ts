@@ -305,6 +305,25 @@ test("extracts Codex usage from turn completed trace and prices with models.dev 
   });
 });
 
+test("prices a profile provider id case-insensitively against models.dev", () => {
+  // Z.AI's own docs spell the Codex provider id "ZAI"; models.dev uses "zai".
+  const trace = JSON.stringify({
+    type: "turn.completed",
+    usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+  });
+  const summary = priceUsageSummary(
+    extractUsageSummary("codex", trace, { provider: "ZAI", model: "glm-5.3", useDefaultProvider: false }),
+    {
+      zai: { models: { "glm-5.3": { cost: { input: 1, output: 4 } } } },
+      other: { models: { "glm-5.3": { cost: { input: 100, output: 100 } } } },
+    },
+  );
+
+  assert.equal(summary.provider, "ZAI");
+  assert.equal(summary.pricingStatus, "priced");
+  assert.equal(summary.cost?.total, 5);
+});
+
 test("does not report non-finite list-price estimates", () => {
   const trace = JSON.stringify({
     type: "turn.completed",

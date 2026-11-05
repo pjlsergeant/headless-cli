@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
+import { rootTomlString } from "./root-toml.js";
 import type { Env } from "./types.js";
 
 const maxProfileBytes = 1024 * 1024;
@@ -43,10 +44,14 @@ export function readCodexBaseFiles(env: Env): CodexBaseFile[] {
   ].filter((file): file is CodexBaseFile => file !== undefined);
 }
 
-export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFiles {
+function codexProfilePath(env: Env, profile: string): string {
   validateCodexProfileName(profile);
+  return resolve(codexHomePath(env), `${profile}.config.toml`);
+}
+
+export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFiles {
+  const profilePath = codexProfilePath(env, profile);
   const codexHome = codexHomePath(env);
-  const profilePath = resolve(codexHome, `${profile}.config.toml`);
   const content = readBoundedRegularFile(profilePath, maxProfileBytes, "Codex profile");
   const assignment = catalogAssignment.exec(content);
   if (!assignment) {
@@ -66,6 +71,41 @@ export function readCodexProfileFiles(env: Env, profile: string): CodexProfileFi
     content,
     path: profilePath,
   };
+}
+
+export interface CodexProfileModelSelection {
+  model?: string;
+  provider?: string;
+}
+
+/**
+ * The model and provider a profile run uses, to label and price it. Codex
+ * overlays the profile on `config.toml`, so each key falls back to the root
+ * of `<CODEX_HOME>/config.toml` when the profile does not set it. Best
+ * effort: an unreadable file or an undecodable value yields `{}` so usage
+ * reporting never fails a run that Codex itself would accept.
+ */
+export function readCodexProfileModelSelection(env: Env, profile: string): CodexProfileModelSelection {
+  try {
+    const profileContent = readBoundedRegularFile(codexProfilePath(env, profile), maxProfileBytes, "Codex profile");
+    let baseContent: string | undefined;
+    let baseRead = false;
+    const setting = (key: string): string | undefined => {
+      const own = rootTomlString(profileContent, key);
+      if (own !== undefined) return own.trim() || undefined;
+      if (!baseRead) {
+        const base = readOptionalCodexFile(join(codexHomePath(env), "config.toml"), ".codex/config.toml", maxProfileBytes);
+        baseContent = base?.content;
+        baseRead = true;
+      }
+      return rootTomlString(baseContent, key)?.trim() || undefined;
+    };
+    const model = setting("model");
+    const provider = setting("model_provider");
+    return { ...(model ? { model } : {}), ...(provider ? { provider } : {}) };
+  } catch {
+    return {};
+  }
 }
 
 export function codexProfileSeedFiles(
