@@ -149,7 +149,8 @@ test("CLI grok --tmux --wait pins the session id and reads the final message fro
         "const args = process.argv.slice(2);",
         "fs.appendFileSync(process.env.HEADLESS_TMUX_CAPTURE, JSON.stringify(args) + '\\n');",
         "if (args[0] === 'new-session') {",
-        "  const sessionId = /--session-id\\s+(\\S+)/.exec(args[6])[1];",
+        "  const launch = args.find((arg) => /--session-id\\s/.test(arg));",
+        "  const sessionId = /--session-id\\s+(\\S+)/.exec(launch)[1];",
         `  const sessionDir = path.join(${JSON.stringify(sessionsRoot)}, sessionId);`,
         "  fs.mkdirSync(sessionDir, { recursive: true });",
         `  fs.copyFileSync(${JSON.stringify(transcript)}, path.join(sessionDir, 'updates.jsonl'));`,
@@ -166,7 +167,12 @@ test("CLI grok --tmux --wait pins the session id and reads the final message fro
       stdout: (text) => stdout.push(text),
     });
 
-    const launchCommand = readFileSync(captureFile, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0][6];
+    const newSession = readFileSync(captureFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .find((args) => args[0] === "new-session");
+    const launchCommand = newSession?.find((arg) => /--session-id\s/.test(arg)) ?? "";
     assert.equal(code, 0);
     assert.equal(stdout.join(""), "Final pinned answer.\n");
     assert.match(launchCommand, /--session-id /);

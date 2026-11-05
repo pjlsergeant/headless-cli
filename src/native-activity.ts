@@ -195,6 +195,19 @@ function parseGrokActivityEvents(text: string): NativeActivityEvent[] {
       continue;
     }
     if (sessionUpdate === "turn_completed") {
+      // turn_completed is written even while a tool call is still open: a
+      // backgrounded bash call is persisted with no status (acp_conversion.rs
+      // ToolOutput::Bash) and never completes inside the turn. Close every
+      // call opened so far so the turn end is not masked as a pending tool.
+      const open = new Set<string>();
+      for (const event of events) {
+        if (!event.toolUseId) continue;
+        if (event.kind === "tool_use") open.add(event.toolUseId);
+        if (event.kind === "tool_result") open.delete(event.toolUseId);
+      }
+      for (const toolUseId of open) {
+        events.push({ ...base, kind: "tool_result", text: [], toolUseId });
+      }
       // agent_result is the error text of a failed turn. A turn that ends with
       // no answer at all (rate_limit carries agent_result null) names its stop
       // reason, so --tmux --wait returns instead of waiting for text that never comes.

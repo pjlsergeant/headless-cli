@@ -149,6 +149,47 @@ test("grok activity for a failed turn reports the error text when no answer was 
   });
 });
 
+test("grok activity treats turn_completed as terminal even with a backgrounded tool call still open", () => {
+  withWorkspace(({ home, workDir, realWorkDir }) => {
+    // A backgrounded bash call is persisted as a tool_call_update with no status
+    // (xai-grok-shell/src/session/acp_conversion.rs ToolOutput::Bash), so it
+    // never gets a completed/failed update before the turn ends.
+    const contents = [
+      grokEnvelope(grokTextChunk("user_message_chunk", "start the server"), ts),
+      grokEnvelope({ sessionUpdate: "tool_call", toolCallId: "bg1", title: "bash", kind: "execute", status: "pending" }, ts),
+      grokEnvelope({ sessionUpdate: "tool_call_update", toolCallId: "bg1", content: [{ type: "text", text: "started" }] }, ts),
+      grokEnvelope(grokTextChunk("agent_message_chunk", "Server is running in the background."), ts),
+      grokEnvelope(grokTurnCompleted(), ts, "_x.ai/session/update"),
+      "",
+    ].join("\n");
+    writeSession(join(home, ".grok", "sessions"), grokSessionDirName(realWorkDir), grokSessionId, contents);
+    const transcript = resolveNativeTranscript("grok", grokSessionId, workDir, { HOME: home });
+    for (const terminalDonePrecedence of [true, false]) {
+      const activity = deriveNativeTranscriptActivity("grok", transcript, { nowMs: ts * 1000 + 1000, terminalDonePrecedence });
+      assert.equal(activity?.status, "idle");
+      assert.equal(activity?.reason, "terminal_done");
+      assert.equal(activity?.message, "Server is running in the background.");
+    }
+  });
+});
+
+test("grok tool calls opened after turn_completed still count as running", () => {
+  withWorkspace(({ home, workDir, realWorkDir }) => {
+    const contents = [
+      grokEnvelope(grokTextChunk("user_message_chunk", "one"), ts),
+      grokEnvelope({ sessionUpdate: "tool_call", toolCallId: "bg1", title: "bash", kind: "execute", status: "pending" }, ts),
+      grokEnvelope(grokTurnCompleted(), ts, "_x.ai/session/update"),
+      grokEnvelope(grokTextChunk("user_message_chunk", "two"), ts),
+      grokEnvelope({ sessionUpdate: "tool_call", toolCallId: "t2", title: "bash", kind: "execute", status: "pending" }, ts),
+      "",
+    ].join("\n");
+    writeSession(join(home, ".grok", "sessions"), grokSessionDirName(realWorkDir), grokSessionId, contents);
+    const transcript = resolveNativeTranscript("grok", grokSessionId, workDir, { HOME: home });
+    const activity = deriveNativeTranscriptActivity("grok", transcript, { nowMs: ts * 1000 + 1000, terminalDonePrecedence: true });
+    assert.equal(activity?.reason, "pending_tool_use_fresh");
+  });
+});
+
 test("grok activity names the stop reason of a turn that ended without any text", () => {
   withWorkspace(({ home, workDir, realWorkDir }) => {
     // An earlier turn's answer must not stand in for this turn's empty result.
