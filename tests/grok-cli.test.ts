@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runCli } from "../src/cli.ts";
+import { listCronJobs } from "../src/cron.ts";
 import { grokNotSignedInLine, grokSessionId, grokStreamingJsonLines, grokUpdatesJsonl } from "./grok-fixtures.ts";
 import { grokSessionDirName } from "../src/native-transcripts.ts";
 
@@ -234,6 +235,54 @@ test("CLI grok --docker/--modal accepts an xAI key from the environment or an ex
       });
       assert.equal(code, 0, testCase.args.join(" "));
       assert.match(stdout.join(""), /grok/, testCase.args.join(" "));
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI grok --docker/--modal skips the key check when auth may come from docker args, an image or a secret", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-grok-"));
+  try {
+    writeFakeGrok(dir, grokStreamingJsonLines());
+    const workDir = join(dir, "work");
+    mkdirSync(workDir, { recursive: true });
+    // Headless cannot see a key passed through these, so it must not refuse the run.
+    const cases = [
+      ["--docker", "--docker-arg", "--env-file=/secrets/xai.env"],
+      ["--docker", "--docker-image", "registry.example/grok-with-key:1"],
+      ["--modal", "--modal-image", "registry.example/grok-with-key:1"],
+      ["--modal", "--modal-secret", "xai"],
+    ];
+    for (const args of cases) {
+      const stderr: string[] = [];
+      const code = await runCli(["grok", "--prompt", "hi", "--work-dir", workDir, ...args, "--print-command"], {
+        env: isolatedEnv(dir),
+        stdout: () => undefined,
+        stderr: (text) => stderr.push(text),
+      });
+      assert.equal(code, 0, `${args.join(" ")}: ${stderr.join("")}`);
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI cron add grok --docker/--modal refuses to schedule a job that has no xAI key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-grok-"));
+  try {
+    writeFakeGrok(dir, grokStreamingJsonLines());
+    const cronDir = join(dir, "cron");
+    for (const sandbox of [["--docker"], ["--modal"]]) {
+      const stderr: string[] = [];
+      const code = await runCli(["cron", "add", "grok", "--every", "1h", "--prompt", "hi", ...sandbox], {
+        env: isolatedEnv(dir, { HEADLESS_CRON_DIR: cronDir }),
+        stdout: () => undefined,
+        stderr: (text) => stderr.push(text),
+      });
+      assert.notEqual(code, 0, sandbox.join(" "));
+      assert.match(stderr.join(""), /grok in Docker or Modal needs XAI_API_KEY/, sandbox.join(" "));
+      assert.deepEqual(listCronJobs({ HEADLESS_CRON_DIR: cronDir, HOME: join(dir, "home") }), [], sandbox.join(" "));
     }
   } finally {
     rmSync(dir, { force: true, recursive: true });
