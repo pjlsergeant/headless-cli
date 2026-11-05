@@ -42,13 +42,13 @@ Headless normalizes the small differences between coding-agent CLIs: prompts, mo
 Run once with `npx`:
 
 ```bash
-npx -y @roberttlange/headless codex --prompt "Hello world"
+npx -y @sgntai/headless codex --prompt "Hello world"
 ```
 
 Or install globally:
 
 ```bash
-npm install -g @roberttlange/headless
+npm install -g @sgntai/headless
 headless codex --prompt "Hello world"
 ```
 

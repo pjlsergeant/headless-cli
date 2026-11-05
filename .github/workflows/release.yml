@@ -131,7 +131,7 @@ jobs:
           PACKAGE_VERSION: ${{ steps.package-version.outputs.version }}
         run: |
           npm_error=$(mktemp)
-          if npm view "@roberttlange/headless@$PACKAGE_VERSION" version >/dev/null 2>"$npm_error"; then
+          if npm view "@sgntai/headless@$PACKAGE_VERSION" version >/dev/null 2>"$npm_error"; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           elif grep -q "E404" "$npm_error"; then
             echo "published=false" >> "$GITHUB_OUTPUT"
@@ -191,7 +191,7 @@ jobs:
           METADATA_PATH="$metadata_path" node - <<'NODE'
           const fs = require("node:fs");
           const metadata = JSON.parse(fs.readFileSync(process.env.METADATA_PATH, "utf8"));
-          if (metadata.name !== "@roberttlange/headless") {
+          if (metadata.name !== "@sgntai/headless") {
             throw new Error(`unexpected npm package name: ${metadata.name}`);
           }
           if (metadata.version !== process.env.EXPECTED_VERSION) {

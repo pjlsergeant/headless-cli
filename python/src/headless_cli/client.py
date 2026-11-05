@@ -402,7 +402,7 @@ class Headless:
                 (
                     "installed Headless CLI returned an invalid capabilities "
                     "response. Please upgrade with "
-                    "`npm install -g @roberttlange/headless@latest`."
+                    "`npm install -g @sgntai/headless@latest`."
                 ),
                 _command_result(capabilities),
             )
@@ -413,7 +413,7 @@ class Headless:
                     "incompatible Headless CLI SDK protocol "
                     f"{version!r}; expected {SDK_PROTOCOL_VERSION}. "
                     "Please upgrade with "
-                    "`npm install -g @roberttlange/headless@latest`."
+                    "`npm install -g @sgntai/headless@latest`."
                 ),
                 _command_result(capabilities),
             )
@@ -457,7 +457,7 @@ def _version_error(command: CommandResult) -> HeadlessVersionError:
         (
             "installed Headless CLI does not support SDK protocol v1. "
             "Please upgrade with "
-            "`npm install -g @roberttlange/headless@latest`."
+            "`npm install -g @sgntai/headless@latest`."
         ),
         command,
     )

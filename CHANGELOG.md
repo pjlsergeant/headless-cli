@@ -2,6 +2,7 @@
 
 ## TBD
 
+- Renamed the npm package to `@sgntai/headless` (fork).
 - Changed the bundled Dockerfile to be unpinned: it builds on the plain `node:22-bookworm-slim` tag and installs the latest Claude Code, Gemini, Pi, Codex, and OpenCode npm releases, the latest Cursor Agent through Cursor's official installer, and the latest Antigravity CLI GitHub release, without version pins or SHA-256 checks. `headless docker build` now builds with `--pull --no-cache`, and the image workflow pulls the base image and passes a per-run `AGENTS_REFRESH` build argument that invalidates the cached agent layers, so every build picks up new agent versions. Antigravity auto-update stays disabled.
 - Added the xAI Grok CLI (`grok`) to the Docker image, installed with its official installer and copied to `/usr/local/bin/grok` so the container's `~/.grok` stays free for runtime config.
 - Fixed `--usage` and SDK results reporting `provider: null, model: null` for Codex `--profile` runs, and the wait spinner showing the profile name instead of the model: the profile's top-level `model` and `model_provider` are now used, falling back to the root of `<CODEX_HOME>/config.toml` as Codex does. A Headless model (`--model`, `CODEX_MODEL`, or a configured agent or role model) still wins. Profiles whose provider id matches a models.dev provider, case-insensitively (such as `zai` or `ZAI`), are now priced.

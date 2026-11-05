@@ -141,7 +141,7 @@ test("npm OIDC is isolated from package build and lifecycle scripts", () => {
   assert.match(npmPublishBlock, /uses: actions\/download-artifact@/);
   assert.match(npmPublishBlock, /tarballs=\("\$PWD"\/npm-package\/\*\.tgz\)/);
   assert.doesNotMatch(npmPublishBlock, /^\s+npm (?:ci|run check|pack(?:\s|$))/m);
-  assert.match(npmPublishBlock, /metadata\.name !== "@roberttlange\/headless"/);
+  assert.match(npmPublishBlock, /metadata\.name !== "@sgntai\/headless"/);
   assert.match(npmPublishBlock, /metadata\.version !== process\.env\.EXPECTED_VERSION/);
   assert.match(
     npmPublishBlock,

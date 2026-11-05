@@ -1,5 +1,5 @@
 {
-  "name": "@roberttlange/headless",
+  "name": "@sgntai/headless",
   "version": "0.6.1",
   "description": "One CLI entrypoint for running coding agents in headless mode.",
   "license": "Apache-2.0",

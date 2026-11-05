@@ -410,7 +410,7 @@ class AsyncHeadless:
                 (
                     "installed Headless CLI returned an invalid capabilities "
                     "response. Please upgrade with "
-                    "`npm install -g @roberttlange/headless@latest`."
+                    "`npm install -g @sgntai/headless@latest`."
                 ),
                 _command_result(capabilities),
             )
@@ -421,7 +421,7 @@ class AsyncHeadless:
                     "incompatible Headless CLI SDK protocol "
                     f"{version!r}; expected {SDK_PROTOCOL_VERSION}. "
                     "Please upgrade with "
-                    "`npm install -g @roberttlange/headless@latest`."
+                    "`npm install -g @sgntai/headless@latest`."
                 ),
                 _command_result(capabilities),
             )

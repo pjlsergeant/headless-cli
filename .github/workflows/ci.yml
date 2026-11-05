@@ -42,7 +42,7 @@ jobs:
       - name: Smoke test npx executable
         run: |
           npm pack --pack-destination /tmp
-          npx -y --package /tmp/roberttlange-headless-*.tgz headless --help
+          npx -y --package /tmp/sgntai-headless-*.tgz headless --help
 
   windows-run-storage:
     name: Windows run storage / Node ${{ matrix.node-version }}
