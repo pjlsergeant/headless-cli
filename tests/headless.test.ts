@@ -3344,7 +3344,9 @@ test("CLI docker build prints the packaged Dockerfile build command", async () =
   });
 
   assert.equal(code, 0);
-  assert.match(stdout.join(""), /^docker build -t headless-local:dev -f .*Dockerfile /);
+  // The Dockerfile installs unpinned latest CLIs, so a cached build would
+  // silently keep stale ones.
+  assert.match(stdout.join(""), /^docker build --pull --no-cache -t headless-local:dev -f .*Dockerfile /);
 });
 
 test("CLI docker build runs docker with a custom image tag", async () => {
@@ -3377,8 +3379,8 @@ test("CLI docker build runs docker with a custom image tag", async () => {
     const args = JSON.parse(readFileSync(captureFile, "utf8"));
     assert.equal(code, 0);
     assert.equal(stdout.join(""), "built\n");
-    assert.deepEqual(args.slice(0, 4), ["build", "-t", "custom/headless:dev", "-f"]);
-    assert.match(args[4], /Dockerfile$/);
+    assert.deepEqual(args.slice(0, 6), ["build", "--pull", "--no-cache", "-t", "custom/headless:dev", "-f"]);
+    assert.match(args[6], /Dockerfile$/);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

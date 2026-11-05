@@ -235,7 +235,7 @@ In all Docker modes, the workdir must remain separate from the reserved `/headle
 
 Docker mode cannot be combined with `--tmux`, `send`, `rename`, or `--list`.
 
-For local development or when the default image has not been published yet, build the packaged Dockerfile explicitly. The Dockerfile is unpinned: it builds on the current `node:22-bookworm-slim` and installs the latest release of every agent CLI (Claude Code, Codex, Gemini, OpenCode, Pi, Cursor Agent, Antigravity, and Grok) at build time, so rebuild to pick up new versions. Antigravity's self-update is disabled in the image.
+For local development or when the default image has not been published yet, build the packaged Dockerfile explicitly. The Dockerfile is unpinned: it builds on the current `node:22-bookworm-slim` and installs the latest release of every agent CLI (Claude Code, Codex, Gemini, OpenCode, Pi, Cursor Agent, Antigravity, and Grok) at build time. `headless docker build` runs `docker build --pull --no-cache`, so every local build pulls the current base image and installs fresh agent CLIs; published images get the same refresh on every release build. Antigravity's self-update is disabled in the image.
 
 ```bash
 headless docker doctor

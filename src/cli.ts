@@ -1059,7 +1059,12 @@ function dockerfilePath(): string {
 }
 
 function buildDockerImageCommand(image: string): BuiltCommand {
-  return { command: "docker", args: ["build", "-t", image, "-f", dockerfilePath(), packageRoot()] };
+  // The Dockerfile installs unpinned latest agent CLIs from byte-stable RUN
+  // lines, so a cached build would keep stale CLIs (and a stale base).
+  return {
+    command: "docker",
+    args: ["build", "--pull", "--no-cache", "-t", image, "-f", dockerfilePath(), packageRoot()],
+  };
 }
 
 function renderDockerDoctor(check: Awaited<ReturnType<typeof checkDocker>>, image: string): string {

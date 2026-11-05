@@ -9,7 +9,14 @@ RUN apt-get update \
 RUN mkdir -p /headless-home && chown node:node /headless-home
 
 # Everything below installs the latest release of each agent CLI at build
-# time: rebuild the image to pick up new versions.
+# time. Those RUN lines never change, so a layer cache would keep serving
+# stale CLIs: CI passes a fresh AGENTS_REFRESH per run, and `headless docker
+# build` builds with --pull --no-cache. Using the ARG here invalidates this
+# layer and, through the chain, every agent layer after it, while the apt
+# layer above stays cacheable.
+ARG AGENTS_REFRESH
+RUN echo "Installing latest agent CLIs (refresh ${AGENTS_REFRESH:-unset})"
+
 RUN npm install -g \
   @anthropic-ai/claude-code \
   @google/gemini-cli \
@@ -30,7 +37,7 @@ RUN set -eu; \
   HOME="${grok_home}" PATH="${grok_home}/.grok/bin:${PATH}" bash "${grok_home}/install.sh"; \
   install -m 0755 "$(readlink -f "${grok_home}/.grok/bin/grok")" /usr/local/bin/grok; \
   rm -rf "${grok_home}"; \
-  grok --version
+  test -x /usr/local/bin/grok
 
 # Cursor's official installer always installs the current release into
 # $HOME/.local/share/cursor-agent/versions/<version>; move that tree to a

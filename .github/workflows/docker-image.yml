@@ -74,6 +74,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The Dockerfile installs unpinned latest agent CLIs; refresh the base
+          # image and bust the agent layers in the shared cache on every run.
+          pull: true
+          build-args: |
+            AGENTS_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: |
             type=gha,scope=docker-${{ github.event_name == 'workflow_dispatch' && 'main' || github.sha }}
             type=gha,scope=docker-main

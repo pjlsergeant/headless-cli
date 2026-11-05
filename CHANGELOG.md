@@ -2,7 +2,7 @@
 
 ## TBD
 
-- Changed the bundled Dockerfile to be unpinned: it builds on the plain `node:22-bookworm-slim` tag and installs the latest Claude Code, Gemini, Pi, Codex, and OpenCode npm releases, the latest Cursor Agent through Cursor's official installer, and the latest Antigravity CLI GitHub release, without version pins or SHA-256 checks. Rebuild the image to pick up new agent versions. Antigravity auto-update stays disabled.
+- Changed the bundled Dockerfile to be unpinned: it builds on the plain `node:22-bookworm-slim` tag and installs the latest Claude Code, Gemini, Pi, Codex, and OpenCode npm releases, the latest Cursor Agent through Cursor's official installer, and the latest Antigravity CLI GitHub release, without version pins or SHA-256 checks. `headless docker build` now builds with `--pull --no-cache`, and the image workflow pulls the base image and passes a per-run `AGENTS_REFRESH` build argument that invalidates the cached agent layers, so every build picks up new agent versions. Antigravity auto-update stays disabled.
 - Added the xAI Grok CLI (`grok`) to the Docker image, installed with its official installer and copied to `/usr/local/bin/grok` so the container's `~/.grok` stays free for runtime config.
 - Fixed `--usage`, the wait spinner, and SDK results reporting `provider: null, model: null` for Codex `--profile` runs: the profile's top-level `model` and `model_provider` are now used (an explicit `--model` or `CODEX_MODEL` still wins), so profiles whose provider id matches models.dev, such as `zai`, are priced.
 - Added `ZAI_API_KEY` to the credentials Docker and Modal forward automatically, and documented running Z.AI GLM models through a Codex profile.

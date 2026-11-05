@@ -39,6 +39,23 @@ test("Dockerfile installs every agent CLI unpinned at its latest release", () =>
   }
 });
 
+test("Dockerfile agent layers are invalidated by an AGENTS_REFRESH build arg", () => {
+  // The unpinned install lines are byte-stable, so without a changing build
+  // arg a layer cache would keep serving stale CLIs.
+  const argIndex = dockerfile.search(/^ARG AGENTS_REFRESH$/m);
+  const aptIndex = dockerfile.indexOf("apt-get update");
+  const useIndex = dockerfile.search(/^RUN echo "[^"\n]*\$\{AGENTS_REFRESH:-[^}]*\}[^"\n]*"$/m);
+  const npmIndex = dockerfile.indexOf("npm install -g");
+  assert.ok(aptIndex !== -1 && argIndex > aptIndex, "the apt layer should stay cacheable");
+  assert.ok(useIndex > argIndex, "the ARG must be referenced so its value reaches the layer cache key");
+  assert.ok(useIndex < npmIndex, "the ARG must be used before every agent install");
+  assert.match(dockerWorkflow, /pull: true/);
+  assert.match(
+    dockerWorkflow,
+    /build-args: \|\s+AGENTS_REFRESH=\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+});
+
 test("Dockerfile installs Cursor agent from the official latest installer on a non-root path", () => {
   assert.match(dockerfile, /curl -fsSL https:\/\/cursor\.com\/install -o /);
   assert.doesNotMatch(dockerfile, /curl[^\n]*\|\s*(?:ba)?sh/);
@@ -61,6 +78,9 @@ test("Dockerfile installs grok outside the container home", () => {
   assert.match(dockerfile, /install -m 0755 "\$\(readlink -f "\$\{grok_home\}\/\.grok\/bin\/grok"\)" \/usr\/local\/bin\/grok/);
   assert.match(dockerfile, /rm -rf "\$\{grok_home\}"/);
   assert.doesNotMatch(dockerfile, /\/headless-home\/\.grok/);
+  // Check the copy without executing grok as root at build time.
+  assert.match(dockerfile, /test -x \/usr\/local\/bin\/grok/);
+  assert.doesNotMatch(dockerfile, /grok --version/);
 });
 
 test("Dockerfile links published images to the source repository", () => {
