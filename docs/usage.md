@@ -22,7 +22,7 @@ printf "Review this diff" | headless pi --model claude-opus
 | `codex` | `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check ...` |
 | `cursor` | `agent -p --trust --force --output-format stream-json --model gpt-5.5-medium ...` |
 | `gemini` | `gemini --model gemini-3.1-pro-preview --skip-trust --prompt '' --output-format stream-json --approval-mode yolo` (prompt on stdin) |
-| `grok` | `grok --model grok-4.6 --output-format streaming-json --no-auto-update --always-approve --single=...` |
+| `grok` | `grok --model grok-4.6 --output-format streaming-json --no-auto-update --trust --always-approve --single=...` |
 | `opencode` | `opencode run --format json --model openai/gpt-5.4 --dangerously-skip-permissions ...` |
 | `pi` | `pi --no-session --mode json --provider openai-codex --model gpt-5.5 --tools read,bash,edit,write ...` |
 
@@ -60,7 +60,9 @@ Environment equivalents are also supported: `HEADLESS_ACP_AGENT`, `HEADLESS_ACP_
 
 By default, Headless uses each agent's native auto-approve/bypass mode. Pass `--allow read-only` to use each agent's read-only or planning mode where available. Pass `--allow yolo` to request full tool access explicitly.
 
-For Grok, read-only runs pass `--permission-mode default`, which outranks an always-approve mode saved in grok's own config, so nothing is auto-approved. One-shot read-only runs also restrict built-in tools with `--tools read_file,grep,list_dir,web_search,web_fetch` and remove the MCP bridge with `--disallowed-tools search_tool,use_tool`; grok's headless mode cancels any remaining permission request. The interactive TUI ignores both tool flags, so tmux read-only runs instead pass `--deny Bash --deny Edit --deny MCPTool` permission rules; tmux yolo runs also pass `--trust` so a folder-trust prompt cannot stall the session.
+For Grok, read-only runs pass `--permission-mode default`, which outranks an always-approve mode saved in grok's own config, so nothing is auto-approved. One-shot read-only runs also restrict built-in tools with `--tools read_file,grep,list_dir,web_search,web_fetch` and remove the MCP bridge with `--disallowed-tools search_tool,use_tool`; grok's headless mode cancels any remaining permission request. The interactive TUI ignores both tool flags, so tmux read-only runs instead pass `--deny Bash --deny Edit --deny MCPTool` permission rules.
+
+Every grok tmux session (yolo and read-only) and every one-shot yolo run passes `--trust`, so a folder-trust prompt cannot stall the session and the project's AGENTS.md, skills, hooks and MCP servers load. `--trust` permanently marks the work directory as trusted in grok's own trust store (`$GROK_HOME/trusted_folders.toml`), not just for that run. One-shot `--allow read-only` runs do not pass it.
 
 Pass `--reasoning-effort low|medium|high|xhigh` or `--effort low|medium|high|xhigh` to request a normalized reasoning effort for agents with native support. Claude receives `--effort`, Codex receives `model_reasoning_effort`, Cursor combines the model family and effort into Cursor's model variant string, OpenCode receives `--variant` in one-shot mode, Grok receives `--reasoning-effort`, and Pi receives `--thinking`. Docker and Modal inherit the same one-shot command. In tmux mode, Claude, Codex, Cursor, Grok, and Pi receive their interactive effort flags. Antigravity, Gemini, and OpenCode tmux currently accept the option, leave the command unchanged, and print a warning.
 
@@ -182,7 +184,7 @@ Use `headless attach` without a session name to attach to the most recently acti
 
 ## Docker
 
-Docker mode wraps headless execution in `docker run --rm`. By default it is one-shot: the target workdir is mounted at the same absolute path inside the container, existing agent config/auth seed paths are mounted read-only, curated credential environment variables are passed through, and the container home is a temporary filesystem. It runs the selected agent from `ghcr.io/roberttlange/headless:latest` by default. For Antigravity, Docker mounts only the credential files needed for authentication and settings; it does not copy the conversation and brain history stored alongside them into the container home. Grok is seeded the same way, in Docker and Modal: only `~/.grok/auth.json`, `config.toml`, and `mcp_credentials.json`, never its sessions, logs, or downloaded binaries. Folder-trust grants (`trusted_folders.toml`) are not seeded: they are keyed by host path, and because the workdir keeps its host path in the container, a host-trusted repo would otherwise run its project hooks there. A host `GROK_HOME` override is not seeded; inside the container grok uses `~/.grok`.
+Docker mode wraps headless execution in `docker run --rm`. By default it is one-shot: the target workdir is mounted at the same absolute path inside the container, existing agent config/auth seed paths are mounted read-only, curated credential environment variables are passed through, and the container home is a temporary filesystem. It runs the selected agent from `ghcr.io/roberttlange/headless:latest` by default. For Antigravity, Docker mounts only the credential files needed for authentication and settings; it does not copy the conversation and brain history stored alongside them into the container home. For Grok, Docker and Modal (one-shot and durable sessions) seed only `~/.grok/config.toml`. Grok's OAuth login (`auth.json`) and MCP OAuth tokens (`mcp_credentials.json`) are never copied into a container, because their refresh tokens are single-use and a refresh inside the container would invalidate the host login; grok authenticates there only through `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY`, and Headless refuses `--docker`/`--modal` for grok when neither is forwarded (a `--modal-secret` is assumed to supply it). Folder-trust grants (`trusted_folders.toml`) are not seeded either: they are keyed by host path, and because the workdir keeps its host path in the container, a host-trusted repo would otherwise run its project hooks there. Sessions, logs and downloaded binaries stay on the host. A host `GROK_HOME` override is not seeded; inside the container grok uses `~/.grok`.
 
 ```bash
 headless codex --prompt "Fix the failing tests" --docker
@@ -342,7 +344,7 @@ See [orchestration.md](orchestration.md) for `--role`, `--run`, `--node`, `--tea
 - `CURSOR_API_KEY`: passed to Cursor as `--api-key`.
 - `GROK_CLI_BIN`: Grok CLI binary override. Defaults to `grok`.
 - `GROK_HOME`: Grok's own home override (defaults to `~/.grok`); Headless reads Grok auth and session transcripts from it.
-- `XAI_API_KEY`, `GROK_CODE_XAI_API_KEY`: Grok API-key auth, read by grok itself; `--check` reports them as `api`, and `$GROK_HOME/auth.json` (or `GROK_AUTH_PATH`) and `GROK_AUTH_PROVIDER_COMMAND` as `oauth`.
+- `XAI_API_KEY`, `GROK_CODE_XAI_API_KEY`: Grok API-key auth, read by grok itself and required for grok in Docker and Modal; `--check` reports them as `api`, and `$GROK_HOME/auth.json` (or `GROK_AUTH_PATH`) and `GROK_AUTH_PROVIDER_COMMAND` as `oauth` (host only).
 - `PI_CODING_AGENT_BIN`: Pi CLI binary override. Defaults to `pi`.
 - `PI_CODING_AGENT_PROVIDER`: Pi provider override used when the Pi model value does not include `provider/model`.
 - `PI_CODING_AGENT_MODEL`: Pi model override when `--model` is omitted. Accepts `provider/model` or a bare model paired with `PI_CODING_AGENT_PROVIDER`.

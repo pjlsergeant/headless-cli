@@ -49,6 +49,7 @@ test("builds grok one-shot command with streaming-json output and the default mo
       "--output-format",
       "streaming-json",
       "--no-auto-update",
+      "--trust",
       "--always-approve",
       "--single=hello",
     ],
@@ -73,6 +74,7 @@ test("grok one-shot honours GROK_CLI_BIN, model and reasoning effort", () => {
         "--output-format",
         "streaming-json",
         "--no-auto-update",
+        "--trust",
         "--always-approve",
         "--single=hi",
       ],
@@ -101,6 +103,7 @@ test("grok read-only one-shot forces ask mode, restricts built-in tools and stri
     "--single=review",
   ]);
   assert.ok(!args.includes("--always-approve"));
+  assert.ok(!args.includes("--trust"));
 });
 
 test("grok one-shot sessions pin a new id or resume a stored one", () => {
@@ -121,11 +124,13 @@ test("builds interactive grok command with the prompt after --", () => {
   });
 });
 
-test("interactive grok read-only forces ask mode, denies shell, edit and MCP tools and does not trust the folder", () => {
+test("interactive grok read-only trusts the folder, forces ask mode and denies shell, edit and MCP tools", () => {
+  // Every tmux session passes --trust so a folder-trust prompt cannot stall it.
   assert.deepEqual(buildInteractiveAgentCommand("grok", { prompt: "look", allow: "read-only" }, {}).args, [
     "--model",
     "grok-4.6",
     "--no-auto-update",
+    "--trust",
     "--permission-mode",
     "default",
     "--deny",
@@ -160,14 +165,14 @@ test("interactive grok pins a new session id and resumes stored sessions", () =>
   assert.deepEqual(resume.slice(-4), ["--resume", sessionId, "--", "hi"]);
 });
 
-test("grok uses the pin wait tier and seeds only credential/config files into Docker", () => {
+test("grok uses the pin wait tier and seeds only its config file into containers", () => {
   assert.equal(waitTierForAgent("grok"), "pin");
   assert.deepEqual(getAgentConfig("grok"), {
     name: "grok",
     promptFileMode: "argument",
     configRelDir: ".grok",
     workspaceConfigRelDir: ".grok",
-    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json"],
+    seedPaths: [".grok/config.toml"],
   });
 });
 

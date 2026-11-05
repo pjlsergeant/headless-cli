@@ -181,3 +181,61 @@ test("CLI grok --tmux --wait pins the session id and reads the final message fro
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("CLI grok --docker/--modal refuses to start without an xAI API key, even with a host OAuth login", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-grok-"));
+  try {
+    writeFakeGrok(dir, grokStreamingJsonLines());
+    const workDir = join(dir, "work");
+    mkdirSync(join(dir, "home", ".grok"), { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+    // A host OAuth login exists, but it must never be copied into a container.
+    writeFileSync(join(dir, "home", ".grok", "auth.json"), "{}\n");
+    for (const sandbox of [["--docker"], ["--docker", "--session", "work"], ["--modal"]]) {
+      const stderr: string[] = [];
+      const stdout: string[] = [];
+      const code = await runCli(["grok", "--prompt", "hi", "--work-dir", workDir, ...sandbox, "--print-command"], {
+        env: isolatedEnv(dir),
+        stdout: (text) => stdout.push(text),
+        stderr: (text) => stderr.push(text),
+      });
+      assert.notEqual(code, 0, sandbox.join(" "));
+      assert.equal(stdout.join(""), "", sandbox.join(" "));
+      assert.match(
+        stderr.join(""),
+        /grok in Docker or Modal needs XAI_API_KEY or GROK_CODE_XAI_API_KEY; the host grok login cannot be used in containers/,
+        sandbox.join(" "),
+      );
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("CLI grok --docker/--modal accepts an xAI key from the environment or an explicit forward", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "headless-grok-"));
+  try {
+    writeFakeGrok(dir, grokStreamingJsonLines());
+    const workDir = join(dir, "work");
+    mkdirSync(workDir, { recursive: true });
+    const cases: Array<{ args: string[]; env: Record<string, string> }> = [
+      { args: ["--docker"], env: { XAI_API_KEY: "xai-test" } },
+      { args: ["--docker"], env: { GROK_CODE_XAI_API_KEY: "xai-test" } },
+      { args: ["--docker", "--docker-env", "XAI_API_KEY=xai-inline"], env: {} },
+      { args: ["--modal"], env: { XAI_API_KEY: "xai-test" } },
+      { args: ["--modal", "--modal-env", "GROK_CODE_XAI_API_KEY=xai-inline"], env: {} },
+    ];
+    for (const testCase of cases) {
+      const stdout: string[] = [];
+      const code = await runCli(["grok", "--prompt", "hi", "--work-dir", workDir, ...testCase.args, "--print-command"], {
+        env: isolatedEnv(dir, testCase.env),
+        stdout: (text) => stdout.push(text),
+        stderr: () => undefined,
+      });
+      assert.equal(code, 0, testCase.args.join(" "));
+      assert.match(stdout.join(""), /grok/, testCase.args.join(" "));
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

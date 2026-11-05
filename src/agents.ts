@@ -446,6 +446,15 @@ export function grokAuthExists(env: Env): boolean {
   return home ? fileExists(join(home, "auth.json")) : false;
 }
 
+export const grokApiKeyEnvNames = ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"] as const;
+
+// grok's OAuth login is never copied into Docker or Modal (see the grok seedPaths),
+// so a container run needs an API key in its forwarded environment.
+export function grokContainerAuthError(forwardedValue: (name: string) => string | undefined): string | undefined {
+  if (grokApiKeyEnvNames.some((name) => Boolean(forwardedValue(name)))) return undefined;
+  return "grok in Docker or Modal needs XAI_API_KEY or GROK_CODE_XAI_API_KEY; the host grok login cannot be used in containers (its refresh tokens are single-use). Set XAI_API_KEY, or pass it with --docker-env/--modal-env.";
+}
+
 // Built-in read-only tool ids accepted by headless `--tools`
 // (xai-grok-pager/docs/user-guide/14-headless-mode.md "Tool Filtering").
 const grokReadOnlyTools = "read_file,grep,list_dir,web_search,web_fetch";
@@ -477,14 +486,20 @@ function buildGrok(options: BuildOptions, env: Env): BuiltCommand {
   if (options.allow === "read-only") {
     args.push(...grokAskModeArgs, "--tools", grokReadOnlyTools, "--disallowed-tools", grokMcpBridgeTools);
   } else {
-    args.push("--always-approve");
+    // --trust persists a folder-trust grant (app/cli.rs `trust`) so a yolo run
+    // loads the project's AGENTS.md, skills, hooks and MCP servers like the TUI
+    // would; read-only one-shot stays untrusted and skips them.
+    args.push("--trust", "--always-approve");
   }
   // `--single=<prompt>` keeps a prompt starting with "-" from being parsed as options.
   return { command: grokCommand(env), args: [...withGrokSession(args, options), `--single=${options.prompt}`] };
 }
 
 function buildInteractiveGrok(options: BuildOptions, env: Env): BuiltCommand {
-  const args = [...withGrokModelAndEffort(options), "--no-auto-update"];
+  // Every tmux session passes --trust, which persists a folder-trust grant
+  // (app/cli.rs `trust`), so a trust prompt cannot stall the session; the
+  // analogue of trustClaudeWorkspace for claude.
+  const args = [...withGrokModelAndEffort(options), "--no-auto-update", "--trust"];
   if (options.allow === "read-only") {
     // The TUI ignores --tools, so deny the mutating tool families by rule
     // (xai-grok-permission-rules/src/rules.rs tool_name_to_filter: Edit covers Write).
@@ -492,9 +507,7 @@ function buildInteractiveGrok(options: BuildOptions, env: Env): BuiltCommand {
     // workflow, image_gen) per permission-rules policy.rs rule_reaches.
     args.push(...grokAskModeArgs, "--deny", "Bash", "--deny", "Edit", "--deny", "MCPTool");
   } else {
-    // --trust pre-grants folder trust so the TUI does not block on a trust
-    // prompt inside tmux (the analogue of trustClaudeWorkspace for claude).
-    args.push("--trust", "--always-approve");
+    args.push("--always-approve");
   }
   return { command: grokCommand(env), args: [...withGrokSession(args, options), "--", options.prompt] };
 }
@@ -693,10 +706,14 @@ const harnesses: Record<AgentName, AgentHarness> = {
     // Listed file by file (like claude/codex) rather than as a ".grok" directory
     // with dockerSeedFiles: Modal ignores dockerSeedFiles and would upload all of
     // ~/.grok, including sessions/, logs/ and the self-updating bin/ and downloads/.
-    // trusted_folders.toml is left out on purpose: its grants are keyed by host
-    // path and the workdir keeps that path in the container, so seeding it would
-    // silently re-enable a host-trusted repo's project hooks and MCP servers.
-    seedPaths: [".grok/auth.json", ".grok/config.toml", ".grok/mcp_credentials.json"],
+    // Only config.toml is seeded. trusted_folders.toml is keyed by host path and
+    // the workdir keeps that path in the container, so it would silently
+    // re-enable a host-trusted repo's project hooks. auth.json and
+    // mcp_credentials.json hold OAuth refresh tokens that rotate on every use
+    // (xai-grok-login manager/refresh_chain.rs; xai-grok-mcp credentials.rs),
+    // so a container refresh would strand the host login: grok authenticates in
+    // containers only through XAI_API_KEY (see grokContainerAuthError).
+    seedPaths: [".grok/config.toml"],
     buildCommand: buildGrok,
     buildInteractiveCommand: buildInteractiveGrok,
   },

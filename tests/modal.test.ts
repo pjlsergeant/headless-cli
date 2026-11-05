@@ -552,7 +552,7 @@ test("executeModalAgent seeds a selected Codex profile and rewrites its catalog 
   }
 });
 
-test("executeModalAgent seeds only grok credential and config files, never its session history or binaries", async () => {
+test("executeModalAgent seeds only grok config, never its OAuth stores, session history or binaries", async () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-modal-grok-"));
   try {
     const home = join(dir, "home");
@@ -566,6 +566,7 @@ test("executeModalAgent seeds only grok credential and config files, never its s
     initGitWorkdir(work);
     writeFileSync(join(work, "input.txt"), "local");
     writeFileSync(join(grokDir, "auth.json"), "{}\n");
+    writeFileSync(join(grokDir, "mcp_credentials.json"), "{}\n");
     writeFileSync(join(grokDir, "config.toml"), "[ui]\n");
     writeFileSync(join(grokDir, "sessions", "%2Fwork", "s-1", "updates.jsonl"), "history\n");
     writeFileSync(join(grokDir, "bin", "grok"), "binary");
@@ -591,7 +592,8 @@ test("executeModalAgent seeds only grok credential and config files, never its s
       clientFactory: async () => client,
     });
 
-    assert.equal(readFileSync(join(remote, "host-home", ".grok", "auth.json"), "utf8"), "{}\n");
+    assert.equal(existsSync(join(remote, "host-home", ".grok", "auth.json")), false);
+    assert.equal(existsSync(join(remote, "host-home", ".grok", "mcp_credentials.json")), false);
     assert.equal(readFileSync(join(remote, "host-home", ".grok", "config.toml"), "utf8"), "[ui]\n");
     assert.equal(existsSync(join(remote, "host-home", ".grok", "sessions")), false);
     assert.equal(existsSync(join(remote, "host-home", ".grok", "bin")), false);

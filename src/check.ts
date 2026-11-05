@@ -3,7 +3,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
 import { commandFromCustom, resolveAcpCommand } from "./acp.js";
-import { claudeCommand, claudeOauthExists, grokAuthExists, grokCommand, listAgents } from "./agents.js";
+import { claudeCommand, claudeOauthExists, grokApiKeyEnvNames, grokAuthExists, grokCommand, listAgents } from "./agents.js";
 import {
   BUILTIN_AGENT_DEFAULTS,
   loadHeadlessConfig,
@@ -116,7 +116,7 @@ const apiEnvNamesByAgent: Record<AgentName, string[]> = {
   cursor: ["CURSOR_API_KEY"],
   gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
   // xai-grok-login/src/auth_method.rs: XAI_API_KEY, falling back to the legacy name.
-  grok: ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"],
+  grok: [...grokApiKeyEnvNames],
   opencode: commonProviderApiEnvNames,
   pi: ["PI_CODING_AGENT_API_KEY", ...commonProviderApiEnvNames],
 };

@@ -268,7 +268,7 @@ test("wraps argument-mode commands without stdin or unrelated env", () => {
   }
 });
 
-test("seeds grok credentials into Docker without session history and forwards xAI keys", () => {
+test("seeds only grok config into Docker, never its OAuth stores or history, and forwards xAI keys", () => {
   const dir = mkdtempSync(join(tmpdir(), "headless-docker-test-"));
   try {
     const home = join(dir, "home");
@@ -292,9 +292,11 @@ test("seeds grok credentials into Docker without session history and forwards xA
       workDir,
     });
 
-    for (const name of ["auth.json", "config.toml", "mcp_credentials.json"]) {
-      assert.ok(command.args.includes(`${join(grokDir, name)}:/tmp/headless-host-home/.grok/${name}:ro`), name);
-    }
+    assert.ok(command.args.includes(`${join(grokDir, "config.toml")}:/tmp/headless-host-home/.grok/config.toml:ro`));
+    // grok's xAI and MCP OAuth stores rotate single-use refresh tokens, so a
+    // container refresh would strand the host login; containers use XAI_API_KEY.
+    assert.ok(!command.args.some((arg) => arg.includes("auth.json")));
+    assert.ok(!command.args.some((arg) => arg.includes("mcp_credentials.json")));
     // Trust grants are keyed by host path, and the workdir keeps its host path in
     // the container, so seeding them would re-enable project hooks there.
     assert.ok(!command.args.some((arg) => arg.includes("trusted_folders.toml")));

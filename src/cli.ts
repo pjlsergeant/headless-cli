@@ -34,6 +34,7 @@ import {
   piModelSpec,
   getAgentConfig,
   getAgentHarness,
+  grokContainerAuthError,
   isAgentName,
   listAgents,
   waitTierForAgent,
@@ -43,6 +44,7 @@ import { BillingError, prepareBillingAttempt, prepareBillingPreview, resolveBill
 import { runWithBilling, type BillingExecutionAttempt, type BillingRunResult } from "./billing-run.js";
 import { resolveCapacityRetries, waitForCapacityRetry } from "./capacity-retry.js";
 import { buildDockerBillingVolumeInitCommand, removeDockerBillingVolume } from "./docker-billing.js";
+import { collectForwardedEnvEntries } from "./env.js";
 import { checkAgents, checkDocker, commandExists, commandForAgent, renderAgentChecks, renderDockerCheck } from "./check.js";
 import {
   BUILTIN_AGENT_DEFAULTS,
@@ -4383,6 +4385,13 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
     if (parsed.fast !== undefined && parsed.agent !== "claude" && parsed.agent !== "codex") {
       throw new CliError("--fast is supported only by claude and codex");
+    }
+    // A named Modal Secret may carry the key, but its contents are not visible here.
+    if (parsed.agent === "grok" && (parsed.docker || (parsed.modal && parsed.modalSecrets.length === 0))) {
+      const explicit = parsed.docker ? parsed.dockerEnv : parsed.modalEnv;
+      const forwarded = collectForwardedEnvEntries(env, undefined, explicit);
+      const error = grokContainerAuthError((name) => forwarded.find((entry) => entry.name === name)?.actualValue);
+      if (error) throw new CliError(error);
     }
     if (parsed.profile !== undefined && parsed.agent !== "codex") {
       throw new CliError("--profile is supported only by codex");
