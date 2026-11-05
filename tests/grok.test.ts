@@ -9,6 +9,20 @@ import {
   waitTierForAgent,
 } from "../src/agents.ts";
 import { BUILTIN_AGENT_DEFAULTS, parseHeadlessConfig } from "../src/config.ts";
+import {
+  extractAgentError,
+  extractFinalMessage,
+  extractNativeSessionId,
+  extractUsageSummary,
+  priceUsageSummary,
+} from "../src/output.ts";
+import {
+  grokNotSignedInLine,
+  grokSessionId,
+  grokSpend,
+  grokStreamingJsonLines,
+  grokUpdatesJsonl,
+} from "./grok-fixtures.ts";
 
 const sessionId = "11111111-1111-4111-8111-111111111111";
 
@@ -146,4 +160,87 @@ test("grok uses the pin wait tier and seeds only credential/config files into Do
       ".grok": ["auth.json", "config.toml", "mcp_credentials.json", "trusted_folders.toml"],
     },
   });
+});
+
+test("grok final message is the last model response's text chunks, ignoring thoughts and tool calls", () => {
+  assert.equal(extractFinalMessage("grok", grokStreamingJsonLines()), "The answer is 42.");
+});
+
+test("grok final message keeps the last text when no per-response usage lines are emitted", () => {
+  const trace = grokStreamingJsonLines()
+    .split("\n")
+    .filter((line) => !line.includes('"type":"usage"'))
+    .join("\n");
+  assert.equal(extractFinalMessage("grok", trace), "The answer is 42.");
+});
+
+test("grok final message is empty for an error-only trace and the error is reported without a type prefix", () => {
+  assert.equal(extractFinalMessage("grok", `${grokNotSignedInLine}\n`), "");
+  assert.match(extractAgentError("grok", `${grokNotSignedInLine}\n`), /^grok error: Not signed in\. /);
+});
+
+test("grok native session id comes from the end line", () => {
+  assert.equal(extractNativeSessionId("grok", grokStreamingJsonLines()), grokSessionId);
+});
+
+test("grok final message also reads updates.jsonl envelopes for tmux --wait", () => {
+  assert.equal(extractFinalMessage("grok", grokUpdatesJsonl({ completed: true })), "Final pinned answer.");
+});
+
+test("grok usage uses the end line totals and the native cost when it is complete", () => {
+  const summary = extractUsageSummary("grok", grokStreamingJsonLines(), { provider: "xai", model: "grok-4.6" });
+  assert.deepEqual(priceUsageSummary(summary, {}), {
+    agent: "grok",
+    provider: "xai",
+    model: "grok-4.6",
+    inputTokens: 1200,
+    cacheReadTokens: 800,
+    cacheWriteTokens: 0,
+    outputTokens: 300,
+    reasoningOutputTokens: 120,
+    totalTokens: 2300,
+    usageStatus: "reported",
+    cost: { input: null, cacheRead: null, cacheWrite: null, output: null, total: 0.0123 },
+    costBasis: "native-reported",
+    pricingSource: "native",
+    pricingStatus: "native",
+  });
+});
+
+test("grok usage falls back to models.dev pricing when grok withholds a partial cost", () => {
+  const trace = grokStreamingJsonLines(grokSpend({ partial: true }));
+  const summary = priceUsageSummary(extractUsageSummary("grok", trace, {}), {
+    xai: { models: { "grok-4.6": { cost: { input: 2, output: 10, cache_read: 0.5, cache_write: 0 } } } },
+  });
+  assert.equal(summary.provider, "xai");
+  assert.equal(summary.model, "grok-4.6");
+  assert.equal(summary.pricingStatus, "priced");
+  assert.equal(summary.costBasis, "api-list-price-estimate");
+  assert.deepEqual(summary.cost, { input: 0.0024, cacheRead: 0.0004, cacheWrite: 0, output: 0.003, total: 0.0058 });
+});
+
+test("grok usage flagged incomplete is reported as missing so it never reads as cheap", () => {
+  const summary = priceUsageSummary(
+    extractUsageSummary("grok", grokStreamingJsonLines(grokSpend({ incomplete: true, cost: 0.5 })), {}),
+    { xai: { models: { "grok-4.6": { cost: { input: 2, output: 10, cache_read: 0.5 } } } } },
+  );
+  assert.equal(summary.usageStatus, "missing");
+  assert.equal(summary.cost, null);
+  assert.equal(summary.pricingStatus, "missing");
+});
+
+test("grok usage reads spend fields carried on an error line", () => {
+  const trace = `${JSON.stringify({ type: "error", message: "rate limited", ...grokSpend({ cost: 0.001 }) })}\n`;
+  const summary = extractUsageSummary("grok", trace, {});
+  assert.equal(summary.inputTokens, 1200);
+  assert.equal(summary.cost?.total, 0.001);
+  assert.equal(summary.pricingStatus, "native");
+});
+
+test("grok usage without an end line is missing", () => {
+  const trace = grokStreamingJsonLines()
+    .split("\n")
+    .filter((line) => !line.includes('"type":"end"'))
+    .join("\n");
+  assert.equal(extractUsageSummary("grok", trace, { provider: "xai", model: "grok-4.6" }).usageStatus, "missing");
 });

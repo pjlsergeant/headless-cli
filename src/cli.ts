@@ -26,6 +26,7 @@ import {
   buildInteractiveOpencodeRun,
   buildInteractiveAgentCommand,
   DEFAULT_GEMINI_MODEL,
+  DEFAULT_GROK_MODEL,
   DEFAULT_OPENCODE_MODEL,
   DEFAULT_PI_MODEL,
   claudeModel,
@@ -1138,7 +1139,7 @@ function validateWorkDir(workDir: string | undefined): string | undefined {
   return workDir;
 }
 
-const autoAgentPreference: AgentName[] = ["codex", "claude", "pi", "opencode", "gemini", "antigravity", "cursor"];
+const autoAgentPreference: AgentName[] = ["codex", "claude", "pi", "opencode", "gemini", "antigravity", "cursor", "grok"];
 
 function selectDefaultAgent(env: Env, preferredAgent: AgentName | undefined): AgentName {
   if (preferredAgent && commandExists(commandForAgent(preferredAgent, env), env)) {
@@ -1192,6 +1193,9 @@ function usageContext(
   }
   if (agent === "gemini") {
     return { provider: "google", model: defaults.model ?? DEFAULT_GEMINI_MODEL };
+  }
+  if (agent === "grok") {
+    return { provider: "xai", model: defaults.model ?? DEFAULT_GROK_MODEL };
   }
   if (agent === "pi") {
     return piModelSpec(defaults.model, env);
@@ -1516,6 +1520,9 @@ function spinnerModelLabel(agent: AgentName, defaults: InvocationDefaults, env: 
   if (agent === "gemini") {
     return defaults.model ?? DEFAULT_GEMINI_MODEL;
   }
+  if (agent === "grok") {
+    return defaults.model ?? DEFAULT_GROK_MODEL;
+  }
   if (agent === "opencode") {
     return defaults.model ?? DEFAULT_OPENCODE_MODEL;
   }
@@ -1607,7 +1614,7 @@ function buildSessionPlan(
   return {
     alias: validAlias,
     mode: "new",
-    nativeId: agent === "claude" ? randomUUID() : undefined,
+    nativeId: agent === "claude" || agent === "grok" ? randomUUID() : undefined,
     profile: profile ?? stored?.profile,
   };
 }

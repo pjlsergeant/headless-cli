@@ -82,6 +82,7 @@ test("SDK capabilities report the supported protocol and command families", asyn
     "codex",
     "cursor",
     "gemini",
+    "grok",
     "opencode",
     "pi",
   ]);

@@ -35,3 +35,28 @@ test("oversized Pi trace compaction preserves assistant usage identity", () => {
 
   assert.equal(JSON.parse(compacted).message.role, "assistant");
 });
+
+test("oversized grok end-line compaction keeps the trust flags and per-model usage rows", () => {
+  const compacted = compactOversizedTraceLine(
+    "grok",
+    JSON.stringify({
+      type: "end",
+      stopReason: "end_turn",
+      sessionId: "s-1",
+      structured_output: { blob: "x".repeat(300_000) },
+      usage: { input_tokens: 10, cache_read_input_tokens: 3, output_tokens: 2, reasoning_tokens: 1, total_tokens: 15 },
+      usage_is_incomplete: true,
+      cost_is_partial: true,
+      modelUsage: { "grok-4.6": { inputTokens: 10, cacheReadInputTokens: 3, outputTokens: 2, note: "x" } },
+    }),
+  );
+
+  assert.deepEqual(JSON.parse(compacted), {
+    type: "end",
+    sessionId: "s-1",
+    usage: { input_tokens: 10, cache_read_input_tokens: 3, output_tokens: 2, reasoning_tokens: 1, total_tokens: 15 },
+    usage_is_incomplete: true,
+    cost_is_partial: true,
+    modelUsage: { "grok-4.6": { inputTokens: 10, cacheReadInputTokens: 3, outputTokens: 2 } },
+  });
+});

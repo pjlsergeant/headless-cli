@@ -90,6 +90,47 @@ function piMessageProjection(record: JsonRecord): JsonRecord {
   return projection;
 }
 
+// grok's end/error spend: usage totals, per-model rows priced when cost is
+// withheld, and the two flags that decide whether any cost is trustworthy.
+const grokUsageNumericFields = ["reasoning_tokens", "total_tokens"] as const;
+const grokModelUsageNumericFields = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadInputTokens",
+  "cacheCreationInputTokens",
+  "modelCalls",
+  "costUSD",
+] as const;
+
+function grokSpendProjection(record: JsonRecord, projection: JsonRecord): void {
+  const sourceUsage = asRecord(record.usage);
+  const usage = numericProjection(sourceUsage);
+  for (const field of grokUsageNumericFields) {
+    const value = copyNumber(sourceUsage, field);
+    if (value !== undefined) usage[field] = value;
+  }
+  if (Object.keys(usage).length > 0) projection.usage = usage;
+  for (const flag of ["usage_is_incomplete", "cost_is_partial"]) {
+    if (record[flag] === true) projection[flag] = true;
+  }
+  const modelUsage = asRecord(record.modelUsage);
+  const rows: JsonRecord = {};
+  let count = 0;
+  for (const model in modelUsage) {
+    if (!Object.hasOwn(modelUsage, model) || Buffer.byteLength(model, "utf8") > 512) continue;
+    const source = asRecord(modelUsage[model]);
+    const row: JsonRecord = {};
+    for (const field of grokModelUsageNumericFields) {
+      const value = copyNumber(source, field);
+      if (value !== undefined) row[field] = value;
+    }
+    rows[model] = row;
+    count += 1;
+    if (count === 100) break;
+  }
+  if (count > 0) projection.modelUsage = rows;
+}
+
 export function compactOversizedTraceLine(agent: AgentName, line: string): string {
   let record: JsonRecord;
   try {
@@ -127,6 +168,9 @@ export function compactOversizedTraceLine(agent: AgentName, line: string): strin
   } else if (agent === "pi") {
     const message = piMessageProjection(asRecord(record.message));
     if (Object.keys(message).length > 0) projection.message = message;
+  } else if (agent === "grok") {
+    grokSpendProjection(record, projection);
+    return Object.keys(projection).length > 0 ? JSON.stringify(projection) : "";
   } else {
     const usage = numericProjection(asRecord(record.usage));
     if (Object.keys(usage).length > 0) projection.usage = usage;
