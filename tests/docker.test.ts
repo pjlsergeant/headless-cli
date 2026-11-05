@@ -22,25 +22,45 @@ import { quoteCommand } from "../src/shell.ts";
 const dockerfile = readFileSync("Dockerfile", "utf8");
 const dockerWorkflow = readFileSync(".github/workflows/docker-image.yml", "utf8");
 
-test("Dockerfile exposes Cursor agent from a non-root path", () => {
-  assert.match(dockerfile, /^FROM node:22-bookworm-slim@sha256:[a-f0-9]{64}$/m);
-  assert.match(dockerfile, /@anthropic-ai\/claude-code@\d+\.\d+\.\d+/);
-  assert.match(dockerfile, /@google\/gemini-cli@\d+\.\d+\.\d+/);
-  assert.match(dockerfile, /@mariozechner\/pi-coding-agent@\d+\.\d+\.\d+/);
-  assert.match(dockerfile, /@openai\/codex@0\.147\.0/);
-  assert.match(dockerfile, /opencode-ai@\d+\.\d+\.\d+/);
-  assert.match(dockerfile, /ARG CURSOR_AGENT_VERSION=\d{4}\.\d{2}\.\d{2}-[a-f0-9]+/);
-  assert.match(dockerfile, /ARG CURSOR_AGENT_SHA256_AMD64=[a-f0-9]{64}/);
-  assert.match(dockerfile, /ARG CURSOR_AGENT_SHA256_ARM64=[a-f0-9]{64}/);
-  assert.match(dockerfile, /ARG AGY_VERSION=\d+\.\d+\.\d+/);
-  assert.match(dockerfile, /ARG AGY_SHA256_AMD64=[a-f0-9]{64}/);
-  assert.match(dockerfile, /ARG AGY_SHA256_ARM64=[a-f0-9]{64}/);
-  assert.match(dockerfile, /sha256sum -c -/);
+test("Dockerfile installs every agent CLI unpinned at its latest release", () => {
+  assert.match(dockerfile, /^FROM node:22-bookworm-slim$/m);
+  assert.doesNotMatch(dockerfile, /@sha256:/);
+  assert.doesNotMatch(dockerfile, /sha256sum/);
+  assert.doesNotMatch(dockerfile, /_VERSION=/);
+  for (const pkg of [
+    "@anthropic-ai/claude-code",
+    "@google/gemini-cli",
+    "@mariozechner/pi-coding-agent",
+    "@openai/codex",
+    "opencode-ai",
+  ]) {
+    const escaped = pkg.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    assert.match(dockerfile, new RegExp(`^\\s+${escaped}(?: \\\\)?$`, "m"), `${pkg} should be installed without a version`);
+  }
+});
+
+test("Dockerfile installs Cursor agent from the official latest installer on a non-root path", () => {
+  assert.match(dockerfile, /curl -fsSL https:\/\/cursor\.com\/install -o /);
+  assert.doesNotMatch(dockerfile, /curl[^\n]*\|\s*(?:ba)?sh/);
   assert.match(dockerfile, /ln -sf \/opt\/cursor-agent\/cursor-agent \/usr\/local\/bin\/cursor-agent/);
   assert.match(dockerfile, /ln -sf \/usr\/local\/bin\/cursor-agent \/usr\/local\/bin\/agent/);
-  assert.match(dockerfile, /github\.com\/google-antigravity\/antigravity-cli\/releases\/download/);
+});
+
+test("Dockerfile installs Antigravity from the latest GitHub release with auto-update off", () => {
+  assert.match(dockerfile, /github\.com\/google-antigravity\/antigravity-cli\/releases\/latest\/download\/\$\{agy_file\}/);
   assert.match(dockerfile, /install -m 0755 \/tmp\/antigravity \/usr\/local\/bin\/agy/);
   assert.match(dockerfile, /ENV AGY_CLI_DISABLE_AUTO_UPDATE=true/);
+});
+
+test("Dockerfile installs grok outside the container home", () => {
+  assert.match(dockerfile, /curl -fsSL https:\/\/x\.ai\/cli\/install\.sh -o /);
+  // The installer writes to $HOME/.grok, which is runtime config in the
+  // container, so it must run under a throwaway HOME and the resolved binary
+  // must be copied to /usr/local/bin.
+  assert.match(dockerfile, /HOME="\$\{grok_home\}"/);
+  assert.match(dockerfile, /install -m 0755 "\$\(readlink -f "\$\{grok_home\}\/\.grok\/bin\/grok"\)" \/usr\/local\/bin\/grok/);
+  assert.match(dockerfile, /rm -rf "\$\{grok_home\}"/);
+  assert.doesNotMatch(dockerfile, /\/headless-home\/\.grok/);
 });
 
 test("Dockerfile links published images to the source repository", () => {
