@@ -440,7 +440,9 @@ export async function startSandboxedNodeMessage(
   fromNodeId: string,
   sandboxArgs: string[],
 ): Promise<void> {
-  if (node.sandbox !== "docker") throw new Error(`node ${node.nodeId} cannot be started in this sandbox`);
+  if (node.sandbox !== "docker" || !sandboxArgs.includes("--docker")) {
+    throw new Error(`node ${node.nodeId} cannot be started in this sandbox`);
+  }
   await startDetachedNodeMessage(env, runId, node.nodeId, node, prompt, fromNodeId, sandboxArgs);
 }
 
