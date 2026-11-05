@@ -1,3 +1,23 @@
+> [!WARNING]
+> # ⚠️⚠️⚠️ THIS IS A FORK ⚠️⚠️⚠️
+>
+> **This is [pjlsergeant/headless-cli](https://github.com/pjlsergeant/headless-cli), an unofficial fork of [RobertTLange/headless-cli](https://github.com/RobertTLange/headless-cli).** It is not the upstream project, and its behaviour differs from upstream in ways that may break you. **No compatibility with upstream on-disk state** (`~/.headless` sessions, locks, run stores) is promised.
+>
+> ### Major changes from upstream
+>
+> - **Process lifecycle:** the agent always runs in its own process group. Signals are forwarded, with a 5s grace period and then `SIGKILL`. After the agent exits, one-shot runs kill the processes it left behind; opt out with `--keep-background`. Cron kills the whole process group, and ACP and async shutdown are bounded.
+> - **Locking:** one owner-aware lock covers launches, the cron daemon, cron jobs and sessions. It checks process identity, so a stale lock is reclaimed safely, and a lock file it can't parse makes the run fail rather than being wiped.
+> - **Docker trust boundary:** containers no longer get the host run directory. Each run node gets its own mailbox. A work dir that overlaps Headless state is refused.
+> - **Modal, ACP, AWS:** sandbox symlinks are checked, and the workspace is recovered even when a run fails (`--modal-keep-sandbox` keeps the sandbox up). ACP file reads are confined to the work dir. Only the selected AWS profile reaches the container.
+> - **Prompts starting with `-`** are no longer parsed as options.
+> - **Docker image is fully unpinned:** latest base image and latest agent CLIs, with no version or SHA-256 pins. `headless docker build` uses `--pull --no-cache`.
+> - **New `grok` agent** for xAI Grok Build. Its OAuth login is never copied into Docker or Modal; containers need `XAI_API_KEY`.
+> - **Z.AI GLM through Codex profiles:** `headless codex --profile zai` with model and provider reporting and pricing, and `ZAI_API_KEY` forwarding. See [docs/usage.md](docs/usage.md).
+>
+> Full details are under `## TBD` in [CHANGELOG.md](CHANGELOG.md). Known gaps and deferred work are in [docs/one-day.md](docs/one-day.md).
+
+---
+
 <p align="center">
   <img src="docs/logo.png" alt="Headless coding agent orchestration" width="200" style="border-radius: 24px;" />
 </p>
